@@ -1,0 +1,48 @@
+[package]
+name = "secm-datasource"
+version = "0.1.0"
+description = "SECM 纯 Rust 驱动采集模块 — Win32/注册表/HTTP 底层数据采集（替代 PowerShell/外部命令数据源）"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "secm_datasource"
+crate-type = ["lib"]
+
+[dependencies]
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_Dns",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    # P15 磁盘 IO 速度：PDH 性能计数器（pdh.dll）
+    "Win32_System_Performance",
+    # P14 磁盘枚举 / SMART 读取：存储设备 IOCTL
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_IscsiDisc",
+    "Win32_Storage_Nvme",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+winreg = "0.55"
+ureq = "2"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+# P1 激活状态 / P2 补丁兜底：WMI 查询（设计文档 §5.1 方案 A）
+# wmi 0.18 依赖 windows 0.59-0.62，与 tauri 的 windows 0.52 可共存（多版本并行）
+wmi = "0.18"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 0

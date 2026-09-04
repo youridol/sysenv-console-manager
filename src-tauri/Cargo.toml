@@ -1,0 +1,51 @@
+[package]
+name = "sysenv-console-manager"
+version = "1.19.0"
+description = "Windows 10/11 System Environment Management Tool"
+authors = ["SECM Team"]
+edition = "2021"
+
+[profile.dev]
+opt-level = 0
+incremental = true
+
+[lib]
+name = "secm_lib"
+crate-type = ["lib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+lazy_static = "1.4"
+sysinfo = "0.30"
+winreg = "0.52"
+surge-ping = "0.8"
+trust-dns-resolver = "0.23"
+rand = "0.8"
+encoding_rs = "0.8"
+# UDP SO_REUSEADDR（DHCP 探测：与 Windows Dhcp 服务共存绑定 UDP 68）
+socket2 = "0.6"
+# 纯 Rust 驱动采集模块（P1-P13 底层采集；独立 crate，可单独 cargo build/test）
+secm-datasource = { path = "../datasource" }
+tiny_http = "0.12.0"
+# LHM sidecar HTTP 客户端（同步阻塞，在 sensor 查询链的 spawn_blocking 上下文内使用）
+ureq = "2"
+# log facade 桥接（datasource crate 的 log::* 转发到 SECM debug 体系）
+log = "0.4"
+
+[features]
+default = []
+# 过渡期回滚开关：启用后 P1-P13 回退旧 PowerShell/外部命令实现（迁移完成后删除）
+legacy-data-source = []

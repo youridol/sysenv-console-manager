@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LhmSidecar —— LibreHardwareMonitor CPU 传感器 sidecar（进程隔离，MPL-2.0 隔离边界）
+    - 仅在本进程内引用 LibreHardwareMonitorLib（MPL-2.0），SECM（MIT）经 HTTP 消费 JSON
+    - self-contained + win-x64：目标机无需预装 .NET 8 runtime
+    - PublishSingleFile=false：依赖 DLL 展开模式，便于排障与内嵌驱动解出
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- 固定程序集名：SECM 侧按 LhmSidecar.exe 定位 -->
+    <AssemblyName>LhmSidecar</AssemblyName>
+    <RootNamespace>LhmSidecar</RootNamespace>
+    <!-- 发布形态：win-x64 self-contained，依赖 DLL 展开（非单文件） -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <!-- 关闭不必要的分析器/代码分析开销，保持 Release 构建快速稳定 -->
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MPL-2.0 库：仅在此 sidecar 内使用；源码随 SECM 发行包附送（resources/lhm/source/） -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,85 @@
+// PawnIO - Input-output driver
+// Copyright (C) 2026  namazso <admin@namazso.eu>
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+//
+// Linking PawnIO statically or dynamically with other modules is making a
+// combined work based on PawnIO. Thus, the terms and conditions of the GNU
+// General Public License cover the whole combination.
+//
+// In addition, as a special exception, the copyright holders of PawnIO give
+// you permission to combine PawnIO program with free software programs or
+// libraries that are released under the GNU LGPL and with independent modules
+// that communicate with PawnIO solely through the device IO control
+// interface. You may copy and distribute such a system following the terms of
+// the GNU GPL for PawnIO and the licenses of the other code concerned,
+// provided that you include the source code of that other code when and as
+// the GNU GPL requires distribution of source code.
+//
+// Note that this exception does not include programs that communicate with
+// PawnIO over the Pawn interface. This means that all modules loaded into
+// PawnIO must be compatible with this licence, including the earlier
+// exception clause. We recommend using the GNU Lesser General Public License
+// version 2.1 to fulfill this requirement.
+//
+// For alternative licensing options, please contact the copyright holder at
+// admin@namazso.eu.
+//
+// Note that people who make modified versions of PawnIO are not obligated to
+// grant this special exception for their modified versions; it is their
+// choice whether to do so. The GNU General Public License gives permission
+// to release a modified version without this exception; this exception also
+// makes it possible to release a modified version which carries forward this
+// exception.
+
+#pragma once
+
+#define DECLSPEC_DEPRECATED_DDK
+#define _WIN32_WINNT _WIN32_WINNT_WIN10
+#define NTDDI_VERSION NTDDI_WIN10_RS5
+#include <sdkddkver.h>
+
+#if _MSC_VER >= 1944
+#define _MSVC_STL_HARDENING 0
+#define _MSVC_STL_DOOM_FUNCTION(expr)
+#else
+#define _CONTAINER_DEBUG_LEVEL 0
+#define _ITERATOR_DEBUG_LEVEL 0
+#define _STL_CRT_SECURE_INVALID_PARAMETER(expr)
+#endif
+
+#define _CRT_SECURE_INVALID_PARAMETER(expr)
+
+#define _INVALID_MEMORY_ORDER
+
+#define assert NT_ASSERT
+
+#define INITGUID
+
+#include <ntddk.h>
+#include <bcrypt.h>
+#include <intrin.h>
+#include <malloc.h>
+
+#include <cstdint>
+#include <cstdarg>
+
+#include <algorithm>
+#include <tuple>
+#include <array>
+#include <type_traits>
+#include <utility>
+#include <bit>
+#include <shared_mutex>

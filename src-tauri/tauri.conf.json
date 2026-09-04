@@ -1,0 +1,67 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/config.schema.json",
+  "productName": "SysEnv Console Manager",
+  "version": "1.19.0",
+  "identifier": "com.secm.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SysEnv Console Manager",
+        "width": 1400,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true,
+        "decorations": true,
+        "additionalBrowserArgs": "--disable-gpu --proxy-bypass-list=<local>;ipc.localhost;localhost;127.0.0.1;::1;[::1]"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/driver/WinRing0x64.sys": "resources/driver/WinRing0x64.sys",
+      "resources/driver/PawnIO.sys": "resources/driver/PawnIO.sys",
+      "resources/driver/PawnIO.cat": "resources/driver/PawnIO.cat",
+      "resources/driver/pawnio.inf": "resources/driver/pawnio.inf",
+      "resources/driver/PawnIO-src": "resources/driver/PawnIO-src",
+      "resources/lhm/publish": "lhm/publish",
+      "resources/lhm/LICENSE-MPL-2.0.txt": "lhm/LICENSE-MPL-2.0.txt",
+      "resources/lhm/LICENSE-GPL-2.0-PawnIO.txt": "lhm/LICENSE-GPL-2.0-PawnIO.txt",
+      "resources/lhm/PawnIo-COPYING-LGPL-2.1.txt": "lhm/PawnIo-COPYING-LGPL-2.1.txt",
+      "resources/lhm/THIRD-PARTY-NOTICES-LHM.txt": "lhm/THIRD-PARTY-NOTICES-LHM.txt",
+      "resources/lhm/source": "lhm/source"
+    },
+    "windows": {
+      "allowDowngrades": true,
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
+      },
+      "wix": {}
+    }
+  }
+}

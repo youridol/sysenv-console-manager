@@ -1,0 +1,9 @@
+# PawnIO 2.2.0 随包来源文件 SHA-256 校验清单
+# 生成日期：2026-08-09（2026 复核：移除官方安装器 exe 与源码 zip 中间产物）
+# 校验方式：certutil -hashfile <file> SHA256（或 sha256sum）
+# 语义：本文件为随包分发的 PawnIO 文件哈希基准；凡与本文件不一致的副本一律视为来源不可信。
+# 注：GPL-2.0 源码提供义务由 PawnIO-src/ 目录承载（含 COPYING 全文），哈希见目录内文件。
+
+fca6e7d58b0cf38dbb913a2b9e532f48629145d395f454b16a9f58e97b8d3940  PawnIO.sys
+a37d46840280efec92063d3a21014c803939e599b4c0da4a4d063b79eeca9446  PawnIO.cat
+7c1c203e13693531243fbee3cb87d7b79170eae89f5729b3f41387fe68a54f0b  pawnio.inf

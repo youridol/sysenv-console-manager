@@ -1,0 +1,42 @@
+# 依赖
+node_modules/
+dist/
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+datasource/target/
+src-tauri/gen/schemas/
+*.tsbuildinfo
+
+# 驱动 stage 产物（由 scripts/stage-driver.mjs 从 third_party 复制；源码见 third_party/）
+src-tauri/resources/driver/
+
+# LHM sidecar stage 产物（由 scripts/stage-lhm.mjs 复制，.NET publish 运行时与随包源码/许可）
+src-tauri/resources/lhm/
+
+# .NET 构建产物
+sidecar-lhm/bin/
+sidecar-lhm/obj/
+
+# 发行包归档（二进制不入库，仅保留文档）
+dist_releases/
+
+# 备份/临时
+*.zip
+*.bak
+BACKUP_INFO.txt
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 临时验证
+.verify_tmp/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# pi agent 运行时记忆（不入库）
+.pi/

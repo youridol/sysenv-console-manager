@@ -1,0 +1,394 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ── Light theme: clean charcoal/slate foundation ── */
+  --color-background: hsl(220 20% 98%);
+  --color-foreground: hsl(224 40% 8%);
+  --color-card: hsl(0 0% 100%);
+  --color-card-foreground: hsl(224 40% 8%);
+  --color-primary: hsl(224 40% 10%);
+  --color-primary-foreground: hsl(210 40% 98%);
+  --color-secondary: hsl(220 14% 94%);
+  --color-secondary-foreground: hsl(224 40% 10%);
+  --color-muted: hsl(220 14% 94%);
+  --color-muted-foreground: hsl(220 8% 44%);
+  --color-accent: hsl(220 14% 94%);
+  --color-accent-foreground: hsl(224 40% 10%);
+  --color-destructive: hsl(0 72% 52%);
+  --color-destructive-foreground: hsl(210 40% 98%);
+  --color-border: hsl(220 14% 90%);
+  --color-input: hsl(220 14% 90%);
+  --color-ring: hsl(224 40% 10%);
+
+  /* ── shadcn 下拉/弹出层 → 深色不透明背景确保可读性 ── */
+  --color-popover: hsl(0 0% 100%);
+  --color-popover-foreground: hsl(224 40% 8%);
+
+  /* ── Accent palette ── */
+  --color-brand-blue: #3b82f6;
+  --color-brand-green: #22c55e;
+  --color-brand-yellow: #eab308;
+  --color-brand-purple: #a855f7;
+  --color-brand-pink: #ec4899;
+
+  --radius: 0.625rem;
+}
+
+.dark {
+  --color-background: hsl(0 0% 4%); /* #0A0A0A */
+  --color-foreground: hsl(210 30% 94%);
+  --color-card: hsl(0 0% 8%); /* #141414 */
+  --color-card-foreground: hsl(210 30% 94%);
+  --color-primary: hsl(210 30% 94%);
+  --color-primary-foreground: hsl(0 0% 4%);
+  --color-secondary: hsl(0 0% 13%); /* ~#212121 */
+  --color-secondary-foreground: hsl(210 30% 94%);
+  --color-muted: hsl(0 0% 13%);
+  --color-muted-foreground: hsl(215 16% 58%);
+  --color-accent: hsl(0 0% 13%);
+  --color-accent-foreground: hsl(210 30% 94%);
+  --color-destructive: hsl(0 56% 38%);
+  --color-destructive-foreground: hsl(210 40% 98%);
+  --color-border: hsl(0 0% 16%);
+  --color-input: hsl(0 0% 16%);
+  --color-ring: hsl(216 20% 68%);
+
+  /* ── shadcn 下拉/弹出层 暗色 ── */
+  --color-popover: hsl(0 0% 12%);
+  --color-popover-foreground: hsl(210 30% 94%);
+  --sidebar: hsl(240 5.9% 10%);
+  --sidebar-foreground: hsl(240 4.8% 95.9%);
+  --sidebar-primary: hsl(224.3 76.3% 48%);
+  --sidebar-primary-foreground: hsl(0 0% 100%);
+  --sidebar-accent: hsl(240 3.7% 15.9%);
+  --sidebar-accent-foreground: hsl(240 4.8% 95.9%);
+  --sidebar-border: hsl(240 3.7% 15.9%);
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+
+/* ── Base ── */
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family:
+      "Inter",
+      system-ui,
+      -apple-system,
+      "Segoe UI",
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* ── Gradient text utility ── */
+.gradient-text {
+  background: linear-gradient(
+    135deg,
+    var(--color-brand-blue),
+    var(--color-brand-purple),
+    var(--color-brand-pink)
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Subtle scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(220 14% 75%);
+  border-radius: 9999px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: hsl(220 20% 28%);
+}
+
+/* ── 进程列表独立滚动条：常驻可见（比全局 6px 更宽，轨道带底色） ── */
+.proc-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.proc-scrollbar::-webkit-scrollbar-track {
+  background: hsl(220 20% 12% / 0.5);
+  border-radius: 9999px;
+}
+.proc-scrollbar::-webkit-scrollbar-thumb {
+  background: hsl(220 20% 32%);
+  border-radius: 9999px;
+}
+.proc-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: hsl(220 20% 42%);
+}
+
+/* ── 悬浮卡片阴影：亮色柔和投影 / 暗色加重投影，营造漂浮立体感 ── */
+.shadow-card {
+  box-shadow:
+    0 1px 2px -1px rgb(0 0 0 / 0.06),
+    0 6px 16px -4px rgb(0 0 0 / 0.1),
+    0 16px 40px -12px rgb(0 0 0 / 0.14);
+}
+.shadow-card-hover {
+  box-shadow:
+    0 2px 4px -2px rgb(0 0 0 / 0.08),
+    0 10px 24px -6px rgb(0 0 0 / 0.14),
+    0 24px 56px -16px rgb(0 0 0 / 0.2);
+}
+.dark .shadow-card {
+  box-shadow:
+    0 1px 3px -1px rgb(0 0 0 / 0.5),
+    0 8px 20px -6px rgb(0 0 0 / 0.55),
+    0 20px 48px -12px rgb(0 0 0 / 0.6);
+}
+.dark .shadow-card-hover {
+  box-shadow:
+    0 2px 4px -2px rgb(0 0 0 / 0.6),
+    0 12px 28px -8px rgb(0 0 0 / 0.65),
+    0 28px 64px -16px rgb(0 0 0 / 0.72);
+}
+
+/* ── 入场动画 ── */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes shimmer-border {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+@keyframes pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.05);
+  }
+}
+@keyframes count-up {
+  from {
+    opacity: 0;
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+  }
+}
+@keyframes gradient-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+/* 高度变量 --radix-accordion-content-height 由 Radix 运行时注入 */
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+/* ── 通用工具类 ── */
+.animate-fade-in-up {
+  animation: fade-in-up 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.animate-fade-in {
+  animation: fade-in 0.35s ease-out both;
+}
+.animate-scale-in {
+  animation: scale-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.animate-slide-left {
+  animation: slide-in-left 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.animate-slide-right {
+  animation: slide-in-right 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.animate-count-up {
+  animation: count-up 0.5s ease-out both;
+}
+
+/* ── Accordion 折叠/展开（shadcn/ui accordion 组件依赖） ── */
+.animate-accordion-down {
+  animation: accordion-down 0.2s ease-out;
+}
+.animate-accordion-up {
+  animation: accordion-up 0.2s ease-out;
+}
+
+/* ── 交错入场延迟 ── */
+.stagger-1 {
+  animation-delay: 0.06s;
+}
+.stagger-2 {
+  animation-delay: 0.12s;
+}
+.stagger-3 {
+  animation-delay: 0.18s;
+}
+.stagger-4 {
+  animation-delay: 0.24s;
+}
+.stagger-5 {
+  animation-delay: 0.3s;
+}
+.stagger-6 {
+  animation-delay: 0.36s;
+}
+.stagger-7 {
+  animation-delay: 0.42s;
+}
+.stagger-8 {
+  animation-delay: 0.48s;
+}
+
+/* ── 毛玻璃卡片 ── */
+.glass-card {
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.03),
+    rgba(255, 255, 255, 0.01)
+  );
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.dark .glass-card {
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.04),
+    rgba(255, 255, 255, 0.01)
+  );
+}
+
+/* ── 渐变边框脉冲 ── */
+.gradient-border {
+  position: relative;
+}
+.gradient-border::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    var(--color-brand-blue),
+    var(--color-brand-purple),
+    var(--color-brand-pink),
+    var(--color-brand-blue)
+  );
+  background-size: 300% 300%;
+  animation: gradient-shift 3s ease infinite;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+:root {
+  --sidebar: hsl(0 0% 98%);
+  --sidebar-foreground: hsl(240 5.3% 26.1%);
+  --sidebar-primary: hsl(240 5.9% 10%);
+  --sidebar-primary-foreground: hsl(0 0% 98%);
+  --sidebar-accent: hsl(240 4.8% 95.9%);
+  --sidebar-accent-foreground: hsl(240 5.9% 10%);
+  --sidebar-border: hsl(220 13% 91%);
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+
+@theme inline {
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}

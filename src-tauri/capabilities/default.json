@@ -1,0 +1,17 @@
+{
+  "identifier": "default",
+  "description": "Default capability for SECM — grants access to all custom commands and required plugins",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:default",
+    "store:default",
+    "dialog:default",
+    "dialog:allow-save",
+    "shell:default",
+    "fs:default"
+  ]
+}
