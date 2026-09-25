@@ -22,8 +22,6 @@ windows-sys = { version = "0.59.0", features = [
     "Win32_Security",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
-    # P15 磁盘 IO 速度：PDH 性能计数器（pdh.dll）
-    "Win32_System_Performance",
     # P14 磁盘枚举 / SMART 读取：存储设备 IOCTL
     "Win32_Storage_FileSystem",
     "Win32_Storage_IscsiDisc",

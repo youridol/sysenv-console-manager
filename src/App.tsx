@@ -8,11 +8,9 @@ import Network from "./pages/Network";
 import NetConfig from "./pages/NetConfig";
 import Settings from "./pages/Settings";
 import Services from "./pages/Services";
-import Logs from "./pages/Logs";
 import About from "./pages/About";
 
 import Environment from "./pages/Environment";
-import AiEnvironment from "./pages/AiEnvironment";
 import Hardware from "./pages/Hardware";
 
 export default function App() {
@@ -28,9 +26,7 @@ export default function App() {
             <Route path="/settings" element={<Settings />} />
             <Route path="/services" element={<Services />} />
             <Route path="/environment" element={<Environment />} />
-            <Route path="/ai-env" element={<AiEnvironment />} />
             <Route path="/hardware" element={<Hardware />} />
-            <Route path="/logs" element={<Logs />} />
             <Route path="/about" element={<About />} />
           </Route>
         </Routes>

@@ -56,55 +56,14 @@ pub struct CleanupResult {
     pub message: String,
 }
 
-/// Check if the current process is running as administrator.
+/// 当前进程是否以管理员权限运行。
+///
+/// 转发到 `driver_install::is_elevated`（ADR-0001 D14）：两处曾各自手写
+/// `OpenProcessToken` + `GetTokenInformation(TokenElevation)`，API 序列完全相同；
+/// driver_install 那份有完整的 `#[link]`、命名常量与 RAII 句柄保护，是更完整的实现。
+/// 合并后语义不变，后续修正只需改一处。
 pub fn is_admin() -> bool {
-    // Use Windows Token Elevation API to check process elevation
-    #[cfg(target_os = "windows")]
-    {
-        use std::ptr::null_mut;
-
-        // Check if the process token has elevation
-        type DWORD = u32;
-
-        extern "system" {
-            fn OpenProcessToken(
-                process_handle: *mut std::ffi::c_void,
-                desired_access: DWORD,
-                token_handle: *mut *mut std::ffi::c_void,
-            ) -> i32;
-            fn GetTokenInformation(
-                token_handle: *mut std::ffi::c_void,
-                token_info_class: i32,
-                token_info: *mut std::ffi::c_void,
-                token_info_length: DWORD,
-                return_length: *mut DWORD,
-            ) -> i32;
-            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-            fn GetCurrentProcess() -> *mut std::ffi::c_void;
-        }
-
-        unsafe {
-            let mut token: *mut std::ffi::c_void = null_mut();
-            if OpenProcessToken(GetCurrentProcess(), 0x0008, &mut token) == 0 {
-                return false;
-            }
-            let mut elevation: DWORD = 0;
-            let mut size: DWORD = std::mem::size_of::<DWORD>() as DWORD;
-            let result = GetTokenInformation(
-                token,
-                20,
-                &mut elevation as *mut _ as *mut std::ffi::c_void,
-                size,
-                &mut size,
-            );
-            CloseHandle(token);
-            result != 0 && elevation != 0
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+    crate::driver_install::is_elevated()
 }
 
 /// Decode bytes from Windows console output (typically GBK on Chinese systems).
@@ -324,16 +283,59 @@ fn mark_delete_on_reboot(_path: &std::path::Path) -> bool {
     false
 }
 
-/// 带重试的删除（占用可能是瞬时的，重试 2 次）
-fn delete_with_retry(path: &std::path::Path) -> std::io::Result<()> {
+/// 重试间隔（毫秒）：远低于原实现的 100ms。「文件被占用」已由
+/// [`is_definitive_lock_error`] 分流直接走重启删除通道，这里的退避只用于覆盖
+/// 杀软/索引器造成的瞬时抖动，长退避没有收益。
+const RETRY_BACKOFF_MS: u64 = 15;
+
+/// 删除重试退避的**总**等待预算（毫秒）。
+///
+/// 关键不变式：重试退避的总耗时必须有界，且与目录内文件数量无关。
+/// 旧实现对每次失败一律 `sleep(100ms)` × 2，于是清理含 N 个被占用文件的目录
+/// 会额外阻塞 `200N` 毫秒（实测：10 个占用文件 2.1s、40 个 8.2s、80 个 16.2s、
+/// 120 个 24.0s，严格线性）。真实机器 TEMP 常有数百个被占用文件，
+/// 因此表现为「点击清理后一直转圈」。共享截止时间把所有文件的退避总量封顶。
+const RETRY_BUDGET_MS: u64 = 500;
+
+/// 判定错误是否属于「文件确实被占用 / 拒绝访问」。
+///
+/// 这类失败在本轮清理内不会自行恢复，立即转入「重启后删除」通道即可，
+/// 反复重试纯属浪费——正是旧实现 200ms/文件 卡顿的来源。
+#[cfg(windows)]
+fn is_definitive_lock_error(e: &std::io::Error) -> bool {
+    // 5 = ERROR_ACCESS_DENIED, 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION
+    matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+#[cfg(not(windows))]
+fn is_definitive_lock_error(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// 带重试的删除。
+///
+/// - `retry_deadline`：退避等待的共享截止时间。一旦超过，本次及后续调用都不再
+///   退避，立即返回最后一次错误——保证全部文件的退避总耗时不超过
+///   [`RETRY_BUDGET_MS`]（与文件数量无关）。
+/// - 命中 [`is_definitive_lock_error`]（被占用）时不退避，直接交给
+///   `mark_delete_on_reboot` 处理。
+fn delete_with_retry(
+    path: &std::path::Path,
+    retry_deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = None;
-    for attempt in 0..=2 {
+    for attempt in 1..=MAX_ATTEMPTS {
         match std::fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(e) => {
+                let retryable = !is_definitive_lock_error(&e);
+                let has_budget = std::time::Instant::now() < retry_deadline;
                 last_err = Some(e);
-                if attempt < 2 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                if attempt < MAX_ATTEMPTS && retryable && has_budget {
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS));
+                } else {
+                    break;
                 }
             }
         }
@@ -341,15 +343,113 @@ fn delete_with_retry(path: &std::path::Path) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::other("delete failed")))
 }
 
-/// Helper: delete files in a directory recursively and return bytes freed.
-/// Does NOT remove the directory itself — only its contents.
-/// Skips reparse points (symlinks/junctions) to prevent unintended deletion.
-fn clean_directory(path: &PathBuf) -> (u64, Vec<String>) {
-    let mut bytes_freed: u64 = 0;
-    let mut errors: Vec<String> = Vec::new();
+/// [`clean_directory`] 的结果。
+///
+/// `pending_reboot` 单独计数而不是把每个文件作为一条错误消息：真实 TEMP 下被
+/// 占用文件可达数百个，逐条展开的 `标记重启后删除: <完整路径>` 文本会达到数十万
+/// 字节，经 Tauri IPC 回传并整段写入日志文件。
+///
+/// `pub` 是为了让集成测试能**确定性地**验证消息长度上界
+/// （构造 >[`MAX_REPORTED_ERRORS`] 条错误后断言消息有界）——该上界只在
+/// 「无法登记重启删除」分支起作用，而提权进程上永远走不到那个分支，
+/// 因此无法靠 `clean_temp_files()` 端到端触发（`cargo test --lib` 在本机因
+/// 既有的 comctl32 加载问题不可用，单元测试无法覆盖）。
+pub struct CleanOutcome {
+    /// 成功删除的字节数（仅统计真正删掉的文件）
+    pub bytes_freed: u64,
+    /// 被占用、已登记「重启后删除」的文件数（正常结果，不算失败）
+    pub pending_reboot: u64,
+    /// 已展开的详情行（长度上界见 [`MAX_REPORTED_ERRORS`]）
+    pub errors: Vec<String>,
+    /// 因超出 [`MAX_REPORTED_ERRORS`] 被压掉的详情行数
+    pub suppressed_errors: u64,
+}
 
+/// 每次 [`clean_directory`] 最多逐条记录的错误数。
+///
+/// 超出的部分只计数、不展开路径，保证消息长度有界（IPC + 日志安全）。
+/// 非提权进程下 `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)` 会失败
+/// （该 API 要求进程属于 Administrators 组），此时每个被占用文件都走这条
+/// else 分支——正是最需要封顶的场景。
+///
+/// 注意：上界是**每次 `clean_directory` 调用**，不是每次操作。
+/// `clean_temp_files` 调 3 次，`clean_shader_cache` 会链式调用多次
+/// （NVIDIA/AMD/DirectX 各路径 + Steam 各库各目录），故单次操作的消息
+/// 上界约为 `调用次数 × MAX_REPORTED_ERRORS` 行。
+pub const MAX_REPORTED_ERRORS: usize = 20;
+
+impl CleanOutcome {
+    /// 新建空结果。
+    pub fn new() -> Self {
+        Self {
+            bytes_freed: 0,
+            pending_reboot: 0,
+            errors: Vec::new(),
+            suppressed_errors: 0,
+        }
+    }
+
+    /// 记录一条错误；超过 [`MAX_REPORTED_ERRORS`] 后仅计数不展开，
+    /// 使消息长度与文件数解耦。
+    pub fn push_error(&mut self, msg: String) {
+        if self.errors.len() < MAX_REPORTED_ERRORS {
+            self.errors.push(msg);
+        } else {
+            self.suppressed_errors += 1;
+        }
+    }
+
+    /// 把本次结果追加到调用方的消息/失败标记中（各调用方共用，避免口径不一致）。
+    ///
+    /// - 已登记重启删除的文件 → 汇总成一行，不算失败
+    /// - 有界数量的详情行 → 逐条追加，标记为失败
+    /// - 超出上限而被压掉的行 → 汇总成一行，仍标记为失败（不能静默丢失信息）
+    ///
+    /// **调用方应优先使用本方法**；若自行拼装消息，务必一并消费
+    /// `suppressed_errors`，否则会静默丢失超限信息。
+    pub fn extend_messages(&self, messages: &mut Vec<String>, has_errors: &mut bool) {
+        if self.pending_reboot > 0 {
+            messages.push(format!(
+                "{} 个文件正在使用中，已安排重启后自动删除",
+                self.pending_reboot
+            ));
+        }
+        for e in &self.errors {
+            messages.push(format!("  错误: {}", e));
+        }
+        if self.suppressed_errors > 0 {
+            messages.push(format!(
+                "  另有 {} 个文件无法删除（已省略逐条明细）",
+                self.suppressed_errors
+            ));
+        }
+        *has_errors |= !self.errors.is_empty() || self.suppressed_errors > 0;
+    }
+}
+
+impl Default for CleanOutcome {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn clean_directory(path: &PathBuf) -> CleanOutcome {
+    let mut out = CleanOutcome::new();
+    // 整棵目录树的删除重试退避共享同一截止时间（总等待量封顶，与文件数无关）
+    let retry_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(RETRY_BUDGET_MS);
+    clean_directory_inner(path, retry_deadline, &mut out);
+    out
+}
+
+/// [`clean_directory`] 的递归实现：`retry_deadline` 在整棵目录树内共享。
+fn clean_directory_inner(
+    path: &PathBuf,
+    retry_deadline: std::time::Instant,
+    out: &mut CleanOutcome,
+) {
     if !path.exists() {
-        return (0, errors);
+        return;
     }
 
     match std::fs::read_dir(path) {
@@ -365,26 +465,25 @@ fn clean_directory(path: &PathBuf) -> (u64, Vec<String>) {
                         );
                         continue;
                     }
-                    let (sub_bytes, sub_errors) = clean_directory(&entry_path);
-                    bytes_freed += sub_bytes;
-                    errors.extend(sub_errors);
+                    clean_directory_inner(&entry_path, retry_deadline, out);
                 } else {
                     match entry.metadata() {
                         Ok(meta) => {
                             // 只读文件无法直接删除，先清除只读属性
                             clear_readonly(&entry_path);
                             // 删除成功才计入释放字节
-                            match delete_with_retry(&entry_path) {
-                                Ok(_) => bytes_freed += meta.len(),
+                            match delete_with_retry(&entry_path, retry_deadline) {
+                                Ok(_) => out.bytes_freed += meta.len(),
                                 Err(_) => {
                                     // 被占用无法删除 → 标记重启后删除（标准方案）
                                     if mark_delete_on_reboot(&entry_path) {
-                                        errors.push(format!(
-                                            "标记重启后删除: {}",
-                                            entry_path.display()
-                                        ));
+                                        // 已入重启队列 = 正常结果，不是失败
+                                        out.pending_reboot += 1;
                                     } else {
-                                        errors.push(format!(
+                                        // 非提权进程会走到这里（MoveFileExW 要求
+                                        // Administrators 组）。push_error 保证详情行
+                                        // 数量有上界，避免消息随文件数线性膨胀。
+                                        out.push_error(format!(
                                             "删除 {} 失败（无法标记重启删除）",
                                             entry_path.display()
                                         ));
@@ -393,18 +492,20 @@ fn clean_directory(path: &PathBuf) -> (u64, Vec<String>) {
                             }
                         }
                         Err(e) => {
-                            errors.push(format!("读取 {} 元数据失败: {}", entry_path.display(), e));
+                            out.push_error(format!(
+                                "读取 {} 元数据失败: {}",
+                                entry_path.display(),
+                                e
+                            ));
                         }
                     }
                 }
             }
         }
         Err(e) => {
-            errors.push(format!("读取目录 {} 失败: {}", path.display(), e));
+            out.push_error(format!("读取目录 {} 失败: {}", path.display(), e));
         }
     }
-
-    (bytes_freed, errors)
 }
 
 /// Check if a path is a Windows reparse point (symlink / junction).
@@ -496,31 +597,21 @@ fn clean_paths(paths: &[PathBuf], operation: &str) -> CleanupResult {
     let mut total_bytes: u64 = 0;
     let mut messages: Vec<String> = Vec::new();
     let mut has_errors = false;
-    let mut pending_reboot = 0u32;
     for path in paths {
         if path.exists() {
-            let (bytes, errors) = clean_directory(path);
-            total_bytes += bytes;
-            messages.push(format!("清理 {}: 释放 {} 字节", path.display(), bytes));
+            let out = clean_directory(path);
+            total_bytes += out.bytes_freed;
+            messages.push(format!(
+                "清理 {}: 释放 {} 字节",
+                path.display(),
+                out.bytes_freed
+            ));
             // 缓存目录清空后删除空目录，实现彻底清理
             remove_empty_dirs(path);
-            for e in errors {
-                if e.starts_with("标记重启后删除") {
-                    pending_reboot += 1;
-                } else {
-                    has_errors = true;
-                }
-                messages.push(format!("  {}", e));
-            }
+            out.extend_messages(&mut messages, &mut has_errors);
         } else {
             messages.push(format!("未发现缓存目录: {}", path.display()));
         }
-    }
-    if pending_reboot > 0 {
-        messages.push(format!(
-            "{} 个被占用文件已标记为重启后删除，重启后系统将自动清理",
-            pending_reboot
-        ));
     }
     CleanupResult {
         operation: operation.to_string(),
@@ -667,16 +758,16 @@ fn clean_steam_shader_cache(steam_path: &PathBuf) -> (u64, Vec<String>) {
         // 1. Clean generic shader cache folder for the library
         let shader_cache = lib.join("steamapps").join("shadercache");
         if shader_cache.exists() {
-            let (bytes, errors) = clean_directory(&shader_cache);
-            total_bytes += bytes;
+            let out = clean_directory(&shader_cache);
+            total_bytes += out.bytes_freed;
             messages.push(format!(
                 "清理 Steam 着色器缓存 {}: {} 字节",
                 shader_cache.display(),
-                bytes
+                out.bytes_freed
             ));
-            for e in errors {
-                messages.push(format!("  错误: {}", e));
-            }
+            // clean_steam_shader_cache 无失败通道，success 由调用方按消息文本判定
+            let mut unreported = false;
+            out.extend_messages(&mut messages, &mut unreported);
         }
 
         // 2. CS2 (730) specific deep clean
@@ -695,15 +786,18 @@ fn clean_steam_shader_cache(steam_path: &PathBuf) -> (u64, Vec<String>) {
                 clear_readonly_recursive(&folder_path);
                 if let Err(e) = std::fs::remove_dir_all(&folder_path) {
                     // 部分文件被占用 → 改用 clean_directory 删可删的，占用文件标记重启删除
-                    let (bytes, errors) = clean_directory(&folder_path);
-                    total_bytes += bytes;
-                    let mut pending = 0u32;
-                    for err in &errors {
-                        if err.starts_with("标记重启后删除") {
-                            pending += 1;
-                        } else {
-                            messages.push(format!("  错误: {}", err));
-                        }
+                    let out = clean_directory(&folder_path);
+                    total_bytes += out.bytes_freed;
+                    let pending = out.pending_reboot;
+                    for err in &out.errors {
+                        messages.push(format!("  错误: {}", err));
+                    }
+                    // 超限被压掉的明细必须汇总可见（否则本分支会静默丢信息）
+                    if out.suppressed_errors > 0 {
+                        messages.push(format!(
+                            "  另有 {} 个文件无法删除（已省略逐条明细）",
+                            out.suppressed_errors
+                        ));
                     }
                     let _ = remove_empty_dirs(&folder_path);
                     if pending > 0 {
@@ -735,12 +829,14 @@ fn clean_steam_shader_cache(steam_path: &PathBuf) -> (u64, Vec<String>) {
             .join("csgo")
             .join("shadercache");
         if cs2_game_cache.exists() {
-            let (bytes, errors) = clean_directory(&cs2_game_cache);
-            total_bytes += bytes;
-            messages.push(format!("清理 CS2 游戏目录着色器缓存: {} 字节", bytes));
-            for e in errors {
-                messages.push(format!("  错误: {}", e));
-            }
+            let out = clean_directory(&cs2_game_cache);
+            total_bytes += out.bytes_freed;
+            messages.push(format!(
+                "清理 CS2 游戏目录着色器缓存: {} 字节",
+                out.bytes_freed
+            ));
+            let mut unreported = false;
+            out.extend_messages(&mut messages, &mut unreported);
         }
     }
 
@@ -757,15 +853,10 @@ pub fn clean_temp_files() -> CleanupResult {
     if let Ok(temp) = std::env::var("TEMP") {
         let temp_path = PathBuf::from(&temp);
         if temp_path.exists() {
-            let (bytes, errors) = clean_directory(&temp_path);
-            total_bytes += bytes;
-            messages.push(format!("清理 TEMP: {} 字节", bytes));
-            if !errors.is_empty() {
-                has_errors = true;
-            }
-            for e in errors {
-                messages.push(format!("  错误: {}", e));
-            }
+            let out = clean_directory(&temp_path);
+            total_bytes += out.bytes_freed;
+            messages.push(format!("清理 TEMP: {} 字节", out.bytes_freed));
+            out.extend_messages(&mut messages, &mut has_errors);
         }
     }
 
@@ -773,15 +864,10 @@ pub fn clean_temp_files() -> CleanupResult {
     if let Ok(windir) = std::env::var("WINDIR") {
         let win_temp = PathBuf::from(&windir).join("Temp");
         if win_temp.exists() {
-            let (bytes, errors) = clean_directory(&win_temp);
-            total_bytes += bytes;
-            messages.push(format!("清理 Windows Temp: {} 字节", bytes));
-            if !errors.is_empty() {
-                has_errors = true;
-            }
-            for e in errors {
-                messages.push(format!("  错误: {}", e));
-            }
+            let out = clean_directory(&win_temp);
+            total_bytes += out.bytes_freed;
+            messages.push(format!("清理 Windows Temp: {} 字节", out.bytes_freed));
+            out.extend_messages(&mut messages, &mut has_errors);
         }
     }
 
@@ -789,15 +875,10 @@ pub fn clean_temp_files() -> CleanupResult {
     if let Ok(windir) = std::env::var("WINDIR") {
         let prefetch = PathBuf::from(&windir).join("Prefetch");
         if prefetch.exists() {
-            let (bytes, errors) = clean_directory(&prefetch);
-            total_bytes += bytes;
-            messages.push(format!("清理 Prefetch: {} 字节", bytes));
-            if !errors.is_empty() {
-                has_errors = true;
-            }
-            for e in errors {
-                messages.push(format!("  错误: {}", e));
-            }
+            let out = clean_directory(&prefetch);
+            total_bytes += out.bytes_freed;
+            messages.push(format!("清理 Prefetch: {} 字节", out.bytes_freed));
+            out.extend_messages(&mut messages, &mut has_errors);
         }
     }
 
@@ -982,13 +1063,14 @@ mod tests {
         std::fs::write(&file1, "hello").expect("write a");
         std::fs::write(&file2, "world").expect("write b");
 
-        let (bytes, errors) = clean_directory(&dir);
-        assert!(errors.is_empty(), "errors: {:?}", errors);
+        let out = clean_directory(&dir);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
         assert!(
-            bytes >= 10,
+            out.bytes_freed >= 10,
             "bytes_freed should count deleted files, got {}",
-            bytes
+            out.bytes_freed
         );
+        assert_eq!(out.pending_reboot, 0);
         assert!(!file1.exists(), "file a should be deleted");
         assert!(!file2.exists(), "file b should be deleted");
 
@@ -997,14 +1079,16 @@ mod tests {
 
     #[test]
     fn test_clean_directory_counts_only_deleted() {
-        // 删除被占用的文件应记录错误且不累计字节（模拟：只读目录导致删除失败）
+        // 被占用的文件不得计入释放字节；且应走「重启后删除」通道，
+        // 而不是被当成硬错误（旧行为会把每个占用文件记为 error，
+        // 使 clean_temp_files 在有占用文件时必然返回 success=false）。
         let dir = std::env::temp_dir().join("secm_test_clean_locked");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test dir");
         let file = dir.join("locked.txt");
         std::fs::write(&file, "data").expect("write");
 
-        // 以只读权限打开文件，模拟占用（Windows 上独占打开会阻止删除）
+        // 以独占方式打开文件，模拟占用（Windows 上独占打开会阻止删除）
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -1013,14 +1097,16 @@ mod tests {
                 .share_mode(0) // 不共享读写 → 独占锁定
                 .open(&file)
                 .expect("open locked");
-            let (bytes, errors) = clean_directory(&dir);
-            assert!(!errors.is_empty(), "deleting locked file should error");
-            assert!(
-                bytes == 0,
-                "bytes should NOT count locked file, got {}",
-                bytes
-            );
+            let out = clean_directory(&dir);
+            assert_eq!(out.bytes_freed, 0, "bytes should NOT count locked file");
             assert!(file.exists(), "locked file should remain");
+            // 提权进程可登记重启删除；非提权进程登记失败 → 记错误。
+            // 两种都是可接受结果，关键是绝不能静默吞掉。
+            assert!(
+                out.pending_reboot == 1 || !out.errors.is_empty(),
+                "locked file must be either scheduled for reboot-delete or reported: {:?}",
+                out.errors
+            );
             drop(_handle);
         }
 

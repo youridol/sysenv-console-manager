@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LhmSidecar 单元测试工程。
+    覆盖 CONTRACT-v3.md §5.1/§5.2/§5.3 冻结的映射语义：
+      SensorMatcher（含排除列表）/ HardwareRules / SensorMap 冲突解决 /
+      FanMapper / ComponentProcessor 熔断+Zen5 修正 / MetricUtils / 契约快照形状。
+    运行：cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 与主工程一致：格式化断言不受区域设置影响 -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>LhmSidecar.Tests</AssemblyName>
+    <RootNamespace>LhmSidecar.Tests</RootNamespace>
+    <!-- 测试替身实现的空事件（接口要求）不参与告警 -->
+    <!-- 主工程带 [assembly: SupportedOSPlatform("windows")]，测试工程调用其 Windows-only API
+         会产生 CA1416 噪音；测试本身已固定 win-x64 RID，无需重复标注 -->
+    <NoWarn>$(NoWarn);CS0067;CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../sidecar-lhm.csproj" />
+  </ItemGroup>
+
+</Project>

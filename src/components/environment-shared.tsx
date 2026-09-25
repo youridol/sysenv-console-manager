@@ -7,10 +7,9 @@ import { CardTitle, CardDescription } from "./ui/card";
 
 /**
  * 环境检测域共享模块（从 src/pages/Environment.tsx 拆出）：
- * - DxCheck / renderChecks：检测项清单，DirectX / VC++ / AI 环境共用渲染
+ * - DxCheck / renderChecks：检测项清单，DirectX / VC++ 共用渲染
  * - safeInvoke：命令调用安全包装（失败返回 null，不抛出）
  * - SectionHeader：卡片头部（图标 + 标题 + 描述）
- * 拆分后 Environment.tsx 与新 AiEnvironment.tsx 共用同一实现，避免双份漂移。
  */
 
 /** 检测项条目（与后端 checks 字段契约一致） */
@@ -36,7 +35,7 @@ const statusConfig: Record<
   info: { icon: Info, color: "text-blue-400", bg: "bg-blue-500/10" },
 };
 
-/* ── 检测项清单（DirectX / VC++ / AI 环境共用） ── */
+/* ── 检测项清单（DirectX / VC++ 共用） ── */
 export function renderChecks(checks: DxCheck[]) {
   return (
     <div className="space-y-1">

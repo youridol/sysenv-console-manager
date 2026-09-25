@@ -1,20 +1,43 @@
-/// Hardware sensor module for SECM.
+/// 硬件传感器模块 —— 契约 v3 的**投影层**（sidecar 快照 → 前端 JSON）。
 ///
-/// Pure Rust sensor architecture (no LHM bridge / no PawnIO driver):
-///   CPU freq:   CallNtPowerInformation (powrprof.dll)
-///   CPU usage:  sysinfo
-///   GPU:        nvidia-smi (NVIDIA 卡; 非 NVIDIA/无驱动环境降级为空)
-///   Memory:     GlobalMemoryStatusEx (kernel32) — authoritative
-///   Storage:    sysinfo Disks
+/// 硬件数据的唯一来源是 LhmSidecar（见 `lhm.rs` 与 `sidecar-lhm/CONTRACT-v3.md`）：
+///   - **tier-1**（无需 UAC）：CPU 负载/频率（PDH 性能计数器）、GPU（厂商用户态通道）、
+///     内存节点、每卷磁盘速率/占用、网络、电池 —— sidecar 进程内采集。
+///   - **tier-2**（一次 UAC）：CPU 温度/功耗/电压、主板 SuperIO、磁盘温度。
+///
+/// SECM 侧不再有任何内联探测链路：`CallNtPowerInformation`、WinRing0、ACPI 热区、
+/// `nvidia-smi`、硬编码 TDP 估算表均已删除。本模块只做三件事：
+///   1. 用 `sysinfo` 取进程内权威的 CPU 占用率/每核占用与磁盘容量；
+///   2. 用 `GlobalMemoryStatusEx` 取权威内存总量（sidecar 内存数值仅作型号补充）；
+///   3. 把 sidecar 快照按契约 §7 映射为前端既有字段（字段名保持不变）。
+///
+/// **不伪造 0**：不可用指标一律 0 + `*_source="none"`，前端据 source 渲染 "—"。
+/// `ntapi` / `sysinfo` / `winring0` / `acpi` / `rapl` 已不可能出现在 `*_source` 中。
 use serde::Serialize;
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
 use sysinfo::System;
 
 use crate::debug_warn;
+use crate::lhm::{LhmDiskData, LhmGpuData, LhmSensorResponse};
 
 // ============================================================================
-// Structures
+// 契约收窄后的来源枚举（CONTRACT-v3.md §7；测试与映射断言共用）
+// ============================================================================
+
+/// `cpu.freq_source` 允许值（原 `ntapi | pdh | registry | sysinfo | none`）。
+///
+/// `lhm` 为契约 §7 修订新增：sidecar `clock_source="lhm"` 是 LHM 复合实时频率
+/// （实测值），在 tier-1 PDH/registry 均缺失（计数器被裁剪的 Windows、或
+/// `PerformanceCounterManager` 异步初始化窗口）时由 tier-2 提供，必须保留而非丢弃。
+const FREQ_SOURCES: [&str; 4] = ["pdh", "registry", "lhm", "none"];
+/// `cpu.temp_source` 允许值（原 `lhm | winring0 | acpi | none`）。
+const TEMP_SOURCES: [&str; 2] = ["lhm", "none"];
+/// `cpu.power_source` 允许值（原 `lhm | rapl | estimated | none`）。
+const POWER_SOURCES: [&str; 3] = ["lhm", "estimated", "none"];
+
+// ============================================================================
+// Structures（字段名冻结：src/pages/Dashboard.tsx 直接依赖）
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,16 +47,27 @@ pub struct CpuData {
     pub per_core: Vec<f32>,
     pub core_count: usize,
     pub clock_mhz: f32,
-    /// 频率数据源: "ntapi" | "pdh" | "registry" | "sysinfo" | "none"（前端契约）
+    /// 频率数据源（契约 §7 收窄）: "pdh" | "registry" | "lhm" | "none"
     pub freq_source: String,
     pub temperature: f32,
     pub power_w: f32,
-    /// 温度数据源: "lhm" | "winring0" | "acpi" | "none"
+    /// 温度数据源（契约 §7 收窄）: "lhm" | "none"
     pub temp_source: String,
-    /// 功耗数据源: "rapl" | "estimated" | "none"
+    /// 功耗数据源（契约 §7 收窄）: "lhm" | "estimated" | "none"
     pub power_source: String,
     /// 功耗是否为估算值（true = 前端显示"估算"角标）
     pub power_estimated: bool,
+    /// CPU 占用率是否为**有效采样**（false = 进程内首次采样尚未完成）。
+    ///
+    /// 背景：sysinfo 的 `refresh_cpu()` 基于 PDH 计数器差分，**进程内第一次调用
+    /// 必然拿到 0 空闲时间**，于是 `usage = 100 - 0 = 100%`（per_core 同样全 100）。
+    /// 实测：独立探针第 1 次 100.00%、第 2 次 9.64%、第 3 次 16.78%；
+    /// 生产 `chart_history.jsonl` 中 27 个会话有 23 个（85.2%）首采样为 100%。
+    ///
+    /// 该值本身是"预热中"的伪值，不是真实高负载。后端只负责如实标注，
+    /// 由前端决定是否用「—」占位（见 Dashboard.tsx `cpuSampleReady`）。
+    /// 字段为新增可选契约：旧版前端忽略它即可，不破坏兼容。
+    pub usage_ready: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuData {
@@ -51,7 +85,7 @@ pub struct MemoryData {
     pub used: u64,
     pub available: u64,
     pub usage_percent: f32,
-    /// 内存型号（LHM SPD 一次性读取补充；无则空串，前端可不渲染）
+    /// 内存型号（sidecar 内存节点名 / SPD 型号补充；无则空串，前端可不渲染）
     pub model_name: String,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -70,106 +104,23 @@ pub struct SensorData {
     pub gpu: Vec<GpuData>,
     pub memory: MemoryData,
     pub disks: Vec<DiskData>,
-    /// LHM 主板传感器（温度/风扇/电压分组；LHM 不可用或无数据时 None，前端不渲染）
+    /// 主板传感器（温度/风扇/电压；tier-2 不可用或无数据时 None，前端不渲染卡片）
     pub motherboard: Option<crate::lhm::LhmMotherboardData>,
+    /// tier-2 指标当前是否可读（sidecar 快照 `tier2_available`）
+    pub tier2_available: bool,
+    /// tier-2 不可读原因（sidecar 快照 `tier2_reason`；前端"需要一次管理员批准"提示）
+    pub tier2_reason: Option<String>,
+    /// tier-2 是否已生效（sidecar 快照 `elevated`，含提权伴生进程）
+    pub elevated: bool,
     pub diag: String,
 }
 
 // ============================================================================
-// WinAPI: CallNtPowerInformation (powrprof.dll) — CPU frequency
-// ============================================================================
-
-#[repr(C)]
-struct ProcessorPowerInfo {
-    number: u32,
-    max_mhz: u32,
-    current_mhz: u32,
-    _limit: u32,
-    _max_idle: u32,
-    _cur_idle: u32,
-}
-
-/// 权威逻辑处理器数（`GetSystemInfo().dwNumberOfProcessors`）。
-///
-/// 替代 `std::thread::available_parallelism()`——后者在 Windows 上不受进程
-/// affinity 影响，且可能低估 >64 逻辑处理器系统（F4 修复）。
-/// 布局与 hardware.rs::authoritative_cpu_count 相同（已核实 x64 布局正确）。
-fn authoritative_cpu_count() -> u32 {
-    // SYSTEM_INFO 布局（x64）：union{dwOemId/struct{arch,reserved}} + 页大小 +
-    // 最小/最大地址 + 活动处理器掩码 + dwNumberOfProcessors + ...
-    #[repr(C)]
-    struct SystemInfo {
-        _union: u32,
-        _page_size: u32,
-        _min_address: *const u8,
-        _max_address: *const u8,
-        _active_mask: usize,
-        dw_number_of_processors: u32,
-        _processor_type: u32,
-        _allocation_granularity: u32,
-        _processor_level: u16,
-        _processor_revision: u16,
-    }
-    // SAFETY: SystemInfo 为数值 POD，零值合法（指针字段为空且不 deref）
-    let mut si: SystemInfo = unsafe { std::mem::zeroed() };
-    extern "system" {
-        fn GetSystemInfo(lpSystemInfo: *mut SystemInfo);
-    }
-    // SAFETY: GetSystemInfo 为无参导出，si 由 API 填充
-    unsafe { GetSystemInfo(&mut si) };
-    if si.dw_number_of_processors == 0 {
-        1
-    } else {
-        si.dw_number_of_processors
-    }
-}
-
-/// 通过 `CallNtPowerInformation(ProcessorInformation)` 采样 CPU 平均频率（MHz）。
-///
-/// 返回 `(平均当前频率, 平均最大频率)`；API 失败或频率全为 0 时返回 `(0.0, 0.0)`。
-/// 平均 `max_mhz` 用于"疑似标称"判定（AMD 7800X3D 等平台 `current_mhz` 恒等于
-/// 标称基频，此时 current ≈ max，见
-/// `crate::datasource::cpu_freq::is_suspected_nominal`，v0.21.7 修复）。
-fn cpu_freq_ntapi() -> (f32, f32) {
-    // 缓冲区按 GetSystemInfo 权威逻辑处理器数分配（F4 修复）
-    let count = authoritative_cpu_count();
-    let sz = std::mem::size_of::<ProcessorPowerInfo>() * count as usize;
-    let mut buf = vec![0u8; sz];
-    let rc = unsafe {
-        // SAFETY: input 为 NULL（无输入参数）；输出缓冲 buf 容量 = count × size_of::<ProcessorPowerInfo>，与 API 填充结构体数组匹配
-        extern "system" {
-            fn CallNtPowerInformation(
-                info_level: i32,
-                input: *const u8,
-                input_sz: u32,
-                output: *mut u8,
-                output_sz: u32,
-            ) -> i32;
-        }
-        CallNtPowerInformation(11, std::ptr::null(), 0, buf.as_mut_ptr(), sz as u32)
-    };
-    if rc != 0 {
-        return (0.0, 0.0);
-    }
-    // SAFETY: 返回成功后缓冲含 count 个 ProcessorPowerInfo（缓冲区长度与结构体数组一致，由 count 保证）
-    let infos: &[ProcessorPowerInfo] = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const ProcessorPowerInfo, count as usize)
-    };
-    let sum_current: u32 = infos.iter().map(|p| p.current_mhz).sum();
-    if sum_current > 0 {
-        // avg_max 与 avg_current 同源同除数，作为疑似标称判定的基准
-        let sum_max: u32 = infos.iter().map(|p| p.max_mhz).sum();
-        (
-            sum_current as f32 / count as f32,
-            sum_max as f32 / count as f32,
-        )
-    } else {
-        (0.0, 0.0)
-    }
-}
-
-// ============================================================================
-// WinAPI: GlobalMemoryStatusEx (kernel32) — authoritative memory data
+// WinAPI: GlobalMemoryStatusEx (kernel32) — 权威内存总量
+//
+// 契约 §3：sidecar 的 `memory` 是 LHM 推算值，SECM **仍以本 API 为权威**
+// （内核用户态，零特权，覆盖全部物理内存）。故此处内联 FFI，不经过任何
+// 中间抽象；sidecar 只补充 `model_name`（LHM 内存节点名）。
 // ============================================================================
 
 #[repr(C)]
@@ -185,461 +136,256 @@ struct MemoryStatusEx {
     _avail_ext: u64,
 }
 
-fn memory_status_ex() -> Option<MemoryData> {
+/// 读取权威内存数据；`model_name` 由 `get_memory_data` 从 sidecar 快照补充。
+pub fn get_memory_data(snap: Option<&LhmSensorResponse>) -> MemoryData {
     let mut ms = MaybeUninit::<MemoryStatusEx>::zeroed();
-    unsafe {
+    // SAFETY: `ms` 按 MemoryStatusEx 大小分配且零初始化；length 由调用方填
+    // size_of；返回非 0 表示整块结构体已被内核填充，assume_init 合法。
+    let sampled = unsafe {
         (*ms.as_mut_ptr()).length = std::mem::size_of::<MemoryStatusEx>() as u32;
         extern "system" {
             fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
         }
         if GlobalMemoryStatusEx(ms.as_mut_ptr()) == 0 {
-            return None;
+            None
+        } else {
+            Some(ms.assume_init())
         }
-        let ms = ms.assume_init();
-        Some(MemoryData {
+    };
+
+    let mut mem = match sampled {
+        Some(ms) => MemoryData {
             total: ms.total_phys,
-            used: ms.total_phys - ms.avail_phys,
+            used: ms.total_phys.saturating_sub(ms.avail_phys),
             available: ms.avail_phys,
             usage_percent: if ms.total_phys > 0 {
-                ms.memory_load as f32
+                (ms.memory_load as f32).clamp(0.0, 100.0)
             } else {
                 0.0
             },
             model_name: String::new(),
-        })
-    }
-}
+        },
+        None => {
+            // 权威 API 不可用（理论上仅在非 Windows/极端受限环境）→ sysinfo 兜底，
+            // 仍然保持"数值真实、不伪造"的语义。
+            debug_warn!("sensor", "GlobalMemoryStatusEx 失败，内存数据回退 sysinfo");
+            let mut sys = System::new();
+            sys.refresh_memory();
+            let t = sys.total_memory();
+            MemoryData {
+                total: t,
+                used: sys.used_memory(),
+                available: sys.available_memory(),
+                usage_percent: if t > 0 {
+                    ((sys.used_memory() as f64 / t as f64) * 100.0) as f32
+                } else {
+                    0.0
+                },
+                model_name: String::new(),
+            }
+        }
+    };
 
-// ============================================================================
-// CPU — WinAPI freq + sysinfo usage（温度由 lhm/WinRing0 数据源回填）
-// ============================================================================
-
-/// RAPL 功耗采样状态（上次计数 + 时间戳；进程级互斥，串行化差值计算）。
-static CPU_POWER_STATE: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
-
-/// 经 WinRing0 RAPL 计算 CPU package 功耗（瓦；差值法）。
-///
-/// 首次采样仅记录基线返回 None；后续采样用能量计数差值 / 时间间隔计算功耗。
-/// 通道不可用（驱动未加载/平台不支持）返回 None，调用方降级为 0。
-fn cpu_power_rapl() -> Option<f32> {
-    let (_energy, count, unit) =
-        crate::driver_install::winring0::winring0_rapl_energy()?;
-    let mut guard = CPU_POWER_STATE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, prev_count)) = guard.as_ref() {
-        let dt = at.elapsed().as_secs_f64();
-        if dt > 0.05 && dt < 10.0 {
-            // 32 位能量计数回绕：wrapping_sub 取模差值（秒级采样最多回绕一次）
-            let delta_count = (count.wrapping_sub(*prev_count)) & 0xFFFF_FFFF;
-            let delta_j = delta_count as f64 * unit;
-            *guard = Some((std::time::Instant::now(), count));
-            return Some((delta_j / dt) as f32);
+    // 型号名：sidecar 内存节点（LHM 节点名 / SPD 型号，best-effort）。
+    // v3 语义变化：不再由 LHM SPD 一次性读取单独填充，而是快照内存节点名直接投影。
+    if let Some(name) = snap
+        .and_then(|s| s.memory.as_ref())
+        .and_then(|m| m.name.as_deref())
+    {
+        if !name.is_empty() {
+            mem.model_name = name.to_string();
         }
     }
-    *guard = Some((std::time::Instant::now(), count));
-    None
+    mem
 }
 
 // ============================================================================
-// CPU 功耗估算（D3：RAPL 不可用时的降级方案）
+// sidecar 快照 → 前端来源映射（CONTRACT-v3.md §7，逐条冻结）
 // ============================================================================
 
-/// (型号关键词, TDP 瓦)。顺序敏感：长型号必须排在短型号之前（如
-/// "7950X3D" 在 "7950X" 前、"13900KS" 在 "13900K" 前），否则短关键词
-/// 会抢先命中长型号字符串。KF/KS 后缀与 K 同 TDP，无需单列。
-const CPU_TDP_TABLE: &[(&str, u32)] = &[
-    // AMD Ryzen 7000 系列（Zen4 桌面）
-    ("7950X3D", 120),
-    ("7950X", 170),
-    ("7900X3D", 120),
-    ("7900X", 170),
-    ("7900", 65),
-    ("7800X3D", 120),
-    ("7700X", 105),
-    ("RYZEN 7 7700", 65),
-    ("7600X", 105),
-    ("7600", 65),
-    ("7500F", 65),
-    // AMD Ryzen 5000 系列（Zen3 桌面）
-    ("5950X", 105),
-    ("5900X", 105),
-    ("5900", 65),
-    ("5800X3D", 105),
-    ("5800X", 105),
-    ("5700X", 65),
-    ("5600X", 65),
-    ("5600G", 65),
-    ("5600", 65),
-    ("5500", 65),
-    // Intel 13 代（Raptor Lake 桌面）
-    ("13900KS", 125),
-    ("13900K", 125),
-    ("13900", 65),
-    ("13700K", 125),
-    ("13700", 65),
-    ("13600K", 125),
-    ("13600", 65),
-    ("13400", 65),
-    ("13100", 60),
-    // Intel 14 代（Raptor Lake Refresh 桌面）
-    ("14900KS", 125),
-    ("14900K", 125),
-    ("14900", 65),
-    ("14700K", 125),
-    ("14700", 65),
-    ("14600K", 125),
-    ("14500", 65),
-    ("14400", 65),
-    // ==== v1.16.0 扩充：X99/X79/全 Intel/全 AMD 平台兼容 ====
-    // 匹配策略：contains 大小写不敏感 + 顺序敏感（长关键词必在短关键词前；
-    // Xeon v3/v4 → v2 → v1（" 0" 注册表名格式）→ 裸型号兜底）
-    // TDP 来源：Intel ARK / AMD 官方数据，secm-dev 2026-08-13 逐条核对
-    // Intel 12 代（Alder Lake 桌面）
-    ("12900KS", 150),
-    ("12900K", 125),
-    ("12900", 65),
-    ("12700K", 125),
-    ("12700", 65),
-    ("12600K", 125),
-    ("12400", 65),
-    ("12100", 60),
-    // 老 Intel 桌面/至尊（Sandy Bridge-E ~ Coffee Lake，X79/X99 及更早）
-    ("6950X", 140),
-    ("6900K", 140),
-    ("6850K", 140),
-    ("6800K", 140),
-    ("5960X", 140),
-    ("5930K", 140),
-    ("5820K", 140),
-    ("4930K", 130),
-    ("4820K", 130),
-    ("3960X", 130),
-    ("3930K", 130),
-    ("I7-3820", 130), // 带前缀避免误匹配移动版 3820QM
-    ("9900K", 95),
-    ("9700K", 95),
-    ("8700K", 95),
-    ("7700K", 91),
-    ("6700K", 91),
-    ("4790K", 88),
-    ("4770K", 84),
-    ("3770K", 77),
-    ("2600K", 95),
-    // Xeon E5-1600 v1~v4（X79/X99 工作站；v1/v2 = 130W，v3/v4 = 140W）
-    ("E5-1680 V4", 140),
-    ("E5-1680 V3", 140),
-    ("E5-1680 V2", 130),
-    ("E5-1680", 140),
-    ("E5-1660 V4", 140),
-    ("E5-1660 V3", 140),
-    ("E5-1660 V2", 130),
-    ("E5-1660 0", 130),
-    ("E5-1660", 130),
-    ("E5-1650 V4", 140),
-    ("E5-1650 V3", 140),
-    ("E5-1650 V2", 130),
-    ("E5-1650 0", 130),
-    ("E5-1650", 130),
-    ("E5-1620 V4", 140),
-    ("E5-1620 V3", 140),
-    ("E5-1620 V2", 130),
-    ("E5-1620 0", 130),
-    ("E5-1620", 130),
-    // Xeon E5-2600 v1~v4（X79/X99 服务器；每型号 V4→V3→V2→V1(" 0")→裸）
-    ("E5-2699 V4", 145),
-    ("E5-2699 V3", 145),
-    ("E5-2699 V2", 130),
-    ("E5-2699", 145),
-    ("E5-2697 V4", 145),
-    ("E5-2697 V3", 145),
-    ("E5-2697 V2", 130),
-    ("E5-2697", 145),
-    ("E5-2690 V4", 135),
-    ("E5-2690 V3", 135),
-    ("E5-2690 V2", 130),
-    ("E5-2690 0", 135),
-    ("E5-2690", 135),
-    ("E5-2687W V4", 160),
-    ("E5-2687W V3", 160),
-    ("E5-2687W 0", 150),
-    ("E5-2687W", 150),
-    ("E5-2680 V4", 120),
-    ("E5-2680 V3", 120),
-    ("E5-2680 V2", 115),
-    ("E5-2680 0", 130),
-    ("E5-2680", 130),
-    ("E5-2670 V4", 120),
-    ("E5-2670 V3", 120),
-    ("E5-2670 V2", 115),
-    ("E5-2670 0", 115),
-    ("E5-2670", 115),
-    ("E5-2660 V4", 105),
-    ("E5-2660 V3", 105),
-    ("E5-2660 V2", 95),
-    ("E5-2660 0", 95),
-    ("E5-2660", 95),
-    ("E5-2650 V4", 105),
-    ("E5-2650 V3", 105),
-    ("E5-2650 V2", 95),
-    ("E5-2650 0", 95),
-    ("E5-2650", 95),
-    ("E5-2640 V4", 90),
-    ("E5-2640 V3", 90),
-    ("E5-2640 V2", 95),
-    ("E5-2640 0", 95),
-    ("E5-2640", 95),
-    ("E5-2637 V4", 135),
-    ("E5-2637 V3", 135),
-    ("E5-2637 V2", 130),
-    ("E5-2637 0", 80),
-    ("E5-2637", 80),
-    ("E5-2630 V4", 85),
-    ("E5-2630 V3", 85),
-    ("E5-2630 V2", 80),
-    ("E5-2630 0", 95),
-    ("E5-2630", 95),
-    ("E5-2623 V4", 85),
-    ("E5-2623 V3", 105),
-    ("E5-2623", 85),
-    ("E5-2620 V4", 85),
-    ("E5-2620 V3", 85),
-    ("E5-2620 V2", 80),
-    ("E5-2620 0", 95),
-    ("E5-2620", 95),
-    ("E5-2603 V4", 85),
-    ("E5-2603 V3", 85),
-    ("E5-2603 V2", 80),
-    ("E5-2603 0", 80),
-    ("E5-2603", 80),
-    // AMD FX（Zambezi/Vishera，AM3+）：ProcessorNameString 为
-    // "AMD FX(tm)-8350 Eight-Core Processor"（CPUID brand string 带 (tm)），
-    // 故每型号列两个关键词（带/不带 (TM)，带 TM 在前）；E 后缀低功耗版先于非 E
-    ("FX(TM)-9590", 220),
-    ("FX-9590", 220),
-    ("FX(TM)-9370", 220),
-    ("FX-9370", 220),
-    ("FX(TM)-8370E", 95),
-    ("FX-8370E", 95),
-    ("FX(TM)-8370", 125),
-    ("FX-8370", 125),
-    ("FX(TM)-8350", 125),
-    ("FX-8350", 125),
-    ("FX(TM)-8320E", 95),
-    ("FX-8320E", 95),
-    ("FX(TM)-8320", 125),
-    ("FX-8320", 125),
-    ("FX(TM)-8300", 95),
-    ("FX-8300", 95),
-    ("FX(TM)-6350", 125),
-    ("FX-6350", 125),
-    ("FX(TM)-6300", 95),
-    ("FX-6300", 95),
-    ("FX(TM)-6100", 95),
-    ("FX-6100", 95),
-    ("FX(TM)-4300", 95),
-    ("FX-4300", 95),
-    ("FX(TM)-4130", 125),
-    ("FX-4130", 125),
-    // AMD Phenom II（K10，AM3）
-    ("1100T", 125),
-    ("1090T", 125),
-    ("1055T", 95),
-    ("1045T", 95),
-    ("X4 980", 125),
-    ("X4 975", 125),
-    ("X4 970", 125),
-    ("X4 965", 125),
-];
-
-/// 从未知 CPU 型号匹配 TDP 表（纯逻辑，可注入测试）。
+/// sidecar `cpu.clock_mhz` / `clock_source` → `(clock_mhz, freq_source)`。
 ///
-/// 匹配前转大写；返回 None = 表中无此型号（调用方用 65W 默认）。
-fn match_tdp(cpu_brand: &str) -> Option<u32> {
-    let upper = cpu_brand.to_ascii_uppercase();
-    CPU_TDP_TABLE
-        .iter()
-        .find(|(key, _)| upper.contains(key))
-        .map(|(_, tdp)| *tdp)
-}
-
-/// 读取 CPU 型号名（注册表 ProcessorNameString，零特权；sysinfo brand() 同源）。
-fn read_processor_name() -> Option<String> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
-    match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") {
-        Ok(k) => k.get_value::<String, _>("ProcessorNameString").ok(),
-        Err(_) => None,
-    }
-}
-
-/// 功耗估算纯逻辑：TDP × usage%（usage 截断到 [0, 100]）。
-fn estimate_power(usage: f32, tdp_w: f32) -> f32 {
-    (tdp_w * (usage.clamp(0.0, 100.0) / 100.0)).max(0.0)
-}
-
-/// 估算 CPU 功耗：标称 TDP × usage%。
+/// 契约 §7：`"perfcounter"`（PDH `% Processor Performance`）→ `"pdh"`；
+/// `"registry"`（标称）→ `"registry"`；`"lhm"`（LHM 复合实时频率，实测值）→ `"lhm"`；
+/// 其余（`"none"` / 空串 / 值缺失或非正）→ `"none"`。
 ///
-/// 返回 (功耗瓦, TDP 是否来自已知型号表)；型号匹配失败用 65W 默认并返回 false
-/// （"标注未知"：前端/日志可区分精确型号与兜底默认）。
-/// 仅作参考值（±30% 级），调用方必须标记为估算（power_estimated=true）。
-fn estimate_cpu_power(usage: f32) -> (f32, bool) {
-    let tdp_known = read_processor_name().and_then(|n| match_tdp(&n));
-    match tdp_known {
-        Some(tdp) => (estimate_power(usage, tdp as f32), true),
-        None => (estimate_power(usage, 65.0), false),
-    }
+/// `"lhm"` 分支不可省略：sidecar 在 tier-1 PDH 与 registry `~MHz` 双双缺失
+/// （计数器被裁剪的系统、或性能计数器异步初始化窗口）而 tier-2 已生效时会回退到
+/// LHM 复合频率——那是真实测量值，丢弃会正好在"管理员场景"下丢数据。
+/// `none` 时频率归零，维持「source=none ⇄ 值=0」不变式（不用 0 冒充有效数据）。
+fn map_cpu_clock(snap: Option<&LhmSensorResponse>) -> (f32, &'static str) {
+    let cpu = match snap {
+        Some(s) => &s.cpu,
+        None => return (0.0, "none"),
+    };
+    let valid = cpu.clock_mhz.filter(|v| v.is_finite() && *v > 0.0);
+    let (clock, src) = match (cpu.clock_source.as_str(), valid) {
+        ("perfcounter", Some(v)) => (v, "pdh"),
+        ("registry", Some(v)) => (v, "registry"),
+        ("lhm", Some(v)) => (v, "lhm"),
+        _ => (0.0, "none"),
+    };
+    debug_assert!(FREQ_SOURCES.contains(&src), "freq_source 越界: {src}");
+    (clock, src)
 }
 
-/// 获取 CPU 数据；温度回退链：LHM → WinRing0 SMN（AMD Zen）→ ACPI 热区 → 0；
-/// 功耗：LHM RAPL 实测 → WinRing0 RAPL 差值法（AMD Zen）→ TDP×usage 估算并标记。
-/// 数据源标记（temp_source/power_source/power_estimated）为前端 T3 契约。
+/// sidecar `cpu.package_temp_c` / `temp_source` → `(temperature, temp_source)`。
 ///
-/// v1.17.0：LHM 温度/功耗改为参数注入（get_sensor_data 每周期先调 `lhm_snapshot()`
-/// 取全量快照后传入，避免本函数内二次 HTTP 轮询）；`lhm_diag_src` 为快照诊断串
-/// （LHM 不可用时的降级原因，透出到 diag 的 [lhm:...] 注记）。
-pub fn get_cpu_data(
-    sys: &System,
-    lhm_temp: Option<f32>,
-    lhm_power: Option<f32>,
-    lhm_diag_src: &str,
-) -> (CpuData, String) {
-    let cpu = sys.cpus();
-    let name = cpu
-        .first()
-        .map(|c| c.brand().to_string())
-        .unwrap_or_else(|| "Unknown CPU".into());
-    let core_count = cpu.len();
-    let mut diag = String::new();
+/// 契约 §7：sidecar `temp_source="lhm"` → `"lhm"`；否则 `"none"`。
+/// tier-2 缺失时 sidecar 给 `null`，本函数输出 0 + `"none"`（前端 "—"）。
+fn map_cpu_temp(snap: Option<&LhmSensorResponse>) -> (f32, &'static str) {
+    let cpu = match snap {
+        Some(s) => &s.cpu,
+        None => return (0.0, "none"),
+    };
+    let valid = cpu.package_temp_c.filter(|v| v.is_finite() && *v > 0.0);
+    let (temp, src) = match (cpu.temp_source.as_str(), valid) {
+        ("lhm", Some(v)) => (v, "lhm"),
+        _ => (0.0, "none"),
+    };
+    debug_assert!(TEMP_SOURCES.contains(&src), "temp_source 越界: {src}");
+    (temp, src)
+}
 
-    // 频率：CallNtPowerInformation 为主（实时）；"疑似标称"判定（v0.21.7）——
-    // AMD 7800X3D 等平台该 API 的 current_mhz 恒等于标称基频（不随负载变化），
-    // 此时 current ≈ max_mhz，判定为疑似标称 → 不直接采用，继续走 datasource
-    // 降级链（PDH 实时估算 → 注册表标称，与主路径不共用失败点），再失败用
-    // sysinfo 当前频率兜底。freq_source 为前端契约（估算/标称角标区分）。
-    // 频率主链路：ntapi 实时值；"疑似标称"判定（AMD 恒标称平台）→ datasource
-    // 降级链（PDH 实时估算 → 注册表标称）；datasource 全失败 → sysinfo 兜底。
-    // 返回 (频率, 数据源, 诊断原因串)——原因串仅在疑似标称兜底/全失败时透出。
-    let (ntapi_freq, ntapi_max) = cpu_freq_ntapi();
-    let (clock_mhz, freq_source, freq_diag): (f32, &str, String) =
-        if ntapi_freq > 0.0
-            && !crate::datasource::cpu_freq::is_suspected_nominal(ntapi_freq, ntapi_max)
-        {
-            // 真实实时值（Intel 平台主路径）：current 随负载变化，非疑似标称
-            (ntapi_freq, "ntapi", String::new())
-        } else {
-            // 疑似标称（或主 API 失败）→ datasource 降级链 + 诊断透出（T2 契约）：
-            // 一次调用同时取频率、数据源与各层失败原因。datasource 内部已做
-            // "ntapi 疑似标称 → PDH 实时估算"判定，PDH 失败时回退 ntapi 标称值
-            // 并带诊断标注（不劣化现状）。
-            let (fallback, src, freq_diag) = crate::datasource::cpu_freq::get_cpu_freq_diag();
-            match fallback {
-                Some(f) => (f, src, freq_diag),
-                None => {
-                    // 注意：sysinfo 0.30.13 的 Windows 频率实现内部同样调用
-                    // CallNtPowerInformation(ProcessorInformation)，与上方主路径同源——
-                    // 主路径失败时此兜底大概率同样返回 0（伪兜底，仅防御实现差异/瞬时抖动）。
-                    // 真正独立的兜底是 datasource 用户态降级链（PDH/registry，见上）。
-                    let f = cpu.first().map(|c| c.frequency() as f32).unwrap_or(0.0);
-                    if f > 0.0 {
-                        (f, "sysinfo", String::new())
-                    } else {
-                        // 全链路失败：原因串（API 名+错误码）透出供前端诊断摘要
-                        (0.0, "none", freq_diag)
-                    }
-                }
-            }
-        };
-    // diag 透出：疑似标称兜底标注"标称"；全失败透出各层失败原因
-    if clock_mhz > 0.0 {
-        if freq_source == "ntapi" && !freq_diag.is_empty() {
-            // datasource 疑似标称兜底路径（diag 带"ntapi疑似标称"原因）：
-            // 标注"标称"，与真实 ntapi 实时值区分（不丢失诊断信息）
-            diag.push_str(&format!("FREQ={:.0}(ntapi,标称) ", clock_mhz));
-        } else {
-            diag.push_str(&format!("FREQ={:.0}({}) ", clock_mhz, freq_source));
+/// sidecar `cpu.power_w` / `power_source` → `(power_w, power_source, power_estimated)`。
+///
+/// 契约 §7：`power_source="lhm"` → `"lhm"` + `power_estimated=false`；否则若
+/// `power_w` 有值 → `"estimated"` + `true`；否则 `"none"`。Rust 侧以 0 表示 null，
+/// 故"有值"要求有限且为正。
+fn map_cpu_power(snap: Option<&LhmSensorResponse>) -> (f32, &'static str, bool) {
+    let cpu = match snap {
+        Some(s) => &s.cpu,
+        None => return (0.0, "none", false),
+    };
+    let valid = cpu.power_w.filter(|v| v.is_finite() && *v > 0.0);
+    let (power, src, estimated) = if cpu.power_source == "lhm" {
+        match valid {
+            Some(v) => (v, "lhm", false),
+            None => (0.0, "none", false),
         }
     } else {
-        diag.push_str("FREQ=0(none) ");
-        if !freq_diag.is_empty() {
-            diag.push_str(&format!("原因:{freq_diag}"));
+        match valid {
+            Some(v) => (v, "estimated", true),
+            None => (0.0, "none", false),
         }
-    }
-
-    let usage = sys.global_cpu_info().cpu_usage();
-    let per_core: Vec<f32> = cpu.iter().map(|c| c.cpu_usage()).collect();
-    diag.push_str(&format!("USAGE={:.1}%", usage));
-
-    // 温度：LHM sidecar（进程隔离，最高优先级）→ WinRing0 SMN（AMD Zen，毫℃）→
-    // ACPI 热区（纯用户态兜底）→ 无数据
-    let mut temperature = 0.0_f32;
-    let mut temp_source = "none";
-    // LHM sidecar：进程隔离的 LibreHardwareMonitor 数据源（PawnIO 驱动，需管理员提权）；
-    // 温度由 get_sensor_data 每周期取全量快照后注入（避免本函数内二次 HTTP 轮询）；
-    // 不可用时不劣化原链，失败原因附到 diag（lhm_note）
-    let mut lhm_note = String::new();
-    if let Some(t) = lhm_temp {
-        if t > 0.0 {
-            temperature = t;
-            temp_source = "lhm";
-            diag.push_str(&format!(" TEMP={:.1}℃(lhm)", temperature));
-        } else if !lhm_diag_src.is_empty() {
-            lhm_note = format!("[lhm:{}]", lhm_diag_src);
-        }
-    } else if !lhm_diag_src.is_empty() {
-        lhm_note = format!("[lhm:{}]", lhm_diag_src);
-    }
-    // WinRing0 SMN（AMD Zen，毫℃）
-    if temperature <= 0.0 {
-        if let Some(mc) = crate::driver_install::winring0::winring0_cpu_temp() {
-            temperature = mc as f32 / 1000.0;
-            temp_source = "winring0";
-            diag.push_str(&format!(" TEMP={:.1}℃(winring0)", temperature));
-        }
-    }
-    // ACPI 热区（纯用户态）
-    if temperature <= 0.0 {
-        if let Some(c) = crate::driver_install::acpi::thermal_zone_temp() {
-            temperature = c as f32;
-            temp_source = "acpi";
-            diag.push_str(&format!(" TEMP={:.1}℃(acpi)", temperature));
-        }
-    }
-    if temperature <= 0.0 {
-        diag.push_str(&format!(" TEMP=n/a{}", lhm_note));
-        debug_warn!(
-            "sensor",
-            "CPU temp unavailable (lhm/WinRing0/ACPI 全通道不可用，可能被杀软拦截)"
-        );
-    } else if !lhm_note.is_empty() {
-        // LHM 通道失败但温度已被兜底源（winring0/acpi）填补时，失败原因仍必须
-        // 透出到 diag——否则用户无法感知 LHM 通道失效（目标机「未见 lhm 诊断」的
-        // 直接原因，v1.17.0 修复：诊断信息不因降级成功而被静默）
-        diag.push_str(&format!(" {}", lhm_note));
-    }
-
-    // 功耗：LHM RAPL 实测（Intel/AMD 全覆盖，power_source="lhm"，前端同 rapl 实测
-    // 语义不显示「估算」角标）→ WinRing0 RAPL 差值法（AMD Zen package）→ 不可用时
-    // TDP×usage 估算（D3）
-    let (power_w, power_source, power_estimated) = match lhm_power {
-        Some(p) if p > 0.0 => {
-            diag.push_str(&format!(" PWR={:.1}W(lhm)", p));
-            (p, "lhm", false)
-        }
-        _ => match cpu_power_rapl() {
-            Some(p) if p > 0.0 => {
-                diag.push_str(&format!(" PWR={:.1}W(rapl)", p));
-                (p, "rapl", false)
-            }
-            _ => {
-                let (est, tdp_known) = estimate_cpu_power(usage);
-                if tdp_known {
-                    diag.push_str(&format!(" PWR≈{:.1}W(estimated)", est));
-                } else {
-                    diag.push_str(&format!(" PWR≈{:.1}W(estimated,未知型号默认65W)", est));
-                }
-                (est, "estimated", true)
-            }
-        },
     };
+    debug_assert!(POWER_SOURCES.contains(&src), "power_source 越界: {src}");
+    (power, src, estimated)
+}
+
+/// 把 sidecar GPU 节点映射为 `GpuData`。
+///
+/// 过滤「无任何有效指标」的节点：原样输出会得到全 0 的占位卡片（伪造 0）。
+/// 至少一个有效指标才映射；可空字段 → 0（前端据 0 渲染 "—"）。
+fn map_lhm_gpu(g: &LhmGpuData) -> Option<GpuData> {
+    let has_metric = g.temperature_c.is_some()
+        || g.load_percent.is_some()
+        || g.power_w.is_some()
+        || g.core_clock_mhz.is_some()
+        || g.memory_used_bytes.is_some()
+        || g.memory_total_bytes.is_some();
+    if !has_metric {
+        return None;
+    }
+    Some(GpuData {
+        name: g.name.clone(),
+        usage: g.load_percent.unwrap_or(0.0),
+        temperature: g.temperature_c.unwrap_or(0.0),
+        memory_used: g.memory_used_bytes.unwrap_or(0),
+        memory_total: g.memory_total_bytes.unwrap_or(0),
+        clock_mhz: g.core_clock_mhz.unwrap_or(0.0),
+        power_w: g.power_w.unwrap_or(0.0),
+    })
+}
+
+/// 对外 tier-2 权限字段投影：`(tier2_available, elevated, tier2_reason)`。
+///
+/// sidecar 快照不可用（缺失/降级）→ `false/false` + lhm 诊断串（绝不 panic、
+/// 绝不给出空原因）；快照可用但未提供 `tier2_reason` 而 tier-2 不可读时，
+/// 同样回落诊断串，保证前端提示卡始终有可读原因。
+fn tier2_fields(snap: Option<&LhmSensorResponse>, lhm_diag: &str) -> (bool, bool, Option<String>) {
+    match snap {
+        Some(r) => {
+            let reason = match r.tier2_reason.clone() {
+                Some(reason) => Some(reason),
+                None if r.tier2_available => None,
+                None if lhm_diag.is_empty() => None,
+                None => Some(lhm_diag.to_string()),
+            };
+            (r.tier2_available, r.elevated, reason)
+        }
+        None => {
+            let reason = if lhm_diag.is_empty() {
+                "sidecar 快照不可用".to_string()
+            } else {
+                lhm_diag.to_string()
+            };
+            (false, false, Some(reason))
+        }
+    }
+}
+
+// ============================================================================
+// CPU — sysinfo 占用 + sidecar 频率/温度/功耗投影
+// ============================================================================
+
+/// 获取 CPU 数据（契约 §7 投影）。
+///
+/// - 名称/占用率/每核占用：`sysinfo`（进程内用户态，权威，不依赖 sidecar）；
+/// - 频率：sidecar `clock_mhz` + `clock_source` → `pdh` / `registry` / `none`；
+/// - 温度：sidecar tier-2 `package_temp_c` + `temp_source` → `lhm` / `none`；
+/// - 功耗：sidecar `power_w` + `power_source` → `lhm` / `estimated` / `none`。
+///
+/// `snap` 为本周期的全量快照（get_sensor_data 每周期只取 1 次，共享给
+/// CPU/GPU/主板/内存/磁盘）；`lhm_diag_src` 为快照诊断串，原样透出到 diag 的
+/// `[lhm:...]` 注记，便于用户排障（sidecar 缺失/降级原因）。
+pub fn get_cpu_data(
+    sys: &System,
+    snap: Option<&LhmSensorResponse>,
+    lhm_diag_src: &str,
+    usage_ready: bool,
+) -> (CpuData, String) {
+    let cpus = sys.cpus();
+    // CPU 名：sysinfo brand（与注册表 ProcessorNameString 同源）为主，
+    // 极端环境下为空时回落 sidecar CPU 节点名，最后才是占位串。
+    let name = cpus
+        .first()
+        .map(|c| c.brand().to_string())
+        .filter(|n| !n.is_empty())
+        .or_else(|| snap.map(|s| s.cpu.name.clone()).filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| "Unknown CPU".into());
+    let core_count = cpus.len();
+    let usage = sys.global_cpu_info().cpu_usage().clamp(0.0, 100.0);
+    let per_core: Vec<f32> = cpus
+        .iter()
+        .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+        .collect();
+
+    let (clock_mhz, freq_source) = map_cpu_clock(snap);
+    let (temperature, temp_source) = map_cpu_temp(snap);
+    let (power_w, power_source, power_estimated) = map_cpu_power(snap);
+
+    // 诊断串：只报告 sidecar 实际提供的来源（无一内联降级链），并透出 lhm 诊断。
+    let mut diag = String::new();
+    if clock_mhz > 0.0 {
+        diag.push_str(&format!("FREQ={:.0}({}) ", clock_mhz, freq_source));
+    } else {
+        diag.push_str("FREQ=0(none) ");
+    }
+    diag.push_str(&format!("USAGE={:.1}%", usage));
+    if temperature > 0.0 {
+        diag.push_str(&format!(" TEMP={:.1}℃({})", temperature, temp_source));
+    } else {
+        diag.push_str(" TEMP=n/a");
+    }
+    match power_source {
+        "lhm" => diag.push_str(&format!(" PWR={:.1}W(lhm)", power_w)),
+        "estimated" => diag.push_str(&format!(" PWR≈{:.1}W(estimated)", power_w)),
+        _ => diag.push_str(" PWR=n/a"),
+    }
+    if !lhm_diag_src.is_empty() {
+        diag.push_str(&format!(" [lhm:{}]", lhm_diag_src));
+    }
 
     (
         CpuData {
@@ -654,184 +400,17 @@ pub fn get_cpu_data(
             temp_source: temp_source.to_string(),
             power_source: power_source.to_string(),
             power_estimated,
+            usage_ready,
         },
         diag,
     )
 }
 
 // ============================================================================
-// GPU — nvidia-smi 真实采集（NVIDIA 卡；非 NVIDIA/无驱动环境降级为空，不中断）
-// ============================================================================
-
-/// nvidia-smi 查询超时；驱动挂起时避免传感器轮询无限等待。
-const NVIDIA_SMI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// GPU 数据缓存有效期：Dashboard 每秒轮询，nvidia-smi 冷启动 100-300ms，
-/// 缓存 2 秒显著降低子进程开销（温度/功耗秒级无感知差异）。
-const GPU_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// nvidia-smi 查询结果缓存（进程级；锁内串行化，避免并发多个 nvidia-smi 子进程）。
-static GPU_CACHE: Mutex<Option<(std::time::Instant, Vec<GpuData>)>> = Mutex::new(None);
-
-/// 带超时的 nvidia-smi 查询。
-///
-/// 查询字段: index,name,temperature.gpu,utilization.gpu,clocks.sm,power.draw,
-/// memory.used,memory.total（csv,noheader,nounits；名称可含逗号，故首字段取 index、
-/// 末尾 6 个数值字段从后向前解析，中间 join 为名称）。
-///
-/// 返回 Ok(Some(gpus)) = 成功;Ok(None) = nvidia-smi 不存在/不可执行/超时
-/// （非 NVIDIA 环境属预期降级，不算错误）;Err = 调用/解析失败。
-fn query_nvidia_gpus() -> Result<Option<Vec<GpuData>>, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,temperature.gpu,utilization.gpu,clocks.sm,power.draw,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        // 显式 piped：spawn() 默认继承 stdout，wait_with_output 捕获不到内容，
-        // 导致解析空文本而降级（与 hardware.rs 同一坑，实测 nvidia-smi 输出漏打到父进程 stdout）
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // CREATE_NO_WINDOW：禁止子进程创建控制台窗口（硬件信息页每秒轮询时防闪 cmd 窗）
-        .creation_flags(0x08000000)
-        .spawn()
-        .map_err(|e| format!("nvidia-smi 启动失败: {e}"))?;
-
-    // 轮询等待 + 超时 kill（驱动挂起时避免无限等待）
-    let deadline = std::time::Instant::now() + NVIDIA_SMI_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(None); // 超时：视为无数据（降级）
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => return Err(format!("nvidia-smi 等待失败: {e}")),
-        }
-    };
-    if !status.success() {
-        // 退出码非 0：无 NVIDIA 驱动/无 NVIDIA GPU（AMD/Intel 平台常见），预期降级
-        return Ok(None);
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("nvidia-smi 输出读取失败: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut gpus = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // CSV 字段: index, name, temperature, utilization, clocks.sm, power, mem.used, mem.total
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if parts.len() < 8 {
-            debug_warn!("sensor", "nvidia-smi 输出格式异常(字段不足): {line}");
-            continue;
-        }
-        let parse_f = |s: &str| s.parse::<f64>().ok().unwrap_or(0.0);
-        let index = parts[0].parse::<u32>().unwrap_or(0);
-        let name = parts[1..parts.len() - 6].join(", ");
-        let temperature = parse_f(parts[parts.len() - 6]) as f32;
-        let usage = parse_f(parts[parts.len() - 5]) as f32;
-        let clock_mhz = parse_f(parts[parts.len() - 4]) as f32;
-        let power_w = parse_f(parts[parts.len() - 3]) as f32;
-        let mem_used_mib = parse_f(parts[parts.len() - 2]);
-        let mem_total_mib = parse_f(parts[parts.len() - 1]);
-        gpus.push(GpuData {
-            name,
-            usage,
-            temperature,
-            memory_used: (mem_used_mib * 1024.0 * 1024.0) as u64,
-            memory_total: (mem_total_mib * 1024.0 * 1024.0) as u64,
-            clock_mhz,
-            power_w,
-        });
-        debug_warn!("sensor", "nvidia-smi 解析 GPU#{index} 成功");
-    }
-    if gpus.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(gpus))
-    }
-}
-
-/// 获取 GPU 数据（nvidia-smi 真实采集；2 秒缓存；无 NVIDIA 环境返回空 = 降级）。
-/// 返回 (gpus, 诊断来源标记)。
-pub fn get_gpu_data() -> (Vec<GpuData>, &'static str) {
-    let mut guard = GPU_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, cached)) = guard.as_ref() {
-        if at.elapsed() < GPU_CACHE_TTL {
-            return (cached.clone(), "nvidia-smi(cache)");
-        }
-    }
-    match query_nvidia_gpus() {
-        Ok(Some(gpus)) => {
-            *guard = Some((std::time::Instant::now(), gpus.clone()));
-            (gpus, "nvidia-smi")
-        }
-        Ok(None) => {
-            guard.take();
-            (Vec::new(), "none")
-        }
-        Err(e) => {
-            debug_warn!("sensor", "GPU 采集失败: {e}");
-            guard.take();
-            (Vec::new(), "none")
-        }
-    }
-}
-
-/// 把 LHM GPU 传感器映射为 GpuData（数据源 "lhm"）。
-///
-/// 可空字段 → 0 兜底（前端 "—" 语义）；字段契约见 lhm.rs LhmGpuData。
-/// 独立函数便于单测（字段映射为纯逻辑）。
-fn map_lhm_gpu(g: &crate::lhm::LhmGpuData) -> GpuData {
-    GpuData {
-        name: g.name.clone(),
-        usage: g.load_percent.unwrap_or(0.0),
-        temperature: g.temperature_c.unwrap_or(0.0),
-        memory_used: g.memory_used_bytes.unwrap_or(0),
-        memory_total: g.memory_total_bytes.unwrap_or(0),
-        clock_mhz: g.core_clock_mhz.unwrap_or(0.0),
-        power_w: g.power_w.unwrap_or(0.0),
-    }
-}
-
-// ============================================================================
-// Memory — GlobalMemoryStatusEx — sysinfo fallback
-// ============================================================================
-
-pub fn get_memory_data() -> MemoryData {
-    memory_status_ex().unwrap_or_else(|| {
-        // System::new() 避免 new_all() 的完整进程枚举（~10-50MB），仅需内存数据
-        let mut sys = System::new();
-        sys.refresh_memory();
-        let t = sys.total_memory();
-        MemoryData {
-            total: t,
-            used: sys.used_memory(),
-            available: sys.available_memory(),
-            usage_percent: if t > 0 {
-                (sys.used_memory() as f32 / t as f32) * 100.0
-            } else {
-                0.0
-            },
-            model_name: String::new(),
-        }
-    })
-}
-
-// ============================================================================
-// Storage — sysinfo（每 60 次调用重建实例，防止 refresh_list 内部累积）
+// Storage — 容量 sysinfo（DriveInfo 等价）+ 速率/温度 sidecar 每卷快照
 //
-// sysinfo v0.30 的 Disks::refresh_list() 在 Windows 上可能追加而非替换旧条目
+// sysinfo v0.30 的 Disks::refresh_list() 在 Windows 上可能追加而非替换旧条目，
+// 故每 DISKS_REBUILD_INTERVAL 次调用重建实例。
 // ============================================================================
 
 static DISKS_INSTANCE: std::sync::LazyLock<Mutex<(sysinfo::Disks, u32)>> =
@@ -840,41 +419,85 @@ static DISKS_INSTANCE: std::sync::LazyLock<Mutex<(sysinfo::Disks, u32)>> =
 /// Disks 实例重建间隔（调用次数），防止 refresh_list 内部条目累积
 const DISKS_REBUILD_INTERVAL: u32 = 60;
 
-pub fn get_disk_data() -> Vec<DiskData> {
+/// 卷标识归一化：`"C:\\"` / `"c:"` / `"C"` → `"C:"`（与 sidecar `disks[].name` 对齐）。
+fn normalize_volume_key(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('\\');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with(':') {
+        trimmed.to_ascii_uppercase()
+    } else {
+        format!("{}:", trimmed).to_ascii_uppercase()
+    }
+}
+
+/// 按卷标识在 sidecar 磁盘列表中查找对应节点（sidecar 名称形如 `"C:"`）。
+fn find_lhm_disk<'a>(disks: &'a [LhmDiskData], key: &str) -> Option<&'a LhmDiskData> {
+    if key.is_empty() {
+        return None;
+    }
+    disks.iter().find(|d| normalize_volume_key(&d.name) == key)
+}
+
+/// sidecar 字节/秒 → MB/s（前端 `read_mbps` / `write_mbps` 单位）。
+/// 缺失/非法值 → 0（前端渲染 0 MB/s，不伪造速率）。
+fn bytes_per_sec_to_mbps(v: Option<f64>) -> f32 {
+    match v {
+        Some(b) if b.is_finite() && b >= 0.0 => (b / (1024.0 * 1024.0)) as f32,
+        _ => 0.0,
+    }
+}
+
+/// 磁盘投影：容量/占用来自 `sysinfo`（DriveInfo 等价，零特权、与 sidecar 无关），
+/// 读写速率来自 sidecar 每卷快照（tier-1 PDH）。
+///
+/// 结构保持 `DiskData` 不变（契约 §7：字段名冻结，不新增前端可见字段）；
+/// sidecar 的 `activity_percent` / `temperature_c` 无对应对外字段，故不透出。
+pub fn get_disk_data(snap: Option<&LhmSensorResponse>) -> Vec<DiskData> {
     let mut guard = DISKS_INSTANCE.lock().unwrap_or_else(|p| p.into_inner());
     let (disks, call_count) = &mut *guard;
     *call_count += 1;
 
-    // 周期性重建 Disks 实例，防止 refresh_list 内部条目累积
     if *call_count >= DISKS_REBUILD_INTERVAL {
         *disks = sysinfo::Disks::new_with_refreshed_list();
         *call_count = 0;
     } else {
         disks.refresh_list();
     }
-    // 各卷磁盘读写速度（PDH 通配计数器按卷独立采样，任务管理器同源）；
-    // 首次调用为采样基线返回空映射，此后每秒返回最近 ~1s 平均速率。
-    // 键为盘符（"C:" 大写），与 mount_point() 归一化后按卷匹配。
-    let io_map = crate::datasource::disk_io::get_disk_io_speed_map();
+
     disks
         .list()
         .iter()
         .map(|d| {
-            let t = d.total_space();
-            let a = d.available_space();
-            let u = t.saturating_sub(a);
-            // mount_point 形如 "D:\\" → 归一化为 "D:" 与 PDH 实例匹配
+            let total = d.total_space();
+            let available = d.available_space();
+            let used = total.saturating_sub(available);
+            // mount_point 形如 "D:\\" → 归一化为 "D:" 与 sidecar 卷名匹配
             let mount = d.mount_point().to_string_lossy();
-            let drive_key = mount.trim_end_matches('\\').to_ascii_uppercase();
-            let (read_mbps, write_mbps) =
-                io_map.get(&drive_key).copied().unwrap_or((0.0, 0.0));
+            let drive_key = normalize_volume_key(&mount);
+            let lhm_disk = snap.and_then(|s| find_lhm_disk(&s.disks, &drive_key));
+            let (read_mbps, write_mbps) = match lhm_disk {
+                Some(x) => (
+                    bytes_per_sec_to_mbps(x.read_bytes_per_sec),
+                    bytes_per_sec_to_mbps(x.write_bytes_per_sec),
+                ),
+                None => (0.0, 0.0),
+            };
+            // 卷标为空时回落盘符，保证前端始终有可读名称
+            let label = d.name().to_string_lossy().to_string();
+            let name = if label.is_empty() {
+                drive_key.clone()
+            } else {
+                label
+            };
             DiskData {
-                name: d.name().to_string_lossy().to_string(),
-                total_space: t,
-                available_space: a,
-                used_space: u,
-                usage_percent: if t > 0 {
-                    (u as f32 / t as f32) * 100.0
+                name,
+                total_space: total,
+                available_space: available,
+                used_space: used,
+                usage_percent: if total > 0 {
+                    (used as f64 / total as f64 * 100.0) as f32
                 } else {
                     0.0
                 },
@@ -893,61 +516,66 @@ pub fn get_disk_data() -> Vec<DiskData> {
 /// 我们只需要 refresh_cpu() / refresh_memory()，不需要进程列表
 static SYS_INSTANCE: Mutex<Option<System>> = Mutex::new(None);
 
+/// 进程内已完成的 CPU 采样次数。
+///
+/// sysinfo 的首次 `refresh_cpu()` 拿不到差分基准，必然返回 100% 伪值
+/// （见 [`CpuData::usage_ready`]）。用它区分"预热伪值"与真实采样：
+/// 第 1 次置 `usage_ready=false`，第 2 次起为 true。
+static CPU_SAMPLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 传感器总快照（前端 `get_sensor_data` 命令的唯一实现）。
+///
+/// 每周期只向 sidecar 轮询 1 次全量快照，CPU/GPU/主板/内存/磁盘共享同一份
+/// （避免各数据源独立 HTTP 的开销）；tier-1 由 sidecar 立即提供，tier-2 需
+/// 用户在提权提示处确认一次 UAC，前端据 `tier2_available` / `tier2_reason` 提示。
 pub fn get_sensor_data() -> SensorData {
     let mut g = SYS_INSTANCE.lock().unwrap_or_else(|p| p.into_inner());
     // System::new() 仅分配 CPU + 内存组件，不枚举全部进程（节省 10-50MB）
     let s = g.get_or_insert_with(System::new);
     s.refresh_cpu();
     s.refresh_memory();
+    // 本次采样是进程内第几次（+1 后使用）；第 1 次的结果是伪值
+    let sample_index = CPU_SAMPLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-    // LHM 全量快照：唯一 HTTP 轮询入口（每采集周期 1 次，CPU/GPU/主板/内存共享，
-    // 避免各数据源独立 HTTP 的 3 倍开销）。快照内含 CPU 温度/功耗，直接注入
-    // get_cpu_data（其内部 lhm_cpu_temp() 薄封装命中 last_snapshot 缓存，零额外 HTTP）。
+    // 唯一 HTTP 轮询入口（含 sidecar 进程生命周期：启动/退避/重启/降级）
     let (lhm_snap, lhm_diag) = crate::lhm::lhm_snapshot();
-    let lhm_temp = lhm_snap
-        .as_ref()
-        .and_then(|r| r.cpu.package_temp_c)
-        .filter(|t| *t > 0.0);
-    let lhm_power = lhm_snap
-        .as_ref()
-        .and_then(|r| r.cpu.power_w)
-        .filter(|p| *p > 0.0);
+    let snap = lhm_snap.as_ref();
 
-    let (cpu, cpu_diag) = get_cpu_data(s, lhm_temp, lhm_power, &lhm_diag);
+    let (cpu, cpu_diag) = get_cpu_data(s, snap, &lhm_diag, sample_index > 1);
 
-    // GPU 主源：LHM gpu[]（NVAPI/ADL 用户态，覆盖 NVIDIA/AMD/Intel）→ 空/不可用
-    // 时降级 nvidia-smi（既有 get_gpu_data 保留，AMD/Intel 卡无数据返回空）。
-    let (gpu, gpu_src): (Vec<GpuData>, &'static str) = match lhm_snap.as_ref() {
-        Some(r) if !r.gpu.is_empty() => {
-            let mapped: Vec<GpuData> = r.gpu.iter().map(map_lhm_gpu).collect();
-            (mapped, "lhm")
-        }
-        _ => get_gpu_data(),
+    // GPU：唯一来源是 sidecar（nvidia-smi 链路已删除）；快照缺失 → 空列表，
+    // 绝不编造占位条目。
+    let gpu: Vec<GpuData> = match snap {
+        Some(r) => r.gpu.iter().filter_map(map_lhm_gpu).collect(),
+        None => Vec::new(),
     };
 
-    // 主板传感器：LHM 快照透出（温度/风扇/电压分组）；LHM 不可用/无数据 → None
-    let motherboard = lhm_snap.as_ref().and_then(|r| r.motherboard.clone());
+    // 主板传感器：sidecar 透出（tier-2；温度/风扇/电压分组）；不可用/无数据 → None
+    let motherboard = snap.and_then(|r| r.motherboard.clone());
 
     drop(g); // release sys
 
-    let mut mem = get_memory_data();
-    // 内存型号：LHM SPD 补充（sidecar 一次性读取缓存，不每轮 SMBus；无则保持空串）
-    if mem.model_name.is_empty() {
-        if let Some(m) = lhm_snap.as_ref().and_then(|r| r.memory.as_ref()) {
-            if let Some(n) = m.name.as_deref() {
-                if !n.is_empty() {
-                    mem.model_name = n.to_string();
-                }
-            }
-        }
-    }
-    let disks = get_disk_data();
+    let mem = get_memory_data(snap);
+    let disks = get_disk_data(snap);
+    let (tier2_available, elevated, tier2_reason) = tier2_fields(snap, &lhm_diag);
 
+    let gpu_src = if gpu.is_empty() { "none" } else { "lhm" };
     let mb_tag = match motherboard.as_ref() {
         Some(mb) => format!("mb={}传感器", mb.sensors.len()),
         None => "mb=n/a".to_string(),
     };
-    let diag = format!("GPU={} {} mem={:.0}% {}", gpu_src, cpu_diag, mem.usage_percent, mb_tag);
+    let tier2_tag = if tier2_available {
+        "tier2=ready".to_string()
+    } else {
+        match tier2_reason.as_deref() {
+            Some(reason) => format!("tier2=n/a({})", reason),
+            None => "tier2=n/a".to_string(),
+        }
+    };
+    let diag = format!(
+        "GPU={} {} mem={:.0}% {} {}",
+        gpu_src, cpu_diag, mem.usage_percent, mb_tag, tier2_tag
+    );
     crate::temp_data::sensor_diag(&diag);
 
     SensorData {
@@ -956,6 +584,9 @@ pub fn get_sensor_data() -> SensorData {
         memory: mem,
         disks,
         motherboard,
+        tier2_available,
+        tier2_reason,
+        elevated,
         diag,
     }
 }
@@ -963,326 +594,567 @@ pub fn get_sensor_data() -> SensorData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_cpu() {
+    use crate::lhm::{LhmCpuData, LhmMemoryData};
+
+    /// 构造一份最小可用快照（tier-1 无来源、tier-2 缺失）。
+    fn snapshot_with(cpu: LhmCpuData, memory: Option<LhmMemoryData>) -> LhmSensorResponse {
+        LhmSensorResponse {
+            available: true,
+            contract_version: Some(3),
+            cpu,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    fn sysinfo_all() -> System {
         let mut s = System::new_all();
         s.refresh_all();
-        let (c, _) = get_cpu_data(&s, None, None, "");
+        s
+    }
+
+    #[test]
+    fn test_cpu() {
+        let s = sysinfo_all();
+        let (c, _) = get_cpu_data(&s, None, "", true);
         assert!(!c.name.is_empty());
-        // 降级语义：数据源不可用时不 panic、温度为非负值
-        // （WinRing0 回退链可能提供真实温度；
-        //   v0.17.5 驱动自愈后本机 WinRing0 可用，温度不再恒为 0）
+        // 降级语义：数据源不可用时不 panic、数值非负且不伪造
         assert!(c.temperature >= 0.0);
         assert!(c.clock_mhz >= 0.0);
         assert!(c.power_w >= 0.0);
-        // freq_source 枚举契约（前端依赖）：固定值集合
+        // 收窄后的来源枚举契约（CONTRACT-v3.md §7）——旧值不可能出现
         assert!(
-            ["ntapi", "pdh", "registry", "sysinfo", "none"].contains(&c.freq_source.as_str()),
-            "freq_source 非法: {}",
+            FREQ_SOURCES.contains(&c.freq_source.as_str()),
+            "freq_source 越界: {}",
             c.freq_source
         );
-        // 数据源契约（前端 T3 依赖）：枚举值固定、温度有值时 temp_source 非 none
         assert!(
-            ["lhm", "winring0", "acpi", "none"].contains(&c.temp_source.as_str()),
-            "temp_source 非法: {}",
+            TEMP_SOURCES.contains(&c.temp_source.as_str()),
+            "temp_source 越界: {}",
             c.temp_source
         );
         assert!(
-            ["lhm", "rapl", "estimated", "none"].contains(&c.power_source.as_str()),
-            "power_source 非法: {}",
+            POWER_SOURCES.contains(&c.power_source.as_str()),
+            "power_source 越界: {}",
             c.power_source
         );
-        if c.temperature > 0.0 {
-            assert_ne!(c.temp_source, "none", "有温度时数据源不应为 none");
+        // source=none ⇄ 值=0（不伪造）
+        if c.temp_source == "none" {
+            assert_eq!(c.temperature, 0.0, "temp_source=none 却给出温度");
+        } else {
+            assert!(c.temperature > 0.0, "temp_source 有效却无温度");
+        }
+        if c.freq_source == "none" {
+            assert_eq!(c.clock_mhz, 0.0, "freq_source=none 却给出频率");
+        } else {
+            assert!(c.clock_mhz > 0.0, "freq_source 有效却无频率");
+        }
+        if c.power_source == "none" {
+            assert_eq!(c.power_w, 0.0);
+            assert!(!c.power_estimated);
         }
     }
 
     #[test]
-    fn test_cpu_lhm_power_source() {
-        // LHM 功耗注入：power_w>0 时 power_source="lhm" 且 power_estimated=false
-        // （前端同 rapl 实测语义，不显示「估算」角标）
-        let mut s = System::new_all();
-        s.refresh_all();
-        let (c, diag) = get_cpu_data(&s, Some(61.5), Some(42.7), "");
-        assert_eq!(c.temp_source, "lhm", "LHM 温度注入后 temp_source 应为 lhm");
-        assert_eq!(c.power_source, "lhm", "LHM 功耗注入后 power_source 应为 lhm");
-        assert!(!c.power_estimated, "LHM 实测功耗不应标记估算");
+    fn test_cpu_projection_perfcounter_and_lhm() {
+        // 契约 §7 主路径：clock_source=perfcounter → freq_source=pdh；
+        // temp_source=lhm → temp_source=lhm；power_source=lhm → lhm + 非估算
+        let s = sysinfo_all();
+        let snap = snapshot_with(
+            LhmCpuData {
+                name: "AMD Ryzen 7 5800X 8-Core Processor".to_string(),
+                load_percent: Some(12.5),
+                package_temp_c: Some(61.5),
+                power_w: Some(42.7),
+                clock_mhz: Some(4200.0),
+                clock_source: "perfcounter".to_string(),
+                temp_source: "lhm".to_string(),
+                power_source: "lhm".to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+        let (c, diag) = get_cpu_data(&s, Some(&snap), "lhm(pkg 61.5℃, 42.7W)", true);
+        assert_eq!(c.freq_source, "pdh");
+        assert_eq!(c.clock_mhz, 4200.0);
+        assert_eq!(c.temp_source, "lhm");
         assert_eq!(c.temperature, 61.5);
+        assert_eq!(c.power_source, "lhm");
         assert_eq!(c.power_w, 42.7);
-        assert!(diag.contains("(lhm)"), "diag 应标注 lhm 数据源: {}", diag);
-
-        // LHM 功耗为 0/None 时降级到既有 rapl/estimated 链（不 panic、不强制 lhm）
-        let (c2, _) = get_cpu_data(&s, None, None, "");
+        assert!(!c.power_estimated, "lhm 实测功耗不得标记估算");
+        assert!(diag.contains("(pdh)"), "diag 应标注 pdh 来源: {}", diag);
+        assert!(diag.contains("(lhm)"), "diag 应标注 lhm 来源: {}", diag);
         assert!(
-            ["rapl", "estimated", "none"].contains(&c2.power_source.as_str()),
-            "LHM 缺失时功耗源应为降级值: {}",
-            c2.power_source
+            diag.contains("[lhm:lhm(pkg 61.5℃, 42.7W)]"),
+            "diag 应透出 lhm 诊断: {}",
+            diag
         );
     }
 
     #[test]
-    fn test_cpu_lhm_diag_note() {
-        // LHM 不可用诊断串透出：lhm_diag_src 非空且无温度时，diag 应含 [lhm:...] 注记
-        let mut s = System::new_all();
-        s.refresh_all();
-        let (c, diag) = get_cpu_data(&s, None, None, "lhm(轮询失败:timeout)");
-        assert!(c.temp_source != "lhm" || c.temperature <= 0.0);
-        assert!(diag.contains("[lhm:lhm(轮询失败:timeout)]"), "diag 应透出 LHM 失败原因: {}", diag);
+    fn test_cpu_projection_registry_and_estimated_power() {
+        // clock_source=registry → freq_source=registry（"标称"角标）；
+        // power_source≠lhm 但 power_w 有值 → estimated + power_estimated=true
+        let s = sysinfo_all();
+        let snap = snapshot_with(
+            LhmCpuData {
+                clock_mhz: Some(3600.0),
+                clock_source: "registry".to_string(),
+                power_w: Some(30.0),
+                power_source: "none".to_string(),
+                temp_source: "none".to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+        let (c, diag) = get_cpu_data(&s, Some(&snap), "", true);
+        assert_eq!(c.freq_source, "registry");
+        assert_eq!(c.clock_mhz, 3600.0);
+        assert_eq!(c.power_source, "estimated");
+        assert_eq!(c.power_w, 30.0);
+        assert!(c.power_estimated, "estimated 功耗必须标记 power_estimated");
+        assert!(diag.contains("(estimated)"), "diag 应标注估算: {}", diag);
+        assert_eq!(c.temp_source, "none");
+        assert_eq!(c.temperature, 0.0);
     }
 
     #[test]
-    fn test_lhm_gpu_mapping() {
-        // LHM GPU 传感器 → GpuData 字段映射（load_percent→usage、core_clock_mhz→clock_mhz 等）
-        let g = crate::lhm::LhmGpuData {
-            name: "NVIDIA GeForce GTX 1660 Ti".to_string(),
-            temperature_c: Some(52.3),
-            core_clock_mhz: Some(1500.0),
-            power_w: Some(85.2),
-            load_percent: Some(45.0),
-            memory_used_bytes: Some(1073741824),
-            memory_total_bytes: Some(6442450944),
-            fan_rpm: Some(1200.0),
-        };
-        let out = map_lhm_gpu(&g);
-        assert_eq!(out.name, "NVIDIA GeForce GTX 1660 Ti");
-        assert_eq!(out.usage, 45.0);
-        assert_eq!(out.temperature, 52.3);
-        assert_eq!(out.clock_mhz, 1500.0);
-        assert_eq!(out.power_w, 85.2);
-        assert_eq!(out.memory_used, 1073741824);
-        assert_eq!(out.memory_total, 6442450944);
+    fn test_cpu_projection_lhm_clock_source_preserved() {
+        // 契约 §7 修订：sidecar clock_source="lhm"（LHM 复合实时频率，实测值）
+        // → freq_source="lhm" 且频率保留。该分支覆盖 tier-1 PDH/registry 均缺失
+        // 而 tier-2 已生效的场景（计数器被裁剪的系统 / 性能计数器初始化窗口），
+        // 值必须保留而不能丢弃；同时绝不出现 ntapi/sysinfo/winring0/acpi/rapl。
+        let s = sysinfo_all();
+        let snap = snapshot_with(
+            LhmCpuData {
+                clock_mhz: Some(4100.0),
+                clock_source: "lhm".to_string(),
+                temp_source: "none".to_string(),
+                power_source: "none".to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+        let (c, diag) = get_cpu_data(&s, Some(&snap), "lhm(无有效温度:需要管理员权限)", true);
+        assert_eq!(
+            c.freq_source, "lhm",
+            "clock_source=lhm 应映射为 freq_source=lhm"
+        );
+        assert_eq!(c.clock_mhz, 4100.0, "lhm 实时频率必须保留，不得归零");
+        assert!(c.clock_mhz > 0.0, "freq_source=lhm 必须配有效频率");
+        assert!(diag.contains("(lhm)"), "diag 应标注 lhm 频率来源: {}", diag);
+        // 其余通道不受影响（本用例未提供 tier-2 数据）
+        assert_eq!(c.temp_source, "none");
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.power_source, "none");
+        assert_eq!(c.power_w, 0.0);
+        assert!(!c.power_estimated);
+        // 旧取值必须仍然不可能（收窄集合的负向断言保持不变）
+        for legacy in ["ntapi", "sysinfo", "winring0", "acpi", "rapl"] {
+            assert_ne!(c.freq_source, legacy);
+            assert_ne!(c.temp_source, legacy);
+            assert_ne!(c.power_source, legacy);
+        }
+        // 正向：新取值在收窄集合内
+        assert!(
+            FREQ_SOURCES.contains(&c.freq_source.as_str()),
+            "freq_source 应在收窄集合内: {}",
+            c.freq_source
+        );
+    }
 
-        // 可空字段 → 0 兜底（前端 "—" 语义，Intel 核显无功耗等场景）
-        let g2 = crate::lhm::LhmGpuData {
-            name: "AMD Radeon Graphics".to_string(),
+    #[test]
+    fn test_cpu_projection_lhm_clock_source_requires_positive_value() {
+        // "lhm" 分支同样受「值有效」守卫约束：clock_mhz 缺失/为 0/非有限时
+        // 回落 "none" + 0，维持「source=none ⇄ 值=0」不变式（不伪造频率）
+        let s = sysinfo_all();
+        for bad in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+        ] {
+            let snap = snapshot_with(
+                LhmCpuData {
+                    clock_mhz: bad,
+                    clock_source: "lhm".to_string(),
+                    ..Default::default()
+                },
+                None,
+            );
+            let (c, _) = get_cpu_data(&s, Some(&snap), "", true);
+            assert_eq!(
+                c.freq_source, "none",
+                "clock_mhz={bad:?} 时不应标记 lhm 来源"
+            );
+            assert_eq!(c.clock_mhz, 0.0, "freq_source=none 时频率必须为 0");
+        }
+    }
+
+    #[test]
+    fn test_cpu_projection_invalid_values_are_filtered() {
+        // 侧车给出 0 / 非有限值（等价于"无数据"）时不得标记有效来源
+        let s = sysinfo_all();
+        let snap = snapshot_with(
+            LhmCpuData {
+                package_temp_c: Some(0.0),
+                power_w: Some(0.0),
+                clock_mhz: Some(0.0),
+                clock_source: "perfcounter".to_string(),
+                temp_source: "lhm".to_string(),
+                power_source: "lhm".to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+        let (c, _) = get_cpu_data(&s, Some(&snap), "", true);
+        assert_eq!(c.freq_source, "none");
+        assert_eq!(c.clock_mhz, 0.0);
+        assert_eq!(c.temp_source, "none");
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.power_source, "none");
+        assert_eq!(c.power_w, 0.0);
+        assert!(!c.power_estimated);
+    }
+
+    #[test]
+    fn test_gpu_projection_and_metricless_filter() {
+        // sidecar GPU → GpuData 字段映射；无任何有效指标的节点被丢弃（不伪造占位）
+        let s = sysinfo_all();
+        let snap = LhmSensorResponse {
+            available: true,
+            contract_version: Some(3),
+            gpu: vec![
+                LhmGpuData {
+                    name: "NVIDIA GeForce RTX 3060".to_string(),
+                    temperature_c: Some(52.3),
+                    core_clock_mhz: Some(1500.0),
+                    power_w: Some(85.2),
+                    load_percent: Some(45.0),
+                    memory_used_bytes: Some(1073741824),
+                    memory_total_bytes: Some(6442450944),
+                    fan_rpm: Some(1200.0),
+                    vram_load_percent: Some(16.7),
+                    temp_source: "lhm".to_string(),
+                    power_source: "lhm".to_string(),
+                    clock_source: "lhm".to_string(),
+                },
+                // 全空节点（LHM 识别到设备但无任何传感器）→ 丢弃
+                LhmGpuData {
+                    name: "Empty Placeholder".to_string(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
-        let out2 = map_lhm_gpu(&g2);
-        assert_eq!(out2.usage, 0.0);
-        assert_eq!(out2.temperature, 0.0);
-        assert_eq!(out2.power_w, 0.0);
-        assert_eq!(out2.memory_used, 0);
-        assert!(out2.name.contains("AMD"));
+        let mapped: Vec<GpuData> = snap.gpu.iter().filter_map(map_lhm_gpu).collect();
+        assert_eq!(mapped.len(), 1, "无指标节点应被过滤，避免伪造 0 占位");
+        let g = &mapped[0];
+        assert_eq!(g.name, "NVIDIA GeForce RTX 3060");
+        assert_eq!(g.usage, 45.0);
+        assert_eq!(g.temperature, 52.3);
+        assert_eq!(g.clock_mhz, 1500.0);
+        assert_eq!(g.power_w, 85.2);
+        assert_eq!(g.memory_used, 1073741824);
+        assert_eq!(g.memory_total, 6442450944);
+        // 与原 CPU 数据正交：不 panic、不使用任何其它数据源
+        let (_c, _) = get_cpu_data(&s, Some(&snap), "", true);
     }
 
     #[test]
-    fn test_memory_model_name_default() {
-        // MemoryData.model_name 默认空串（无 LHM SPD 时前端不渲染）
-        let m = get_memory_data();
+    fn test_memory_authoritative_total_and_sidecar_model_name() {
+        // 权威总量来自 GlobalMemoryStatusEx（与 sidecar 无关）；型号名来自
+        // sidecar 内存节点名（v3 语义：投影而非 SPD 一次性读取）
+        let without = get_memory_data(None);
+        assert!(without.total > 0, "权威内存总量应为正");
+        assert!(
+            without.model_name.is_empty(),
+            "无 sidecar 时型号应为空串（前端不渲染）"
+        );
+        assert!(without.used <= without.total);
+        assert!(without.available <= without.total);
+        assert!((0.0..=100.0).contains(&without.usage_percent));
+
+        let snap = snapshot_with(
+            LhmCpuData::default(),
+            Some(LhmMemoryData {
+                name: Some("Physical Memory".to_string()),
+                total_bytes: Some(1),
+                used_bytes: Some(1),
+            }),
+        );
+        let with = get_memory_data(Some(&snap));
+        assert_eq!(with.model_name, "Physical Memory");
+        assert_eq!(
+            with.total, without.total,
+            "sidecar 数值只作补充，不得覆盖权威总量"
+        );
+
+        // 空名 / 缺失 name → 保持空串（不伪造型号）
+        let empty = snapshot_with(
+            LhmCpuData::default(),
+            Some(LhmMemoryData {
+                name: Some(String::new()),
+                ..Default::default()
+            }),
+        );
+        assert!(get_memory_data(Some(&empty)).model_name.is_empty());
+        let no_mem = snapshot_with(LhmCpuData::default(), None);
+        assert!(get_memory_data(Some(&no_mem)).model_name.is_empty());
+    }
+
+    #[test]
+    fn test_memory_status_shape() {
+        let m = get_memory_data(None);
         assert!(m.total > 0);
-        assert!(m.model_name.is_empty(), "无 LHM 注入时型号应为空串");
     }
 
     #[test]
-    fn tdp_table_known_models() {
-        // 常见型号精确匹配（AMD Ryzen 7000/5000 + Intel 13/14 代）
-        assert_eq!(match_tdp("AMD Ryzen 9 7950X3D 16-Core Processor"), Some(120));
-        assert_eq!(match_tdp("AMD Ryzen 9 7950X 16-Core Processor"), Some(170));
-        assert_eq!(match_tdp("AMD Ryzen 9 7900X 12-Core Processor"), Some(170));
-        assert_eq!(match_tdp("AMD Ryzen 7 7800X3D 8-Core Processor"), Some(120));
-        assert_eq!(match_tdp("AMD Ryzen 5 7600X 6-Core Processor"), Some(105));
-        assert_eq!(match_tdp("AMD Ryzen 9 5950X 16-Core Processor"), Some(105));
-        assert_eq!(match_tdp("AMD Ryzen 7 5800X3D 8-Core Processor"), Some(105));
-        assert_eq!(match_tdp("AMD Ryzen 5 5600X 6-Core Processor"), Some(65));
+    fn test_disk_projection_overlays_sidecar_rates() {
+        let snap = LhmSensorResponse {
+            available: true,
+            contract_version: Some(3),
+            disks: vec![
+                LhmDiskData {
+                    name: "C:".to_string(),
+                    read_bytes_per_sec: Some(1024.0 * 1024.0),
+                    write_bytes_per_sec: Some(2.0 * 1024.0 * 1024.0),
+                    activity_percent: Some(12.0),
+                    used_percent: Some(63.5),
+                    temperature_c: Some(38.0),
+                },
+                LhmDiskData {
+                    name: "Z:".to_string(),
+                    read_bytes_per_sec: Some(999.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let disks = get_disk_data(Some(&snap));
+        for d in &disks {
+            assert!(!d.name.is_empty(), "磁盘名不应为空");
+            assert!(d.used_space <= d.total_space);
+            assert!(d.read_mbps.is_finite() && d.read_mbps >= 0.0);
+            assert!(d.write_mbps.is_finite() && d.write_mbps >= 0.0);
+            // sidecar 未提供该卷速率时必须是 0（不伪造），且不可能是 sidecar
+            // 中不存在的卷（Z:）的值泄漏过来
+            assert_ne!(d.read_mbps, 999.0, "未匹配卷的速率不应泄漏: {}", d.name);
+        }
+        // 无快照 → 速率全 0（不伪造），容量仍可用
+        let bare = get_disk_data(None);
+        assert_eq!(bare.len(), disks.len(), "快照有无不应改变磁盘条目数");
+        for d in &bare {
+            assert_eq!(d.read_mbps, 0.0);
+            assert_eq!(d.write_mbps, 0.0);
+        }
+        // 卷匹配纯逻辑：与挂载点归一化后的键一致
         assert_eq!(
-            match_tdp("Intel(R) Core(TM) i9-14900K CPU @ 3.20GHz"),
-            Some(125)
+            find_lhm_disk(&snap.disks, "C:").map(|d| d.name.as_str()),
+            Some("C:")
         );
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-14700K CPU @ 3.40GHz"), Some(125));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i5-13600K CPU @ 3.50GHz"), Some(125));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i9-13900 CPU @ 2.00GHz"), Some(65));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i3-13100 CPU @ 3.40GHz"), Some(60));
+        assert!(find_lhm_disk(&snap.disks, "").is_none());
+        assert!(find_lhm_disk(&snap.disks, "Q:").is_none());
     }
 
     #[test]
-    fn tdp_table_order_sensitive() {
-        // 长型号必须优先：7950X3D 不能被 7950X 抢先；13900KS 不能被 13900K 抢先
-        assert_eq!(match_tdp("AMD Ryzen 9 7950X3D"), Some(120), "7950X3D 应匹配 120");
-        assert_eq!(
-            match_tdp("Intel(R) Core(TM) i9-13900KS CPU @ 3.20GHz"),
-            Some(125),
-            "13900KS 应匹配 125"
-        );
-        assert_eq!(match_tdp("Intel(R) Core(TM) i9-13900KF CPU @ 3.00GHz"), Some(125));
+    fn test_normalize_volume_key() {
+        assert_eq!(normalize_volume_key("C:\\"), "C:");
+        assert_eq!(normalize_volume_key("c:"), "C:");
+        assert_eq!(normalize_volume_key("D"), "D:");
+        assert_eq!(normalize_volume_key(""), "");
+        assert_eq!(normalize_volume_key("  E:  "), "E:");
     }
 
     #[test]
-    fn tdp_table_unknown_defaults() {
-        // 未知/非桌面型号 → None（调用方用 65W 默认）
-        assert_eq!(match_tdp("Unknown CPU"), None);
-        assert_eq!(match_tdp("Apple Silicon"), None);
-        assert_eq!(match_tdp(""), None);
+    fn test_bytes_per_sec_to_mbps() {
+        assert!((bytes_per_sec_to_mbps(Some(1024.0 * 1024.0)) - 1.0).abs() < 1e-4);
+        assert_eq!(bytes_per_sec_to_mbps(None), 0.0);
+        assert_eq!(bytes_per_sec_to_mbps(Some(-1.0)), 0.0);
+        assert_eq!(bytes_per_sec_to_mbps(Some(f64::NAN)), 0.0);
     }
 
     #[test]
-    fn tdp_table_xeon_e5_models() {
-        // Xeon E5 v1~v4（X79/X99）：各代独立 TDP（Intel ARK 官方数据）
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2690 v4 @ 2.10GHz"),
-            Some(135)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz"),
-            Some(135)
-        );
-        // v2 顺序敏感：必须命中 V2（130W）而非 V3/V4/裸词
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2690 v2 @ 3.00GHz"),
-            Some(130),
-            "E5-2690 v2 应匹配 130W（V2 关键词必须在 V3 后、裸词前）"
-        );
-        // v1 注册表名格式带 " 0"：命中 v1 条目（135W）
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2690 0 @ 2.90GHz"),
-            Some(135)
-        );
-        // 裸型号兜底（135W）
-        assert_eq!(match_tdp("Intel(R) Xeon(R) CPU E5-2690"), Some(135));
-        // E5-1650：v3/v4 = 140W，v1/v2 = 130W（X79 平台）
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-1650 v4 @ 3.60GHz"),
-            Some(140)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-1650 v3 @ 3.50GHz"),
-            Some(140)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-1650 0 @ 3.20GHz"),
-            Some(130)
-        );
-        // 低端型号代表
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2603 v4 @ 3.30GHz"),
-            Some(85)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2630 0 @ 2.30GHz"),
-            Some(95)
-        );
-    }
+    fn test_tier2_fields_projection() {
+        // sidecar 缺失：false/false + lhm 诊断串（绝不 None、绝不 panic）
+        let (avail, elevated, reason) = tier2_fields(None, "lhm(exe 缺失)");
+        assert!(!avail);
+        assert!(!elevated);
+        assert_eq!(reason.as_deref(), Some("lhm(exe 缺失)"));
 
-    #[test]
-    fn tdp_table_xeon_order_sensitive() {
-        // 长关键词优先验证：2697（v2=130 vs v3/v4=145）
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz"),
-            Some(145)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2697 v2 @ 2.70GHz"),
-            Some(130)
-        );
-        // 2687W：v3=160 vs v1(" 0")=150
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2687W v3 @ 3.10GHz"),
-            Some(160)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Xeon(R) CPU E5-2687W 0 @ 3.10GHz"),
-            Some(150)
-        );
-    }
+        let (avail, _elevated, reason) = tier2_fields(None, "");
+        assert!(!avail);
+        assert_eq!(reason.as_deref(), Some("sidecar 快照不可用"));
 
-    #[test]
-    fn tdp_table_amd_legacy_models() {
-        // AMD FX（AM3+）
-        assert_eq!(match_tdp("AMD FX(tm)-8350 Eight-Core Processor"), Some(125));
-        assert_eq!(match_tdp("AMD FX(tm)-9590 Eight-Core Processor"), Some(220));
-        assert_eq!(match_tdp("AMD FX(tm)-4130 Quad-Core Processor"), Some(125));
-        // E 后缀顺序敏感：8370E(95W) 必须命中 E 条目而非 8370(125W)
-        assert_eq!(match_tdp("AMD FX(tm)-8370E Eight-Core Processor"), Some(95));
-        assert_eq!(match_tdp("AMD FX(tm)-8320E Eight-Core Processor"), Some(95));
-        assert_eq!(match_tdp("AMD FX(tm)-8370 Eight-Core Processor"), Some(125));
-        // Phenom II X6 / X4（K10）
-        assert_eq!(match_tdp("AMD Phenom(tm) II X6 1090T Processor"), Some(125));
-        assert_eq!(match_tdp("AMD Phenom(tm) II X6 1055T Processor"), Some(95));
-        assert_eq!(match_tdp("AMD Phenom(tm) II X4 965 Processor"), Some(125));
-    }
+        // 已提权：透出 true/true + 无原因
+        let ok = LhmSensorResponse {
+            available: true,
+            elevated: true,
+            tier2_available: true,
+            tier2_reason: None,
+            ..Default::default()
+        };
+        let (avail, elevated, reason) = tier2_fields(Some(&ok), "");
+        assert!(avail);
+        assert!(elevated);
+        assert!(reason.is_none());
 
-    #[test]
-    fn tdp_table_intel_12th_gen() {
-        // 12 代顺序敏感：KS(150) → K(125) → 裸(65)
-        assert_eq!(
-            match_tdp("Intel(R) Core(TM) i9-12900KS CPU @ 3.40GHz"),
-            Some(150)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Core(TM) i9-12900K CPU @ 3.20GHz"),
-            Some(125)
-        );
-        assert_eq!(match_tdp("Intel(R) Core(TM) i9-12900 CPU @ 2.40GHz"), Some(65));
-        assert_eq!(
-            match_tdp("Intel(R) Core(TM) i7-12700K CPU @ 3.60GHz"),
-            Some(125)
-        );
-        assert_eq!(
-            match_tdp("Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz"),
-            Some(125)
-        );
-        assert_eq!(match_tdp("Intel(R) Core(TM) i5-12400 CPU @ 2.50GHz"), Some(65));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i3-12100 CPU @ 3.30GHz"), Some(60));
-    }
+        // 未提权且有原因：原样透出
+        let no = LhmSensorResponse {
+            available: true,
+            elevated: false,
+            tier2_available: false,
+            tier2_reason: Some(
+                "需要管理员权限（PawnIO 设备仅 SYSTEM/Administrators 可访问）".to_string(),
+            ),
+            ..Default::default()
+        };
+        let (avail, elevated, reason) = tier2_fields(Some(&no), "lhm(pkg…)");
+        assert!(!avail);
+        assert!(!elevated);
+        assert!(reason.as_deref().unwrap_or("").contains("管理员"));
 
-    #[test]
-    fn tdp_table_intel_legacy_models() {
-        // 老 Intel 桌面/至尊（X79/X99 及更早）
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-5960X CPU @ 3.00GHz"), Some(140));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-5820K CPU @ 3.30GHz"), Some(140));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-3960X CPU @ 3.30GHz"), Some(130));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-4790K CPU @ 4.00GHz"), Some(88));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-7700K CPU @ 4.20GHz"), Some(91));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz"), Some(95));
-        assert_eq!(match_tdp("Intel(R) Core(TM) i7-2600K CPU @ 3.40GHz"), Some(95));
-    }
-
-    #[test]
-    fn estimate_power_formula() {
-        // 功耗 = TDP × usage/100；usage 截断 [0,100]
-        assert!((estimate_power(50.0, 170.0) - 85.0).abs() < 1e-6);
-        assert!((estimate_power(0.0, 65.0) - 0.0).abs() < 1e-6);
-        assert!((estimate_power(100.0, 120.0) - 120.0).abs() < 1e-6);
-        // usage 越界截断
-        assert!((estimate_power(150.0, 65.0) - 65.0).abs() < 1e-6);
-        assert!((estimate_power(-10.0, 65.0) - 0.0).abs() < 1e-6);
-        // 未知型号默认 65W
-        assert!((estimate_power(50.0, 65.0) - 32.5).abs() < 1e-6);
+        // 未提权但 sidecar 未给原因：回落 lhm 诊断串（前端提示卡始终可读）
+        let no_reason = LhmSensorResponse {
+            available: true,
+            tier2_available: false,
+            tier2_reason: None,
+            ..Default::default()
+        };
+        let (_a, _e, reason) = tier2_fields(Some(&no_reason), "lhm(不可用:驱动未安装)");
+        assert_eq!(reason.as_deref(), Some("lhm(不可用:驱动未安装)"));
     }
 
     #[test]
     fn cpu_data_serialize_sources() {
-        // CpuData 序列化契约：新增三个字段必须出现在 JSON 中（前端 T3 消费）
+        // CpuData 序列化契约：新增三个字段必须出现在 JSON 中（前端消费）
         let c = CpuData {
             name: "Test CPU".to_string(),
             usage: 10.0,
             per_core: vec![10.0],
             core_count: 1,
             clock_mhz: 3000.0,
-            freq_source: "ntapi".to_string(),
+            freq_source: "registry".to_string(),
             temperature: 60.0,
             power_w: 30.0,
-            temp_source: "winring0".to_string(),
+            temp_source: "lhm".to_string(),
             power_source: "estimated".to_string(),
             power_estimated: true,
+            usage_ready: true,
         };
         let json = serde_json::to_string(&c).expect("CpuData 序列化不应失败");
-        assert!(json.contains("\"temp_source\":\"winring0\""));
+        assert!(json.contains("\"temp_source\":\"lhm\""));
         assert!(json.contains("\"power_source\":\"estimated\""));
         assert!(json.contains("\"power_estimated\":true"));
-        assert!(json.contains("\"freq_source\":\"ntapi\""));
+        assert!(json.contains("\"freq_source\":\"registry\""));
+        // usage_ready 必须序列化给前端（决定首帧是否用「—」占位 CPU 占用率）
+        assert!(json.contains("\"usage_ready\":true"));
+
+        // 契约 §7 修订新增的 "lhm" 频率来源必须原样往返（前端按字符串比较）
+        let c_lhm = CpuData {
+            freq_source: "lhm".to_string(),
+            clock_mhz: 4100.0,
+            temp_source: "none".to_string(),
+            power_source: "none".to_string(),
+            power_estimated: false,
+            ..c
+        };
+        let json_lhm = serde_json::to_string(&c_lhm).expect("CpuData 序列化不应失败");
+        assert!(
+            json_lhm.contains("\"freq_source\":\"lhm\""),
+            "freq_source=lhm 必须原样序列化: {json_lhm}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&json_lhm).expect("序列化结果应可解析");
+        assert_eq!(
+            back.get("freq_source").and_then(|v| v.as_str()),
+            Some("lhm"),
+            "freq_source=lhm 应往返一致"
+        );
+        assert_eq!(
+            back.get("clock_mhz").and_then(|v| v.as_f64()),
+            Some(4100.0),
+            "lhm 来源的频率值应随 JSON 保留"
+        );
     }
 
     #[test]
-    fn test_mem() {
-        let m = get_memory_data();
-        assert!(m.total > 0);
+    fn sensor_data_serializes_tier2_fields() {
+        // 新增外的 tier-2 字段名必须是契约冻结的 snake_case（前端按名读取）
+        let data = get_sensor_data();
+        let json = serde_json::to_value(&data).expect("SensorData 应可序列化");
+        let obj = json.as_object().expect("SensorData 应为对象");
+        for key in ["tier2_available", "tier2_reason", "elevated"] {
+            assert!(obj.contains_key(key), "SensorData 缺少字段: {key}");
+        }
+        assert!(obj["tier2_available"].is_boolean());
+        assert!(obj["elevated"].is_boolean());
+        assert!(obj["tier2_reason"].is_string() || obj["tier2_reason"].is_null());
+        assert!(!data.diag.is_empty(), "diag 诊断串不应为空");
     }
 
-    /// 真机端到端验证（默认忽略）：get_sensor_data 快照中磁盘 IO 速度字段
-    /// 应为非负有限值（PDH 通道；空闲可为 0）。
+    /// 真机端到端验证（默认忽略）：`get_sensor_data` 投影必须落在契约 §7 的
+    /// 收窄枚举内，且 tier-1 指标（频率/内存/磁盘容量）真实可用。
+    ///
+    /// 运行：`cargo test --lib -- --ignored real_machine_projection_contract`
+    /// （需本机 127.0.0.1:45980 有 sidecar；无 sidecar 时全部降级为 none 亦通过，
+    /// 因为本测试断言的是不变式而非"必须有数据"。）
     #[test]
     #[ignore]
-    fn real_machine_disk_io_in_snapshot() {
+    fn real_machine_projection_contract() {
+        let data = get_sensor_data();
+        // 枚举收窄（契约 §7）：旧取值不可能出现
+        assert!(FREQ_SOURCES.contains(&data.cpu.freq_source.as_str()));
+        assert!(TEMP_SOURCES.contains(&data.cpu.temp_source.as_str()));
+        assert!(POWER_SOURCES.contains(&data.cpu.power_source.as_str()));
+        // none ⇄ 0 不变式
+        if data.cpu.freq_source == "none" {
+            assert_eq!(data.cpu.clock_mhz, 0.0);
+        }
+        if data.cpu.temp_source == "none" {
+            assert_eq!(data.cpu.temperature, 0.0);
+        }
+        if data.cpu.power_source == "none" {
+            assert_eq!(data.cpu.power_w, 0.0);
+            assert!(!data.cpu.power_estimated);
+        }
+        // 权威内存始终可用
+        assert!(data.memory.total > 0);
+        assert!(data.cpu.core_count >= 1);
+        assert!(!data.diag.is_empty());
+        // tier-2 字段必须自洽：可读时不应给出"无原因"以外的矛盾
+        if data.tier2_available {
+            eprintln!("[真机] tier-2 已生效 elevated={}", data.elevated);
+        } else {
+            assert!(
+                !data.elevated,
+                "tier2_available=false 时 elevated 应为 false"
+            );
+            assert!(
+                data.tier2_reason.as_deref().is_some_and(|r| !r.is_empty()),
+                "tier-2 不可用时应给出可读原因"
+            );
+        }
+        eprintln!(
+            "[真机] freq={:.0}MHz({}) temp={:.1}℃({}) pwr={:.1}W({}) gpu={} disks={} tier2={} reason={:?}",
+            data.cpu.clock_mhz,
+            data.cpu.freq_source,
+            data.cpu.temperature,
+            data.cpu.temp_source,
+            data.cpu.power_w,
+            data.cpu.power_source,
+            data.gpu.len(),
+            data.disks.len(),
+            data.tier2_available,
+            data.tier2_reason
+        );
+    }
+
+    /// 真机端到端验证（默认忽略）：get_sensor_data 快照中磁盘吞吐字段
+    /// 应为非负有限值（sidecar tier-1/tier-2 提供；缺失时全 0；不伪造 0 契约保证）。
+    #[test]
+    #[ignore]
+    fn real_machine_disk_throughput_in_snapshot() {
         let data = get_sensor_data();
         assert!(!data.disks.is_empty(), "应有磁盘条目");
         for d in &data.disks {
@@ -1298,10 +1170,12 @@ mod tests {
             );
         }
         eprintln!(
-            "[真机] disks={} read={:.2} write={:.2} MB/s(首盘)",
+            "[真机] disks={} read={:.2} write={:.2} MB/s(首盘) tier2_available={} reason={:?}",
             data.disks.len(),
             data.disks[0].read_mbps,
-            data.disks[0].write_mbps
+            data.disks[0].write_mbps,
+            data.tier2_available,
+            data.tier2_reason
         );
     }
 }

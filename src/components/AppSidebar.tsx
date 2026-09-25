@@ -6,7 +6,6 @@ import {
   ArrowUp,
   ChevronLeft,
   ClipboardCheck,
-  Bot,
   Cpu,
   Gauge,
   Globe,
@@ -14,7 +13,6 @@ import {
   LayoutDashboard,
   Monitor,
   PanelLeftOpen,
-  ScrollText,
   Server,
   Settings,
   Trash2,
@@ -70,19 +68,7 @@ const navItems: NavItem[] = [
     icon: ClipboardCheck,
     color: "text-emerald-400",
   },
-  {
-    to: "/ai-env",
-    label: "AI 环境",
-    icon: Bot,
-    color: "text-emerald-400",
-  },
   { to: "/hardware", label: "硬件检测", icon: Cpu, color: "text-orange-400" },
-  {
-    to: "/logs",
-    label: "调试日志",
-    icon: ScrollText,
-    color: "text-yellow-400",
-  },
   { to: "/about", label: "关于", icon: Info, color: "text-pink-400" },
 ];
 
@@ -131,9 +117,7 @@ export default function AppSidebar() {
       ? ipInfo.domestic_ipv6
       : (ipInfo?.public_ipv6 ?? "");
   const ipv6Loc =
-    ipInfo && ipInfo.domestic_ipv6 !== "—"
-      ? ipInfo.domestic_ipv6_location
-      : "";
+    ipInfo && ipInfo.domestic_ipv6 !== "—" ? ipInfo.domestic_ipv6_location : "";
   const showIpv6 =
     !!ipv6Addr && ipv6Addr !== "—" && ipv6Addr !== ipInfo?.public_ipv4;
 
@@ -151,13 +135,20 @@ export default function AppSidebar() {
   }, []);
 
   return (
-    <Sidebar collapsible="icon" variant="floating">
-      {/* 品牌区：Monitor 图标 + 绿色状态点 + 应用名与副标题 */}
+    /* variant="sidebar"（非 floating）：左栏是**完整侧边栏**——通高、贴边、
+       右缘一条 border-r 分割线从窗口顶部贯穿到底部。
+       （floating 会加 p-3 内边距 + rounded-xl 圆角卡片外观，使分割线在顶部/底部
+       断开，与「分割线上下完整贯穿」的布局要求冲突。） */
+    <Sidebar collapsible="icon" variant="sidebar">
+      {/* 品牌区：通高布局下与中间标题栏等高（h-9），保证三栏顶边对齐 */}
       <SidebarHeader
         className={cn(
-          "h-14 flex-row items-center gap-2 border-b border-sidebar-border px-3",
+          "h-9 flex-row items-center gap-2 border-b border-sidebar-border px-3",
           collapsed && "justify-center px-2",
         )}
+        /* 品牌区空白处可拖拽窗口；"deep" 使子元素上的点击也能拖动
+           （裸属性只认直接点击，见 TitleBar 注释）。 */
+        data-tauri-drag-region="deep"
       >
         <div className="relative shrink-0">
           <Monitor className="size-5 text-brand-blue" />
@@ -165,18 +156,19 @@ export default function AppSidebar() {
           <StatusDot className="absolute -right-0.5 -top-0.5" />
         </div>
         {!collapsed && (
-          <div className="min-w-0">
-            <span className="gradient-text block truncate text-sm font-semibold">
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <span className="gradient-text shrink-0 text-sm font-semibold">
               SECM
             </span>
-            <p className="mt-0.5 text-[10px] leading-tight text-muted-foreground/60">
+            {/* 副标题：通高布局下改为单行内联（原两行文案在 h-9 标题条内放不下） */}
+            <p className="truncate text-[10px] leading-none text-muted-foreground/60">
               事实上，恢复就是优化的终点。
             </p>
           </div>
         )}
       </SidebarHeader>
 
-      {/* 导航区：8 个页面入口；折叠态由 SidebarMenuButton 的 tooltip 自动显示标签 */}
+      {/* 导航区：9 个页面入口；折叠态由 SidebarMenuButton 的 tooltip 自动显示标签 */}
       <SidebarContent>
         <SidebarGroup>
           <SidebarMenu>
@@ -323,7 +315,6 @@ export default function AppSidebar() {
           </button>
         </div>
       </SidebarFooter>
-
     </Sidebar>
   );
 }

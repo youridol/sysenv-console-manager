@@ -247,7 +247,7 @@ fn summarize_smart(data: &DiskSmartData) -> HealthSummary {
     let mut wear_level_percent: Option<u8> = None;
 
     let mut severity = 0u8; // 0=Good 1=Warning 2=Critical
-    // WMI 报告 Unknown（5）且无其他告警时，最终状态应为 Unknown 而非 Good
+                            // WMI 报告 Unknown（5）且无其他告警时，最终状态应为 Unknown 而非 Good
     let mut wmi_unknown = false;
 
     // WMI 兜底路径（虚拟化环境）：先按 HealthStatus 判定，再叠加 IOCTL 数据
@@ -330,7 +330,10 @@ fn summarize_smart(data: &DiskSmartData) -> HealthSummary {
             alerts.push("寿命已用尽（磨损 100%）".to_string());
         } else if nvme.percentage_used >= 80 {
             severity = severity.max(1);
-            alerts.push(format!("寿命磨损 {}%（接近寿命末期）", nvme.percentage_used));
+            alerts.push(format!(
+                "寿命磨损 {}%（接近寿命末期）",
+                nvme.percentage_used
+            ));
         }
         if nvme.temperature_c >= 70 {
             severity = severity.max(2);
@@ -341,7 +344,10 @@ fn summarize_smart(data: &DiskSmartData) -> HealthSummary {
         }
         if nvme.unsafe_shutdowns >= 100 {
             severity = severity.max(1);
-            alerts.push(format!("不安全关机次数较多（{} 次）", nvme.unsafe_shutdowns));
+            alerts.push(format!(
+                "不安全关机次数较多（{} 次）",
+                nvme.unsafe_shutdowns
+            ));
         }
     }
 
@@ -511,7 +517,12 @@ fn mock_smart_detail(id: &str) -> DiskSmartDetail {
             "SSD",
         )
     } else if warning {
-        ("WDC WD40EZAZ-00SF3B0 (Mock)", "MOCK-HDD-0002", "SATA", "HDD")
+        (
+            "WDC WD40EZAZ-00SF3B0 (Mock)",
+            "MOCK-HDD-0002",
+            "SATA",
+            "HDD",
+        )
     } else if critical {
         (
             "Samsung SSD 860 EVO 500GB (Mock)",

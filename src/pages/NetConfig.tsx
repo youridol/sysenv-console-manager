@@ -110,7 +110,7 @@ export default function NetConfigPage() {
           netConfigState.adapters[0])
       : null;
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+    <div className="grid grid-cols-1 @3xl/main:grid-cols-2 gap-4 items-start">
       {/* 页头：垂直结构（PageHeader 契约：标题 + 描述 + 可选操作区）；col-span-full 保证页头独占整行，不占 grid 左列 */}
       <PageHeader
         className="col-span-full"
@@ -129,7 +129,8 @@ export default function NetConfigPage() {
               <div>
                 <CardTitle className="text-sm">网络配置</CardTitle>
                 <CardDescription className="text-xs">
-                  仅显示当前上网网卡（状态 Up 且有默认网关）；物理地址 / IPv4 / 网关 / 链路本地 IPv6（直接编辑，应用即生效）
+                  仅显示当前上网网卡（状态 Up 且有默认网关）；物理地址 / IPv4 /
+                  网关 / 链路本地 IPv6（直接编辑，应用即生效）
                 </CardDescription>
               </div>
             </div>

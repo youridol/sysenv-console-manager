@@ -16,7 +16,7 @@ import {
   Gamepad2,
   ShieldAlert,
 } from "lucide-react";
-import { cn, formatBytes } from "../lib/utils";
+import { cn, formatBytes, withTimeout } from "../lib/utils";
 import { Button } from "../components/ui/button";
 import { Card, CardContent } from "../components/ui/card";
 import { Input } from "../components/ui/input";
@@ -68,6 +68,97 @@ interface ProcessInfo {
   pid: number;
   name: string;
   memory_mb: number;
+}
+
+/* ── 执行结果 → 右侧栏操作日志（cleanup scope）的边界预算 ── */
+/** 单条正文行的字符数上限（先按行裁剪，控制单行爆炸） */
+const OP_LOG_MAX_LINE_CHARS = 200;
+/** 单条正文行数上限（超出的行折叠为一行省略提示，不逐行上报） */
+const OP_LOG_MAX_BODY_LINES = 12;
+/**
+ * 整条消息的字符数硬上限（最终兜底；头部 + 正文 + 省略提示共用）。
+ *
+ * 字节预算（后端 `append_frontend_log` MAX_LEN = 4096 **字节**，按 UTF-8 计）：
+ *   - 头部（成功/失败 + 操作名 + formatBytes + ASCII 标点）≈ 110B；
+ *   - 正文先按行裁剪为 ≤12 行 × 200 字符，但该理论上限（7200B）不可接受，
+ *     故再用本上限二次兜底：截断结果为「前 1024 字符 + 省略号」= 最多 1025 字符，
+ *     1025 × 3B/字符 = **3075B**（上限）。
+ *     单字符 UTF-8 最大字节数是 3B（BMP 中文/全角占 1 个 UTF-16 码元）；
+ *     补充平面字符为 4B 但占 2 个码元，即 2B/码元，不突破 3B/码元的上界。
+ *   - 最终消息 ≤ 3075B < 4096B，留出约 1KB 余量；
+ *     `message.slice(0, 4096)`（前端）与后端 MAX_LEN 均不会触发截断。
+ */
+const OP_LOG_MAX_TOTAL_CHARS = 1024;
+
+/** 按字符数截断（`slice` 作用于 UTF-16 码元，不会切断码点，故 UTF-8 边界安全） */
+function clipChars(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+/** 把执行结果压成单条有界日志消息（不依赖后端截断兜底） */
+function buildActionResultMessage(result: CleanupResult): string {
+  const head = `${result.success ? "成功" : "失败"} · ${result.operation} · 释放 ${formatBytes(
+    result.bytes_freed,
+  )}`;
+  const lines = result.message
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return clipChars(head, OP_LOG_MAX_TOTAL_CHARS);
+  const kept = lines
+    .slice(0, OP_LOG_MAX_BODY_LINES)
+    .map((l) => clipChars(l, OP_LOG_MAX_LINE_CHARS));
+  if (lines.length > kept.length) {
+    kept.push(`… 其余 ${lines.length - kept.length} 行已省略`);
+  }
+  return clipChars([head, ...kept].join("\n"), OP_LOG_MAX_TOTAL_CHARS);
+}
+
+/**
+ * 把一次操作结果同步写入右侧栏日志面板（「按页输出」下 `/cleanup` 可见）。
+ *
+ * 为什么用 `logger.action` 而非 `logger.info`：`reportToBackend` 以
+ * `级别:模块` 为键做 5s 节流，连续两次清理操作（同为 INFO + "Cleanup"）会让
+ * 第二条被静默丢弃，违背「每次执行恰好一条日志」。`action` 不做节流判定，
+ * 每次调用必定上报一条；正常 info/warn/error 的节流语义不变。
+ *
+ * 次数保证：`runAction` 的 success 分支与 catch 分支互斥且都在
+ * `seq === actionSeq.current` 校验之后，故一次执行恰好调用一次本函数。
+ */
+function reportActionResult(
+  result: CleanupResult,
+  failureLevel: "WARN" | "ERROR" = "WARN",
+) {
+  logger.action(
+    result.success ? "INFO" : failureLevel,
+    "Cleanup",
+    buildActionResultMessage(result),
+  );
+}
+
+/**
+ * 清理/进程操作超时（毫秒）。
+ *
+ * Tauri invoke 无法取消底层 spawn_blocking，后端若卡住（例如遍历被占用的
+ * 磁盘目录、OpenProcess 挂起），`loading` 会永久为真、按钮永远转圈。
+ * 本页此前是唯一没有超时保护的操作页（Dashboard / Hardware 均已用
+ * withTimeout 兜底）。给所有操作统一加保护：到点即报错并复位 loading，
+ * 用户至少能看到失败原因并重试。
+ *
+ * 取值需大于最慢的正常清理（全量着色器缓存清理含遍历多库目录 + 重启删除
+ * 登记），同时远小于用户忍受上限。着色器全清单独放宽。
+ */
+const CLEANUP_TIMEOUT_MS = 60000;
+/** 「全部清理」需串行遍历 NVIDIA/AMD/DirectX/Steam 四类缓存，放宽到 3 分钟 */
+const CLEAN_SHADER_ALL_TIMEOUT_MS = 180000;
+/** 进程列表枚举（sysinfo 全量刷新）超时 */
+const LIST_PROCESSES_TIMEOUT_MS = 15000;
+
+/** 按命令取超时：全部清理用放宽值，其余用默认值 */
+function timeoutFor(cmd: string): number {
+  return cmd === "clean_shader_cache"
+    ? CLEAN_SHADER_ALL_TIMEOUT_MS
+    : CLEANUP_TIMEOUT_MS;
 }
 
 /* ── 基础清理操作（融合在一个卡片容器中）── */
@@ -199,11 +290,19 @@ export default function Cleanup() {
   const [pid, setPid] = useState("");
   const [priority, setPriority] = useState("normal");
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
+  /** 进程列表读取失败原因；非空时卡片显示「读取失败」而非「未检测到进程」。 */
+  const [processesError, setProcessesError] = useState<string | null>(null);
   const [procSearch, setProcSearch] = useState("");
   // 清理操作执行状态：cmd -> 成功与否（undefined=未执行）
   const [cleanStatus, setCleanStatus] = useState<Record<string, boolean>>({});
   // 高亮复位定时器（1 秒后清除状态）
   const cleanResetTimers = useRef<Record<string, number>>({});
+  /**
+   * 操作请求序号：每次 runAction 递增。超时后底层 invoke 仍在后台运行，
+   * 其 finally 若直接 setLoading(null) 会误清新操作的转圈态。
+   * 响应/超时返回时序号不匹配即视为过期，不触碰 loading。
+   */
+  const actionSeq = useRef(0);
 
   /** 高亮 1 秒后复位 */
   const flashStatus = (cmd: string, ok: boolean) => {
@@ -230,17 +329,34 @@ export default function Cleanup() {
 
   const loadProcesses = async () => {
     try {
-      const procs = await invoke<ProcessInfo[]>("list_processes");
+      const procs = await withTimeout(
+        invoke<ProcessInfo[]>("list_processes"),
+        LIST_PROCESSES_TIMEOUT_MS,
+        `进程列表获取超时（超过 ${LIST_PROCESSES_TIMEOUT_MS / 1000} 秒无响应）`,
+      );
       setProcesses(procs);
+      setProcessesError(null);
     } catch (e: unknown) {
-      if (import.meta.env.DEV) logger.error("Cleanup", "list_processes failed:", e);
+      // 失败必须可见且与「无进程」区分（ADR-0001 D9）：原实现仅 DEV 记日志，
+      // 生产环境静默，进程列表保持空数组 → UI 显示「未检测到进程」，
+      // 把「读取失败」呈现成「机器上没有进程」。
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.error("Cleanup", "list_processes failed:", msg);
+      setProcessesError(msg);
     }
   };
 
   useEffect(() => {
     // 异步数据加载：setProcesses 在 await 之后，非同步级联渲染（合法用例）
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadProcesses();
+    void loadProcesses();
+    // 卸载时清掉全部高亮复位定时器（ADR-0001 D12）：否则成功后 1 秒内切换路由，
+    // 定时器仍会触发 setCleanStatus，对已卸载组件调用 setState。
+    return () => {
+      for (const timer of Object.values(cleanResetTimers.current)) {
+        window.clearTimeout(timer);
+      }
+      cleanResetTimers.current = {};
+    };
   }, []);
 
   const runAction = async (
@@ -249,14 +365,25 @@ export default function Cleanup() {
     args?: Record<string, unknown>,
   ) => {
     setLoading(label);
+    const seq = ++actionSeq.current;
     try {
-      const result = await invoke<CleanupResult>(cmd, args);
+      // 超时保护：后端卡住时到点 reject，finally 复位 loading，
+      // 避免按钮永久转圈（本页唯一的 loading 复位路径）
+      const result = await withTimeout(
+        invoke<CleanupResult>(cmd, args),
+        timeoutFor(cmd),
+        `操作超时（超过 ${timeoutFor(cmd) / 1000} 秒无响应）。后端可能正被占用文件阻塞，请稍后重试；部分文件可能已登记重启后删除。`,
+      );
+      if (seq !== actionSeq.current) return;
       setResults((prev) => [{ result, time: formatTime(new Date()) }, ...prev]);
+      // 同步写入右侧栏日志面板（每次执行恰好一条；不节流，见 reportActionResult）
+      reportActionResult(result);
       // 清理操作记录执行结果（成功 → 按钮高亮绿色，1 秒后复位）
       if (CLEAN_STATUS_CMDS.includes(cmd)) {
         flashStatus(cmd, result.success);
       }
     } catch (e: unknown) {
+      if (seq !== actionSeq.current) return;
       const failed: CleanupResult = {
         operation: label,
         success: false,
@@ -267,11 +394,14 @@ export default function Cleanup() {
         { result: failed, time: formatTime(new Date()) },
         ...prev,
       ]);
+      // 超时属预期的保护路径（withTimeout 以「操作超时（」开头），记为 WARN；其余异常记为 ERROR
+      const timedOut = e instanceof Error && e.message.startsWith("操作超时（");
+      reportActionResult(failed, timedOut ? "WARN" : "ERROR");
       if (CLEAN_STATUS_CMDS.includes(cmd)) {
         flashStatus(cmd, false);
       }
     } finally {
-      setLoading(null);
+      if (seq === actionSeq.current) setLoading(null);
     }
   };
 
@@ -305,19 +435,27 @@ export default function Cleanup() {
         }
       />
 
-      {/* ══════════ 第一行：系统清理 + 进程管理（宽屏两列并排） ══════════ */}
-      {/* items-stretch：两列卡片等高对齐（表格行均分填满，无底部留白） */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 items-stretch">
+      {/* ══════════ 系统清理 / 进程管理（全宽纵向堆叠） ══════════ */}
+      {/* 全宽排列：原为 @2xl/main:grid-cols-2 两列并排，现改为单列堆叠，
+          三张卡片（系统清理 / 进程管理 / 执行结果）均占满内容列宽度。
+          卡片内的嵌套网格因此获得完整宽度，按 @container/section 自然展开更多列。 */}
+      <div className="flex flex-col gap-5">
         <section className="animate-fade-in-up stagger-1 flex flex-col">
           <div className="mb-2 shrink-0">
             <SectionTitle icon={Layers} title="系统清理" />
           </div>
 
-          {/* 基础清理 + 着色器缓存：合并为单个容器（flex-1：吃掉 section 内标题后的剩余空间） */}
-          <Card className="flex-1 min-h-0">
-            <CardContent className="p-4 space-y-3">
+          {/* 基础清理 + 着色器缓存：合并为单个容器 */}
+          <Card>
+            {/* @container/section（本地命名容器）：本卡内两个网格是**嵌套网格**，
+                按卡片自身宽度（现为内容列全宽）解析列数，而非页面级 @container/main。
+                用本地容器可让列数随卡片实际宽度响应，不依赖外层网格形态。 */}
+            <CardContent className="@container/section p-4 space-y-3">
               {/* 基础清理 3 项：DNS + 临时文件 + 工作集修剪（破坏性操作均带 AlertDialog 确认） */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {/* 上限 2 列（≥512px）：每格 ≈355px，图标+标题+按钮均可完整显示。
+                  不取 3 列是因为每格会压到 ≈240px，标题被截断成「DN...」「临时...」
+                  （实测全宽卡片下 3 列即出现该回归）。 */}
+              <div className="grid grid-cols-1 @lg/section:grid-cols-2 gap-3">
                 {BASIC_ACTIONS.map((action) => {
                   const Icon = action.icon;
                   const isActive = loading === action.label;
@@ -439,7 +577,8 @@ export default function Cleanup() {
                 </div>
 
                 {/* 着色器厂商子卡片（固定紧凑高度），各厂商清理均需 AlertDialog 确认 */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {/* 同为嵌套网格 → 按本地 @container/section 响应：≥512px 才并排 2 列（上限不变） */}
+                <div className="grid grid-cols-1 @lg/section:grid-cols-2 gap-4">
                   {SHADER_ACTIONS.map((action) => {
                     const Icon = action.icon;
                     const isActive = loading === action.label;
@@ -499,12 +638,16 @@ export default function Cleanup() {
           </Card>
         </section>
 
-        {/* 第二列：进程管理（全宽卡片，与系统清理并排） */}
+        {/* 进程管理（全宽卡片，与系统清理纵向堆叠） */}
         <section className="animate-fade-in-up stagger-2 flex flex-col">
           <div className="mb-2 shrink-0">
-            <SectionTitle icon={Cpu} title="进程管理" count={processes.length} />
+            <SectionTitle
+              icon={Cpu}
+              title="进程管理"
+              count={processes.length}
+            />
           </div>
-          <Card className="flex-1 min-h-0 flex flex-col">
+          <Card>
             <CardContent className="p-4 space-y-3 flex flex-col">
               {/* 搜索 + 优先级设置（一行显示，搜索置左） */}
               <div className="flex flex-wrap items-end gap-3">
@@ -563,8 +706,10 @@ export default function Cleanup() {
                 </Button>
               </div>
 
-              {/* 进程表格：固定 7 行可视（285px = 表头 33 + 7×36），行多时独立滚动条查看全部 */}
-              <div className="h-[285px] shrink-0 overflow-y-auto rounded-md border border-border flex flex-col text-xs proc-scrollbar">
+              {/* 进程表格：固定 10 行可视（393px = 表头 33 + 10×36），行多时可滚动查看全部。
+                  全宽排列后卡片不再被两列挤压，可视行数由 7 提升到 10（更充分利用高度）。
+                  滚动条已按全局要求隐藏（见 index.css），滚轮/键盘滚动不受影响。 */}
+              <div className="h-[393px] shrink-0 overflow-y-auto rounded-md border border-border flex flex-col text-xs">
                 {/* 表头 */}
                 <div className="sticky top-0 bg-muted/90 backdrop-blur-sm z-10 flex border-b border-border shrink-0">
                   <div className="text-left px-3 py-2 font-medium text-muted-foreground w-[80px] shrink-0">
@@ -603,8 +748,14 @@ export default function Cleanup() {
                   ))}
                   {/* 空态：进程为空或搜索无匹配时显示提示行（bug B6） */}
                   {visibleProcs.length === 0 && (
-                    <div className="flex items-center justify-center flex-1 min-h-[72px] text-xs text-muted-foreground gap-1.5">
-                      {processes.length === 0 ? (
+                    <div className="flex items-center justify-center flex-1 min-h-[72px] text-xs gap-1.5 text-muted-foreground">
+                      {processesError ? (
+                        /* 读取失败与「无进程」必须可区分（ADR-0001 D9） */
+                        <span className="flex items-center gap-1.5 text-destructive">
+                          <Activity className="size-3.5 opacity-70" />
+                          读取失败：{processesError}
+                        </span>
+                      ) : processes.length === 0 ? (
                         <>
                           <Activity className="size-3.5 opacity-50" />
                           未检测到进程
@@ -624,7 +775,7 @@ export default function Cleanup() {
         </section>
       </div>
 
-      {/* ══════════ 第二行：执行结果（独立卡片，含 Alert 状态反馈） ══════════ */}
+      {/* ══════════ 执行结果（独立卡片，含 Alert 状态反馈；同占内容列全宽） ══════════ */}
       <section className="animate-fade-in-up stagger-3">
         <Card>
           <CardContent className="p-4 space-y-3">

@@ -1,5 +1,5 @@
 import { logger } from "../lib/logger";
-import { memo, useState, useEffect } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -42,7 +42,9 @@ import {
   Activity,
   AlertTriangle,
   ShieldAlert,
+  Info,
   RefreshCw,
+  Loader2,
   ExternalLink,
   Copy,
   CircuitBoard,
@@ -51,12 +53,22 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { cn, formatBytes } from "../lib/utils";
+import { cn, formatBytes, withTimeout } from "../lib/utils";
 import { getDisplayNet, useNetIface } from "../contexts/NetIfaceContext";
 import { LiveIndicator } from "../components/LiveIndicator";
 import { PageHeader } from "../components/PageHeader";
 import { CardHeaderWithIcon } from "../components/CardHeaderWithIcon";
 import { SectionTitle } from "../components/SectionTitle";
+import { safeInvoke } from "../components/environment-shared";
+
+/** 运行数据落点（与后端 `runtime_paths::RuntimePathsInfo` 契约一致） */
+interface RuntimePathsInfo {
+  root: string;
+  logs: string;
+  diag: string;
+  sidecar_log: string;
+}
+
 interface SensorData {
   cpu: {
     name: string;
@@ -64,16 +76,29 @@ interface SensorData {
     per_core: number[];
     core_count: number;
     clock_mhz: number;
-    /** 频率数据源："ntapi" | "pdh" | "registry" | "sysinfo" | "none"（旧版后端缺失时为 undefined，须兼容） */
+    /**
+     * 频率数据源："pdh" | "registry" | "none"
+     * （契约 v3 §7 收窄：旧版内核驱动 / 兜底探测通道已整体移除；
+     *  旧版后端缺失该字段时为 undefined，须兼容）
+     */
     freq_source?: string;
     temperature: number;
     power_w: number;
-    /** 温度数据源："lhm" | "winring0" | "acpi" | "none"（旧版后端缺失时为 undefined） */
+    /** 温度数据源："lhm" | "none"（契约 v3 §7 收窄；旧版后端缺失时为 undefined） */
     temp_source?: string;
-    /** 功耗数据源："rapl" | "estimated" | "none" */
+    /** 功耗数据源："lhm" | "estimated" | "none"（契约 v3 §7 收窄，已无硬件计量通道） */
     power_source?: string;
     /** true = 估算功耗（前端显示"估算"角标） */
     power_estimated?: boolean;
+    /**
+     * CPU 占用率是否为有效采样（false/缺失 = 进程内首次采样未完成）。
+     *
+     * sysinfo 首次 `refresh_cpu()` 拿不到差分基准，必然返回 100% 伪值
+     * （实测独立探针第 1 次 100.00%、第 2 次 9.64%；生产 chart_history
+     * 27 个会话中 23 个首采样为 100%）。首帧渲染该伪值会让用户看到
+     * "CPU 100%" 满格进度条。缺失（旧版后端）按 true 处理：退化为原行为。
+     */
+    usage_ready?: boolean;
   };
   gpu: Array<{
     name: string;
@@ -112,6 +137,16 @@ interface SensorData {
     write_mbps: number;
   }>;
   diag: string;
+  /**
+   * tier-2（管理员）权限状态：CONTRACT-v3 §3 由 sidecar 提供。
+   * 后端（task-2）尚未投影这三个字段时缺失 → undefined，前端退化为按
+   * `cpu.temp_source !== "lhm"` 推断 tier-2 不可用（不阻塞渲染）。
+   */
+  tier2_available?: boolean;
+  /** tier-2 不可用原因（如「需要管理员权限（PawnIO 设备仅 SYSTEM/Administrators 可访问）」） */
+  tier2_reason?: string | null;
+  /** tier-2 是否已生效（提权伴生进程已贡献数据） */
+  elevated?: boolean;
 }
 
 /** driver_status / driver_install 命令返回的安全软件信息（与后端 serde 契约对齐） */
@@ -122,24 +157,25 @@ export interface SecuritySoftwareInfo {
   display_name: string;
   /** 检测到运行中 */
   active: boolean;
-  /** 是否命中已知拦截对象（WinRing0） */
+  /** 是否命中已知拦截对象（PawnIO） */
   blocked_driver: boolean;
 }
 
 /** driver_status / driver_install 命令返回的驱动状态（与后端 serde 契约对齐） */
 export interface DriverStatus {
-  /** 当前生效的采集通道 */
-  channel: "lhm" | "winring0" | "acpi" | "none";
+  /**
+   * 当前生效的采集通道："pawnio" | "none"
+   * （v3 起内核驱动只剩 PawnIO；此处不做穷尽 switch，未知取值仍原样渲染。）
+   */
+  channel: "pawnio" | "none";
   /** 是否已有可用的驱动通道 */
   available: boolean;
-  /** 驱动服务状态（SCM 查询结果） */
+  /** PawnIO 服务状态（SCM 查询结果）："running" | "stopped" | "not_installed" | "unknown" */
   service_state: string;
   secure_boot: boolean;
   testsigning: boolean;
   /** 降级原因链（逐条展示给用户） */
   degraded: string[];
-  /** 驱动探测到的温度（℃），探测失败为 null */
-  probe_temp_c: number | null;
   /** 检测到的安全软件列表 */
   security: SecuritySoftwareInfo[];
 }
@@ -152,14 +188,16 @@ const DRIVER_INSTALL_TIMEOUT_MS = 30000;
 /**
  * 按安全软件 name 给出的驱动放行配置步骤（name 与后端 SecuritySoftwareInfo.name 对齐）。
  * 未命中的杀软回退到 SECURITY_GUIDE_GENERIC 通用指引。
+ *
+ * 注意：v3 起内核驱动只剩 PawnIO.sys，放行对象一律是 PawnIO.sys。
  */
 const SECURITY_GUIDE: Readonly<Record<string, readonly string[]>> = {
   defender: [
     "打开 Windows 安全中心 → 设备安全性 → 内核隔离，关闭「内存完整性」开关",
-    "在「易受攻击的驱动程序阻止列表」中关闭阻止列表，或把 SECM 驱动加入排除",
+    "在「易受攻击的驱动程序阻止列表」中关闭阻止列表，或把 PawnIO.sys 加入排除",
   ],
   huorong: [
-    "打开火绒安全 → 防护中心 → 信任区 → 添加「SECM 安装/运行目录」与「WinRing0x64.sys」",
+    "打开火绒安全 → 防护中心 → 信任区 → 添加「SECM 安装/运行目录」与「PawnIO.sys」",
     "或在火绒 → 设置 → 驱动防护中允许 SECM 加载内核驱动",
     "添加完成后点击下方「一键重试」重新检测",
     "若提示服务标记删除/驱动加载被拒（错误码 0x431/0x430），请重启电脑后再试",
@@ -169,7 +207,9 @@ const SECURITY_GUIDE: Readonly<Record<string, readonly string[]>> = {
     "如弹窗提示拦截驱动加载，选择「允许 / 信任」",
   ],
   tencent: ["打开腾讯电脑管家 → 病毒查杀 → 信任区，添加 SECM 安装目录"],
-  kaspersky: ["打开卡巴斯基 → 设置 → 排除项与受信任程序，添加 SECM 为受信任程序"],
+  kaspersky: [
+    "打开卡巴斯基 → 设置 → 排除项与受信任程序，添加 SECM 为受信任程序",
+  ],
   norton: ["打开诺顿 → 设置 → 防病毒排除项，添加 SECM 安装目录"],
   eset: ["打开 ESET 安全设置 → 检测引擎排除项，添加 SECM 安装目录"],
   lenovo: ["打开联想电脑管家 → 信任中心 → 白名单，添加 SECM 安装目录"],
@@ -177,7 +217,7 @@ const SECURITY_GUIDE: Readonly<Record<string, readonly string[]>> = {
 
 /** 未识别杀软时的通用配置指引 */
 const SECURITY_GUIDE_GENERIC: readonly string[] = [
-  "在杀毒软件的信任区 / 白名单中添加 SECM 安装目录",
+  "在杀毒软件的信任区 / 白名单中添加 SECM 安装目录，以及内核驱动 PawnIO.sys",
   "如出现驱动加载拦截弹窗，选择「允许 / 信任」，再点击下方「一键重试」",
 ];
 
@@ -194,26 +234,118 @@ const NET_MAX_HISTORY = 30;
 const NET_KB_LIMIT = 1024 * 1024 * 2;
 /** 传感器查询超时（毫秒）：驱动挂起时避免轮询永久 pending */
 const LOAD_TIMEOUT_MS = 8000;
+/**
+ * request_elevation 调用超时（毫秒）：含 UAC 弹窗的用户思考时间，
+ * 不能按普通 invoke 的 5s 计时（用户在弹窗上停留超过 5s 是常态）。
+ */
+const ELEVATION_TIMEOUT_MS = 120000;
 
 /**
- * 给 Promise 加超时：超时后 reject（invoke 无法取消底层 spawn_blocking，
- * 用于驱动挂起时前端至少给出明确提示，避免 UI 永久 loading/请求堆积）。
+ * auto_elevate 调用超时（毫秒）。
+ *
+ * 该命令只走零 UAC 路径（schtasks /Run + 有界等待 tier-2，最长约 8s），
+ * 不含用户在 UAC 弹窗上的思考时间，故预算远小于 ELEVATION_TIMEOUT_MS。
+ * 超时视为不可行/瞬时故障，交由权限卡按钮重试，不阻塞页面。
  */
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    p.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (e: unknown) => {
-        clearTimeout(timer);
-        reject(e);
-      },
-    );
-  });
+const AUTO_ELEVATE_TIMEOUT_MS = 20000;
+
+/**
+ * 首屏"引导加载"最长等待（毫秒）。
+ *
+ * 背景（发布版实测时间线）：tier-1 的 PDH 计数器需要两次采样才能出数，
+ * 冷启动约 2.5–4.4s 内 `clock_mhz`/disk 速率均为空；更早的采样还会拿到
+ * sidecar `available:false`。
+ *
+ * 现状说明（重要）：`hasSubstantialData` 纳入 tier-1 首帧信号（内存/CPU）后，
+ * 任何真实快照都会满足它，因此在 Windows 上 `bootstrapping` 实际恒为 false
+ * ——骨架屏只由 `!data`（首个响应未到）决定。本常量因此是**纯保险**：
+ * 它只在"快照已返回但无实质信号"这一理论分支起作用，在正常机器上不可达。
+ * 保留它是为了在采集彻底异常（`SensorData` 全零）时仍有确定的结束点。
+ *
+ * 首帧值伪值问题由 `cpuSampleReady`（后端 `cpu.usage_ready`）单独处理：
+ * sysinfo 首次采样恒为 100%，故首帧 CPU 主数值留空并显示"正在采样…"，
+ * 而不是把一个假的 100% 呈现给用户。
+ */
+const BOOTSTRAP_GRACE_MS = 8000;
+
+/**
+ * 首屏引导判据：快照是否已含"实质数据"。
+ *
+ * 只要出现任一真实信号即可结束等待：
+ * - 内存总量（`GlobalMemoryStatusEx`，tier-1，**首帧即有真实值**）
+ * - CPU 负载（sysinfo，tier-1，首帧即有值）
+ * - GPU（厂商用户态通道，无需授权）
+ * - CPU 时钟（PDH 预热完成后即出数）
+ * - 温度（tier-2 生效）
+ *
+ * **不等待授权**：tier-2 未授权时也应尽快用 tier-1 数据渲染完整页面，
+ * 授权卡在加载完成后才判定。
+ *
+ * 设计修正（实测）：旧判据只认 `gpu || clock_mhz || temperature`，三者全部来自
+ * LHM sidecar 的 PDH 计数器——需两次采样才出数。生产日志（2026-09-20）显示：
+ * 应用 15:17:16.689 启动，首个"含实质数据"的快照出现在 **15:17:28.773（+12.1s）**，
+ * 而同期 CPU 负载与内存总量在首个 1ms 快照里就已可用。于是用户在整个 PDH 预热
+ * 窗口内（远超 8s 上限）干看骨架屏——这正是「加载时间过久」的用户可见部分，
+ * 与后端首个请求阻塞（4.1s）是两个独立成因。
+ *
+ * 加入内存/CPU 这两个**首帧即可用**的 tier-1 信号后，页面在后端预热完成即刻
+ * 渲染真实数据；GPU/时钟/温度随后到达时原地填充（缺项仍显示「—」）。
+ * `BOOTSTRAP_GRACE_MS` 保留为无数据机器上的兜底上限。
+ */
+function hasSubstantialData(d: SensorData | null): boolean {
+  if (!d) return false;
+  return (
+    d.gpu.length > 0 ||
+    d.cpu.clock_mhz > 0 ||
+    d.cpu.temperature > 0 ||
+    // tier-1 首帧即可用：内存总量恒 > 0（GlobalMemoryStatusEx 同步返回）
+    d.memory.total > 0 ||
+    // CPU 核数由 sysinfo 首帧即给出
+    d.cpu.core_count > 0
+  );
 }
+
+/**
+ * 采集管线是否仍在「预热」：sidecar 的 PDH 计数器尚未产出任何真实信号。
+ *
+ * 与 [`hasSubstantialData`] 的区别：后者现在可由 tier-1 首帧信号（内存/CPU）
+ * 满足，用于**尽早结束骨架屏**；本判据只认 sidecar 侧信号
+ * （GPU/时钟/温度），用于**门控"数据缺失类"提示卡**。
+ *
+ * 为什么必须分开：`Tier2PrivilegeCard`/`DriverGuidanceCard`/`FrequencyDiagCard`
+ * 都是"某个指标确实拿不到"的结论。预热期 GPU 列表必为空、`clock_mhz` 必为 0，
+ * 此时渲染它们会给出**错误结论**（例如 PDH 还没出数就断言"CPU 频率数据缺失"，
+ * 或误报驱动被拦截）。因此这些卡只在 sidecar 首次出数后才允许出现——与修复前
+ * 的时机一致（修复前骨架屏恰好也等到这一刻）。
+ *
+ * `deadline_passed`：超过 [`PIPELINE_WARMUP_MAX_MS`] 后强制返回 false，
+ * 避免"sidecar 始终起不来"的机器永远显示不了本该显示的诊断卡。
+ */
+function isPipelineWarmingUp(
+  d: SensorData | null,
+  deadline_passed: boolean,
+): boolean {
+  if (deadline_passed) return false;
+  if (!d) return true;
+  return d.gpu.length === 0 && d.cpu.clock_mhz <= 0 && d.cpu.temperature <= 0;
+}
+
+/**
+ * 采集管线"预热"判定的兜底时限（毫秒）。
+ *
+ * [`isPipelineWarmingUp`] 只认 sidecar 侧信号，因此在"sidecar 永远起不来 /
+ * 该机确实没有 GPU 且 PDH 拿不到频率"的机器上它会**恒为真**，把
+ * `FrequencyDiagCard`（正是为这种机器准备的诊断卡）永久挡住。
+ * 超过本时限后一律不再视为预热，让诊断卡按原有条件出现。
+ *
+ * 取值须大于 sidecar 内部实测预热上界（冷机 8.4s，见生产日志 9.1–12.1s），
+ * 否则会在真实预热尚未结束时就把"数据缺失"结论过早呈现给用户。
+ */
+const PIPELINE_WARMUP_MAX_MS = 15000;
+
+// 此处曾有 `withTimeout` 的本地副本，与 `src/lib/utils.ts` 的同名导出逐行同构。
+// Cleanup / Hardware / DiskSmartDialog 都从 lib/utils 导入，只有本文件用副本，
+// 后续修复（如接 AbortSignal）会漏改（ADR-0001 D14：合并到唯一实现）。
 
 interface NetHistoryPoint {
   time: string;
@@ -261,16 +393,40 @@ const HardwareTrendChart = memo(function HardwareTrendChart({
         <defs>
           {/* 渐变 stopColor 用品牌色 CSS 变量，与线条 stroke 同源（var(--color-brand-*)） */}
           <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="5%" stopColor="var(--color-brand-blue)" stopOpacity={0.25} />
-            <stop offset="95%" stopColor="var(--color-brand-blue)" stopOpacity={0} />
+            <stop
+              offset="5%"
+              stopColor="var(--color-brand-blue)"
+              stopOpacity={0.25}
+            />
+            <stop
+              offset="95%"
+              stopColor="var(--color-brand-blue)"
+              stopOpacity={0}
+            />
           </linearGradient>
           <linearGradient id="gpuGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="5%" stopColor="var(--color-brand-green)" stopOpacity={0.25} />
-            <stop offset="95%" stopColor="var(--color-brand-green)" stopOpacity={0} />
+            <stop
+              offset="5%"
+              stopColor="var(--color-brand-green)"
+              stopOpacity={0.25}
+            />
+            <stop
+              offset="95%"
+              stopColor="var(--color-brand-green)"
+              stopOpacity={0}
+            />
           </linearGradient>
           <linearGradient id="memGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="5%" stopColor="var(--color-brand-yellow)" stopOpacity={0.2} />
-            <stop offset="95%" stopColor="var(--color-brand-yellow)" stopOpacity={0} />
+            <stop
+              offset="5%"
+              stopColor="var(--color-brand-yellow)"
+              stopOpacity={0.2}
+            />
+            <stop
+              offset="95%"
+              stopColor="var(--color-brand-yellow)"
+              stopOpacity={0}
+            />
           </linearGradient>
         </defs>
         <CartesianGrid
@@ -330,12 +486,28 @@ const NetTrendChart = memo(function NetTrendChart({
       <AreaChart data={data} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
         <defs>
           <linearGradient id="dlGradDash" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="5%" stopColor="var(--color-brand-blue)" stopOpacity={0.25} />
-            <stop offset="95%" stopColor="var(--color-brand-blue)" stopOpacity={0} />
+            <stop
+              offset="5%"
+              stopColor="var(--color-brand-blue)"
+              stopOpacity={0.25}
+            />
+            <stop
+              offset="95%"
+              stopColor="var(--color-brand-blue)"
+              stopOpacity={0}
+            />
           </linearGradient>
           <linearGradient id="ulGradDash" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="5%" stopColor="var(--color-brand-green)" stopOpacity={0.25} />
-            <stop offset="95%" stopColor="var(--color-brand-green)" stopOpacity={0} />
+            <stop
+              offset="5%"
+              stopColor="var(--color-brand-green)"
+              stopOpacity={0.25}
+            />
+            <stop
+              offset="95%"
+              stopColor="var(--color-brand-green)"
+              stopOpacity={0}
+            />
           </linearGradient>
         </defs>
         <CartesianGrid
@@ -395,7 +567,7 @@ interface SummaryStat {
   iconClass?: string;
   /** 额外布局类（如 ml-auto 使该条靠右对齐） */
   className?: string;
-  /** 数值后的补充角标（如"估算"/"低精度"），可传 Badge 元素 */
+  /** 数值后的补充角标（如"估算"/"标称"），可传 Badge 元素 */
   badge?: ReactNode;
 }
 
@@ -464,9 +636,13 @@ function SummaryCard({
             </div>
             <Progress value={progressValue} className={progressClass} />
             <div className="flex gap-3 mt-2 text-xs text-muted-foreground">
-              {stats.map((s) => (
+              {/* key 必须含索引：`text` 在降级态会重复（tier-2 未授权时 CPU 卡为
+                  「—」「4.4 GHz」「—」，两个 "—" 同 key）。授权后文本变为唯一，
+                  key 集合在同一挂载实例内从"重复"变"唯一"，React 协调会保留部分旧
+                  节点，表现为卡片里多出图标与横线，且只有切换页面重新挂载才复位。*/}
+              {stats.map((s, i) => (
                 <span
-                  key={s.text}
+                  key={`${i}-${s.text}`}
                   className={cn("flex items-center gap-1", s.className)}
                 >
                   {s.icon && <s.icon className={cn("size-3", s.iconClass)} />}
@@ -492,7 +668,13 @@ interface MotherboardCardProps {
 /** 传感器类型 → 分组展示元数据（图标/单位/颜色） */
 const MB_GROUP_META: Record<
   string,
-  { label: string; unit: string; icon: LucideIcon; colorClass: string; iconClass: string }
+  {
+    label: string;
+    unit: string;
+    icon: LucideIcon;
+    colorClass: string;
+    iconClass: string;
+  }
 > = {
   temperature: {
     label: "温度",
@@ -540,7 +722,7 @@ function MotherboardCard({ mb }: MotherboardCardProps) {
         title={mb.name && mb.name.trim().length > 0 ? mb.name : "主板传感器"}
         description={`LHM SuperIO 共 ${mb.sensors.length} 项`}
       />
-      <CardContent className="px-4 pb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      <CardContent className="px-4 pb-4 grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-3">
         {groups.map((g) => (
           <div
             key={g.kind}
@@ -566,7 +748,11 @@ function MotherboardCard({ mb }: MotherboardCardProps) {
                   </span>
                   <span className="shrink-0 tabular-nums font-medium">
                     {s.value.toFixed(
-                      g.kind === "voltage" ? 2 : g.kind === "temperature" ? 1 : 0,
+                      g.kind === "voltage"
+                        ? 2
+                        : g.kind === "temperature"
+                          ? 1
+                          : 0,
                     )}
                     <span className="text-[10px] text-muted-foreground">
                       {g.meta.unit}
@@ -634,7 +820,7 @@ function StorageCard({
           <p className="text-sm text-muted-foreground">无磁盘数据</p>
         ) : (
           <div className="flex flex-col divide-y divide-border/50">
-            {disks.map((d) => {
+            {disks.map((d, i) => {
               // 进度条颜色：按使用率分级（90% 红 / 70% 黄 / 正常紫）
               const barClass =
                 d.usage_percent > 90
@@ -644,7 +830,7 @@ function StorageCard({
                     : "[&>div]:bg-purple-500";
               return (
                 <div
-                  key={d.name}
+                  key={`${d.name}-${i}`}
                   className="py-2 first:pt-0 last:pb-0 space-y-1"
                 >
                   {/* 行 1：卷标 + 总容量 + 读写速度 */}
@@ -700,7 +886,8 @@ async function queryDriverStatus(): Promise<DriverStatus | null> {
       `driver_status 查询超时（超过 ${DRIVER_STATUS_TIMEOUT_MS / 1000} 秒无响应）`,
     );
   } catch (e: unknown) {
-    logger.warn("Dashboard", 
+    logger.warn(
+      "Dashboard",
       "driver_status failed:",
       e instanceof Error ? e.message : String(e),
     );
@@ -720,7 +907,8 @@ async function retryDriverInstall(): Promise<DriverStatus | null> {
       `driver_install 执行超时（超过 ${DRIVER_INSTALL_TIMEOUT_MS / 1000} 秒无响应）`,
     );
   } catch (e: unknown) {
-    logger.warn("Dashboard", 
+    logger.warn(
+      "Dashboard",
       "driver_install failed:",
       e instanceof Error ? e.message : String(e),
     );
@@ -744,6 +932,8 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
   const [status, setStatus] = useState<DriverStatus | null>(null);
   const [queryError, setQueryError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"retry" | "redetect" | null>(null);
+  // 运行数据落点（由后端 runtime_paths 解析，界面不硬编码路径）
+  const [sidecarLog, setSidecarLog] = useState<string | null>(null);
 
   // 降级条件触发时查询一次驱动状态（一次性，不进 1s 轮询热路径）
   useEffect(() => {
@@ -756,6 +946,10 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
         setStatus(s);
         setQueryError(null);
       }
+    });
+    void safeInvoke<RuntimePathsInfo>("get_runtime_paths").then((p) => {
+      if (!mounted || p === null) return;
+      setSidecarLog(p.sidecar_log);
     });
     return () => {
       mounted = false;
@@ -795,12 +989,14 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
     try {
       const win = window.open("windowsdefender://", "_self");
       if (win === null) {
-        logger.warn("Dashboard", 
+        logger.warn(
+          "Dashboard",
           "open windowsdefender:// returned null (popup may be blocked)",
         );
       }
     } catch (e: unknown) {
-      logger.warn("Dashboard", 
+      logger.warn(
+        "Dashboard",
         "open windowsdefender:// failed:",
         e instanceof Error ? e.message : String(e),
       );
@@ -819,8 +1015,10 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
       <AlertTitle>硬件数据受安全软件限制</AlertTitle>
       <AlertDescription>
         <p>
-          {missingItems}数据不可用。这通常由安全软件（Windows Defender / 火绒
-          / 360 等）拦截内核驱动加载导致，可按下方步骤放行后重试。
+          {missingItems}
+          数据不可用。若已在上方完成一次管理员授权仍无数据，通常是安全软件（Windows
+          Defender / 火绒 / 360 等）拦截了内核驱动 PawnIO
+          的加载，可按下方步骤放行后重试。
         </p>
 
         {/* 驱动状态摘要 */}
@@ -898,7 +1096,10 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
         <p className="mt-3 flex items-start gap-1.5 rounded-md border border-border/60 bg-muted/20 px-2 py-1.5 text-xs text-muted-foreground">
           <AlertTriangle className="mt-0.5 size-3 shrink-0 text-amber-400" />
           <span>
-            LHM 采集日志：<code className="rounded bg-muted px-1 font-mono">%TEMP%\secm-lhm-sidecar.log</code>
+            LHM 采集日志：
+            <code className="rounded bg-muted px-1 font-mono">
+              {sidecarLog ?? "加载中…"}
+            </code>
             （如弹窗提示 UAC 请点击「是」；仍失败可复制该日志上报）
           </span>
         </p>
@@ -944,6 +1145,179 @@ function DriverGuidanceCard({ missingItems }: DriverGuidanceCardProps) {
   );
 }
 
+/* ── tier-2 提权（一次 UAC 解锁 CPU 温度/功耗/电压、主板、磁盘温度） ── */
+
+/**
+ * 是否「后端未注册该命令」型错误：Tauri v2 对未注册命令返回
+ * `Command <name> not found`（错误类型 UnknownCommand）。
+ * 命中时隐藏按钮而非报错 —— 旧版后端或命令尚未落地时优雅降级。
+ */
+function isUnknownCommandError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("not found") || msg.includes("unknown command");
+}
+
+/**
+ * 提权结果：
+ * - ok          已提权（tier-2 生效）
+ * - declined    用户在 UAC 弹窗上取消 / 后端返回 false（非致命，被后端记住，不重复弹窗）
+ * - unsupported 后端没有 `request_elevation` 命令（旧版后端 / 尚未落地）→ 隐藏按钮
+ * - error       其它失败（超时、sidecar 不可达等）→ 允许重试
+ */
+type ElevationOutcome = "ok" | "declined" | "unsupported" | "error";
+
+/**
+ * 触发一次 UAC 提权：调用后端 Tauri 命令 `request_elevation`（无参，返回 bool）。
+ * Rust 侧 `Err(String)` 会被 Tauri reject 成字符串，故失败原因须从消息文本判断；
+ * 本函数不抛出（返回 outcome 与原因），避免打断 1s 传感器轮询热路径。
+ *
+ * 原因透出：`error` 分支返回后端的原始消息，供 `Tier2PrivilegeCard` 展示。
+ * 此前只把消息写进 `logger.warn`，界面固定显示「提权请求失败，可稍后重试」，
+ * 用户与排障都拿不到真实原因（例如 sidecar 未就绪、计划任务注册失败）。
+ */
+interface ElevationResult {
+  outcome: ElevationOutcome;
+  /** 失败原因（后端原始消息）；成功或用户取消时为 null */
+  reason: string | null;
+}
+
+async function requestElevation(): Promise<ElevationResult> {
+  try {
+    const raised = await withTimeout(
+      invoke<boolean>("request_elevation"),
+      ELEVATION_TIMEOUT_MS,
+      `request_elevation 超时（超过 ${ELEVATION_TIMEOUT_MS / 1000} 秒无响应）`,
+    );
+    return { outcome: raised ? "ok" : "declined", reason: null };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn("Dashboard", "request_elevation failed:", msg);
+    if (isUnknownCommandError(e))
+      return { outcome: "unsupported", reason: null };
+    // Win32 1223 / 0x04C7 = ERROR_CANCELLED（用户在 UAC 点了「否」）
+    if (msg.includes("1223") || msg.includes("0x4c7") || msg.includes("取消")) {
+      return { outcome: "declined", reason: null };
+    }
+    return { outcome: "error", reason: msg };
+  }
+}
+
+/**
+ * 自动提权（零 UAC）：调用后端 `auto_elevate`，只走「管理员直通」与
+ * 「已注册持久授权 /Run」两条路径，**绝不弹 UAC**。
+ *
+ * 返回值语义（与 [`Tier2PrivilegeCard`] 的两步提权流程对应）：
+ * - `"ok"`           tier-2 已自动生效（用户零操作）
+ * - `"infeasible"`   自动路径不可行（非管理员且无持久授权）→ 才由调用方申请用户授权
+ * - `"unsupported"`  旧版后端无该命令 → 不申请，交给权限卡按钮
+ * - `"error"`        sidecar 未就绪等瞬时故障 → 不弹窗，下轮轮询/按钮重试
+ */
+async function autoElevate(): Promise<
+  "ok" | "infeasible" | "unsupported" | "error"
+> {
+  try {
+    const raised = await withTimeout(
+      invoke<boolean>("auto_elevate"),
+      AUTO_ELEVATE_TIMEOUT_MS,
+      `auto_elevate 超时（超过 ${AUTO_ELEVATE_TIMEOUT_MS / 1000} 秒无响应）`,
+    );
+    return raised ? "ok" : "infeasible";
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (isUnknownCommandError(e)) return "unsupported";
+    logger.warn("Dashboard", "auto_elevate failed:", msg);
+    return "error";
+  }
+}
+
+/**
+ * tier-2 权限提示卡（CONTRACT-v3 §1 两级权限模型）：
+ * - tier-1（普通用户，无需 UAC）：CPU 负载/频率、内存、GPU、磁盘 IO、网络、电池
+ * - tier-2（管理员，一次 UAC）：CPU 温度/功耗/电压、主板 SuperIO 温度/风扇/电压、磁盘温度
+ *   —— 只能经 PawnIO ring0 设备读取（DACL 仅 SYSTEM / Administrators）
+ * - 按钮调用后端 `request_elevation`；命令缺失/旧版后端 → 隐藏按钮只留说明
+ * - 用户在 UAC 取消为非致命且被后端记住（不会每次轮询重复弹窗）
+ */
+function Tier2PrivilegeCard({ reason }: { reason: string | null }) {
+  const [phase, setPhase] = useState<
+    "idle" | "busy" | "ok" | "declined" | "unsupported" | "error"
+  >("idle");
+  /** 提权失败时后端返回的具体原因（用于界面直出，不再只写日志） */
+  const [failureReason, setFailureReason] = useState<string | null>(null);
+
+  const handleElevate = async () => {
+    setPhase("busy");
+    setFailureReason(null);
+    const result = await requestElevation();
+    setFailureReason(result.reason);
+    setPhase(result.outcome);
+  };
+
+  return (
+    <Alert className="animate-fade-in border-sky-500/30 bg-sky-500/5">
+      <Info className="text-sky-400" />
+      <AlertTitle>CPU 温度 / 功耗与主板传感器需要管理员授权</AlertTitle>
+      <AlertDescription>
+        <p>
+          SECM 以普通用户权限启动，CPU
+          负载/频率、内存、GPU、磁盘与网络无需授权即可读取；但 CPU
+          温度/功耗/电压、主板温度/风扇/电压与磁盘温度只能经 PawnIO
+          内核驱动获取（该设备仅 SYSTEM / Administrators
+          可访问），需要一次管理员授权。
+        </p>
+
+        {reason && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            后端报告：{reason}
+          </p>
+        )}
+
+        {phase === "ok" && (
+          <p className="mt-2 text-xs text-emerald-400">
+            已授权。tier-2 指标会在数秒内（驱动就绪后）自动出现在下方卡片中。
+          </p>
+        )}
+        {phase === "declined" && (
+          <p className="mt-2 text-xs text-amber-400">
+            未获授权（已在 UAC 弹窗中取消）。tier-2
+            指标保持不可用；如需启用可再次点击下方按钮。
+          </p>
+        )}
+        {phase === "error" && (
+          <>
+            <p className="mt-2 text-xs text-destructive">
+              提权请求失败，可稍后重试；若持续失败请查看上方日志路径。
+            </p>
+            {failureReason && (
+              <p className="mt-1 text-xs text-destructive/80 break-all">
+                原因：{failureReason}
+              </p>
+            )}
+          </>
+        )}
+        {phase === "unsupported" && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            当前后端未提供提权命令，无法在此发起管理员授权（请更新到包含该命令的版本）。
+          </p>
+        )}
+
+        {(phase === "idle" || phase === "declined" || phase === "error") && (
+          <div className="mt-3">
+            <Button
+              size="sm"
+              onClick={() => void handleElevate()}
+              className="bg-sky-500/15 text-sky-400 hover:bg-sky-500/25"
+            >
+              <ShieldAlert className="h-3.5 w-3.5" />
+              {phase === "idle" ? "授权并启用" : "重新授权"}
+            </Button>
+          </div>
+        )}
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 /** 频率全链路失败诊断卡：一次性摘要（可复制上报），与 DriverGuidanceCard 同风格 */
 interface FrequencyDiagCardProps {
   freqSource: string;
@@ -953,17 +1327,16 @@ interface FrequencyDiagCardProps {
   diag: string;
 }
 
-/** 传感器数据源标识 → 展示文案（前端契约值映射；未知值原样显示兜底） */
+/**
+ * 传感器数据源标识 → 展示文案（前端契约值映射；未知值原样显示兜底）。
+ * 只保留 CONTRACT-v3 §7 冻结的取值；旧版已删除通道的标识不再在此出现，
+ * 万一后端回传未知值则由 `?? source` 兜底原样展示。
+ */
 const SOURCE_LABELS: Record<string, string> = {
-  ntapi: "实时(ntapi)",
   pdh: "估算(pdh)",
   registry: "标称(registry)",
-  sysinfo: "标称(sysinfo)",
   none: "无",
-  lhm: "LHM 驱动(lhm)",
-  winring0: "驱动(winring0)",
-  acpi: "低精度(acpi)",
-  rapl: "实测(rapl)",
+  lhm: "LHM(lhm)",
   estimated: "估算(estimated)",
 };
 
@@ -992,7 +1365,8 @@ function FrequencyDiagCard({
       })
       .catch((e: unknown) => {
         if (mounted) {
-          logger.warn("Dashboard", 
+          logger.warn(
+            "Dashboard",
             "get_app_version failed:",
             e instanceof Error ? e.message : String(e),
           );
@@ -1032,7 +1406,8 @@ function FrequencyDiagCard({
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch (e: unknown) {
-      logger.warn("Dashboard", 
+      logger.warn(
+        "Dashboard",
         "复制诊断摘要失败:",
         e instanceof Error ? e.message : String(e),
       );
@@ -1043,11 +1418,11 @@ function FrequencyDiagCard({
     <Card className="animate-fade-in border-amber-500/30 bg-amber-500/5">
       <CardHeader className="flex flex-row items-start justify-between gap-3 pb-2">
         <div className="space-y-1">
-          <CardTitle className="text-sm">
-            CPU 频率数据缺失 · 诊断摘要
-          </CardTitle>
+          <CardTitle className="text-sm">CPU 频率数据缺失 · 诊断摘要</CardTitle>
           <CardDescription className="text-xs">
-            点击复制后发送给开发者，便于定位降级原因
+            v3 起频率只有两个来源：PDH 性能计数器（tier-1，无需
+            UAC）与注册表标称值回退（tier-1）。两者都拿不到时值为
+            「—」，不会再尝试任何内核驱动；点击复制后发送给开发者便于定位。
           </CardDescription>
         </div>
         <Button
@@ -1161,6 +1536,77 @@ export default function Dashboard() {
   const [history, setHistory] = useState<HistoryPoint[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [netHistory, setNetHistory] = useState<NetHistoryPoint[]>([]);
+  /**
+   * 首屏引导加载态（见 BOOTSTRAP_GRACE_MS 注释）。
+   *
+   * 初始 true；首个"含实质数据"的快照到达即置 false，或超过 BOOTSTRAP_GRACE_MS
+   * 后由定时器兜底置 false（保证必然结束）。加载期只渲染骨架屏，
+   * **不渲染卡片容器、不渲染授权/降级提示卡**——避免让用户误以为页面在等授权。
+   */
+  const [bootstrapping, setBootstrapping] = useState(true);
+
+  /**
+   * 采集管线"预热"判定的兜底时限状态（见 [`PIPELINE_WARMUP_MAX_MS`]）。
+   *
+   * 初始 false；挂载后经一次定时器置 true，此后 `isPipelineWarmingUp` 一律
+   * 返回 false，保证"数据缺失类"提示卡最终必定能出现。
+   */
+  const [warmupDeadlinePassed, setWarmupDeadlinePassed] = useState(false);
+
+  /**
+   * 进入硬件信息页即后台自动提权（不等待用户授权）。
+   *
+   * 两步流程（用户诉求：「自动提权不等待授权，非管理员环境无法自动提权才申请用户提权」）：
+   *   1. `auto_elevate` —— 零 UAC 路径（管理员直通 / 已注册持久授权 /Run），
+   *      可行时用户零操作即拿到 tier-2；**不阻塞**页面加载与轮询。
+   *   2. 仅当返回 `infeasible`（确认为非管理员且从未授权）时，才调用
+   *      `request_elevation` 申请一次用户授权（UAC）。被用户取消后 sidecar
+   *      会记住该状态，本会话不再重复弹窗（契约 §1）。
+   *
+   * `autoElevateAttemptedRef` 保证**每次进入本页**只自动发起一次（用 ref 而非 state：
+   * 1s 轮询会持续重渲染；页面重挂载则会重新尝试，便于侧车稍后就绪时自动补上）。
+   */
+  const autoElevateAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    if (autoElevateAttemptedRef.current) return;
+    autoElevateAttemptedRef.current = true;
+    let cancelled = false;
+    const run = async () => {
+      const outcome = await autoElevate();
+      if (cancelled) return;
+      if (outcome === "infeasible") {
+        // 自动路径确实不可行 → 申请一次用户授权（这是唯一的 UAC 触发点）。
+        const result = await requestElevation();
+        if (!cancelled && result.outcome === "error") {
+          logger.warn("Dashboard", "自动申请用户授权失败:", result.reason);
+        }
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 预热兜底定时器：到点后不再把缺失信号解释为"还在预热"
+  useEffect(() => {
+    const t = window.setTimeout(
+      () => setWarmupDeadlinePassed(true),
+      PIPELINE_WARMUP_MAX_MS,
+    );
+    return () => window.clearTimeout(t);
+  }, []);
+
+  // 引导兜底定时器：到点无条件结束加载（无 GPU / 采集异常环境也不会永久骨架）
+  useEffect(() => {
+    if (!bootstrapping) return;
+    const t = window.setTimeout(
+      () => setBootstrapping(false),
+      BOOTSTRAP_GRACE_MS,
+    );
+    return () => window.clearTimeout(t);
+  }, [bootstrapping]);
 
   // [实验D] 恢复 v0.12.1 图表 5s 节流（诊断二分测试用）
 
@@ -1220,7 +1666,8 @@ export default function Dashboard() {
       .catch((e: unknown) => {
         // 读取失败 → 空历史启动（优雅降级，不阻塞实时轮询）
         if (import.meta.env.DEV) {
-          logger.warn("Dashboard", 
+          logger.warn(
+            "Dashboard",
             "get_chart_history failed:",
             e instanceof Error ? e.message : String(e),
           );
@@ -1251,15 +1698,20 @@ export default function Dashboard() {
   ];
 
   // 传感器采样（独立 effect，不受网卡选择影响）
+  //
+  // 采样节奏为「上一轮真正 settle 后才排下一次」（settle-then-schedule），
+  // 而不是固定 1s 的 setInterval——原因见 ADR-0001 D7：
+  // `withTimeout` 只让定时器 reject，**无法取消底层 Tauri invoke / spawn_blocking**。
+  // 原实现在 finally 里立即把 inFlight 置回 false，于是超时后 1s 就会再发一次新请求，
+  // 而旧请求仍在挂起：并发请求数随时间线性累积（约每 8s 加一），注释声称的
+  // 「避免每秒堆积 pending invoke」并未实现。改成「等本轮真实结束再排下一轮」后，
+  // 挂起期间不再产生新请求，并发度恒为 1。
   useEffect(() => {
     let mounted = true;
-    // 并发防护：驱动挂起（等待超时）期间跳过本轮轮询，避免每秒堆积 pending invoke
-    let inFlight = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const fetchData = async () => {
-      if (inFlight) return;
-      inFlight = true;
       try {
-        // 超时保护：驱动无响应时 8 秒内给出明确错误，避免轮询永久 pending
+        // 超时保护：驱动无响应时 8 秒内给出明确错误，避免 UI 永久 loading
         const result = await withTimeout(
           invoke<SensorData>("get_sensor_data"),
           LOAD_TIMEOUT_MS,
@@ -1268,38 +1720,52 @@ export default function Dashboard() {
         if (!mounted) return;
         setData(result);
         setError(null);
+        // 首个含实质数据的快照到达 → 结束首屏引导（不等待授权：tier-1 的
+        // GPU/时钟足够形成完整页面，授权卡在加载完成后再判定）
+        if (hasSubstantialData(result)) {
+          setBootstrapping(false);
+        }
         const now = new Date();
         const time = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}:${now.getSeconds().toString().padStart(2, "0")}`;
         const maxGpu =
           result.gpu.length > 0
             ? Math.max(...result.gpu.map((g) => g.usage))
             : 0;
-        setHistory((prev) => {
-          const next = [
-            ...prev,
-            {
-              time,
-              cpu: result.cpu.usage,
-              gpu: maxGpu,
-              memory: result.memory.usage_percent,
-            },
-          ];
-          return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
-        });
+        // 首次采样是 100% 伪值（见 SensorData.cpu.usage_ready）：不写入趋势历史，
+        // 否则曲线首点会被伪值顶到 Y 轴顶端（domain [0,100]）造成视觉跳变。
+        // 旧版后端缺该字段时视为已就绪，保持原行为。
+        if (result.cpu.usage_ready !== false) {
+          setHistory((prev) => {
+            const next = [
+              ...prev,
+              {
+                time,
+                cpu: result.cpu.usage,
+                gpu: maxGpu,
+                memory: result.memory.usage_percent,
+              },
+            ];
+            return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
+          });
+        }
       } catch (e: unknown) {
         if (mounted)
           setError(
             `传感器数据获取失败: ${e instanceof Error ? e.message : String(e)}`,
           );
       } finally {
-        inFlight = false;
+        // 本轮**真实**结束后（成功、失败或超时）才排下一轮。
+        // 超时分支里底层 promise 仍未 settle，但那正是本设计要覆盖的情形：
+        // 只要不在这里立刻发新请求，就不会有并发累积。
+        if (mounted) {
+          timer = setTimeout(fetchData, 1000);
+        }
       }
     };
-    fetchData();
-    const interval = setInterval(fetchData, 1000);
+    void fetchData();
     return () => {
       mounted = false;
-      clearInterval(interval);
+      if (timer !== undefined) clearTimeout(timer);
     };
   }, []);
 
@@ -1313,7 +1779,6 @@ export default function Dashboard() {
     const now = new Date();
     const time = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}:${now.getSeconds().toString().padStart(2, "0")}`;
     // netHistory 是外部轮询数据(netStats)的累积历史，必须在 effect 中追加（合法用例）
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNetHistory((prev) => {
       const dl = downloadSpeed / 1024;
       const ul = uploadSpeed / 1024;
@@ -1355,21 +1820,45 @@ export default function Dashboard() {
     );
   }
 
-  // 首次加载中：标题区 + 骨架网格
-  if (!data) {
+  // 首屏引导加载：只渲染骨架屏，**不渲染**卡片容器、授权卡与降级卡。
+  //
+  // 两个触发条件合并处理：
+  //   - `!data`：首个快照尚未返回（**正常路径下唯一实际生效的条件**）；
+  //   - `bootstrapping`：快照已返回但无任何实质信号。`hasSubstantialData`
+  //     纳入 tier-1 首帧信号（内存/CPU）后此条件在 Windows 上不可达，
+  //     保留作纯保险（见 BOOTSTRAP_GRACE_MS 注释）。
+  //
+  // 预热期不再靠骨架屏"挡住"提示卡：改由 `isPipelineWarmingUp` 显式门控
+  // 授权/降级/频率诊断卡（否则预热期会误报"CPU 频率缺失"等错误结论）。
+  if (!data || bootstrapping) {
     return (
-      <div className="flex flex-col gap-6">
-        <PageHeader title="硬件信息" description="正在读取硬件传感器数据…" />
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {[1, 2, 3, 4].map((i) => (
-            <Skeleton key={i} className="h-48 rounded-md" />
+      <div className="flex flex-col gap-6 animate-fade-in">
+        <PageHeader
+          title="硬件信息"
+          description="正在加载硬件信息，首次采集需要预热性能计数器…"
+        />
+        {/* 加载过渡：与内容态同构的骨架网格（摘要 3 卡 + 下方 3 卡），
+            尺寸/间距对齐真实布局，切换时不产生跳动 */}
+        <div>
+          <Skeleton className="mb-3 h-5 w-24 rounded-md" />
+          <div className="grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-4">
+            {[1, 2, 3].map((i) => (
+              <Skeleton key={`sum-${i}`} className="h-[148px] rounded-xl" />
+            ))}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 @2xl/main:grid-cols-2 @5xl/main:grid-cols-3 gap-4">
+          {[1, 2, 3].map((i) => (
+            <Skeleton key={`detail-${i}`} className="h-[320px] rounded-xl" />
           ))}
         </div>
       </div>
     );
   }
 
-  // 降级判定：CPU 温度/功耗缺失 → 展示驱动引导卡（杀软拦截内核驱动场景）
+  // 降级判定：CPU 温度/功耗缺失 → 两层原因分流
+  //   1) tier-2 未授权（最常见）→ 权限提示卡（可一键触发一次 UAC）
+  //   2) tier-2 已授权仍缺 → 驱动引导卡（杀软拦截 PawnIO）
   const cpuTempMissing = data.cpu.temperature <= 0;
   const cpuPowerMissing = data.cpu.power_w <= 0;
   const showDriverGuidance = cpuTempMissing || cpuPowerMissing;
@@ -1379,22 +1868,52 @@ export default function Dashboard() {
   ]
     .filter((x): x is string => x !== null)
     .join("、");
+  // tier-2 状态优先取后端显式字段；旧版后端缺失时退化为按 temp_source 推断
+  const tier2Available = data.tier2_available ?? data.cpu.temp_source === "lhm";
+  const showPrivilegeNotice = !tier2Available && missingItems.length > 0;
+  /**
+   * CPU 占用率是否可用于展示。
+   *
+   * `usage_ready === false` = 后端明确告知"这是进程内首次采样"——sysinfo 首次
+   * `refresh_cpu()` 无差分基准，必然返回 100% 伪值（实测 85.2% 的生产会话首采样
+   * 为 100%）。此时主数值与进度条留空（并显示"正在采样…"），下一次 1s 轮询即得真值。
+   *
+   * `undefined`（旧版后端无该字段）按可用处理，退化为修复前的行为。
+   */
+  const cpuSampleReady = data.cpu.usage_ready !== false;
 
   return (
-    <div className="flex flex-col gap-6">
-      {/* ── 驱动降级引导卡（杀软拦截内核驱动） ── */}
-      {showDriverGuidance && <DriverGuidanceCard missingItems={missingItems} />}
+    <div className="flex flex-col gap-6 animate-fade-in">
+      {/* ── tier-2 权限提示卡（未授权 → 一次 UAC 解锁温度/功耗/主板） ──
+          仅在 sidecar 首次出数后判定：预热期 GPU/时钟/温度必为空，此时渲染
+          "需要管理员授权"会给出错误结论。`isPipelineWarmingUp` 代替了原先
+          "骨架屏恰好挡住"的隐式保护——现在骨架屏结束得更早（tier-1 首帧信号），
+          必须显式门控。 */}
+      {!isPipelineWarmingUp(data, warmupDeadlinePassed) &&
+        showPrivilegeNotice && (
+          <Tier2PrivilegeCard reason={data.tier2_reason ?? null} />
+        )}
 
-      {/* ── 频率全链路失败：一次性诊断摘要（可复制上报，FREQ=0 场景） ── */}
-      {((data.cpu.freq_source ?? "none") === "none" ||
-        data.cpu.clock_mhz <= 0) && (
-        <FrequencyDiagCard
-          freqSource={data.cpu.freq_source ?? "none"}
-          tempSource={data.cpu.temp_source ?? "none"}
-          powerSource={data.cpu.power_source ?? "none"}
-          diag={data.diag}
-        />
-      )}
+      {/* ── 驱动降级引导卡（已授权仍缺 → 杀软拦截 PawnIO） ── */}
+      {!isPipelineWarmingUp(data, warmupDeadlinePassed) &&
+        showDriverGuidance &&
+        !showPrivilegeNotice && (
+          <DriverGuidanceCard missingItems={missingItems} />
+        )}
+
+      {/* ── 频率全链路失败：一次性诊断摘要（可复制上报，FREQ=0 场景） ──
+          同样需等预热结束：PDH 首次采样前 `clock_mhz` 必然为 0，
+          否则会误报"CPU 频率数据缺失"。 */}
+      {!isPipelineWarmingUp(data, warmupDeadlinePassed) &&
+        ((data.cpu.freq_source ?? "none") === "none" ||
+          data.cpu.clock_mhz <= 0) && (
+          <FrequencyDiagCard
+            freqSource={data.cpu.freq_source ?? "none"}
+            tempSource={data.cpu.temp_source ?? "none"}
+            powerSource={data.cpu.power_source ?? "none"}
+            diag={data.diag}
+          />
+        )}
 
       {/* ── 页头：标题 + 在线状态 ── */}
       <PageHeader
@@ -1404,7 +1923,9 @@ export default function Dashboard() {
             {data.cpu.name} ·{" "}
             {data.gpu.length > 0
               ? data.gpu.map((g) => g.name).join(" · ")
-              : "未检测到 GPU"}
+              : isPipelineWarmingUp(data, warmupDeadlinePassed)
+                ? "正在采集…"
+                : "未检测到 GPU"}
           </>
         }
         actions={
@@ -1418,7 +1939,7 @@ export default function Dashboard() {
       {/* ── 实时摘要（卡内 stagger-1~3，外层不叠加动画） ── */}
       <div>
         <SectionTitle icon={Gauge} title="实时摘要" className="mb-3" />
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-4">
           {/* CPU 融合卡片 */}
           <SummaryCard
             className="animate-scale-in stagger-1"
@@ -1427,10 +1948,20 @@ export default function Dashboard() {
             iconColor="text-blue-400"
             label="CPU"
             meta={`${data.cpu.core_count} 核`}
-            value={data.cpu.usage.toFixed(0)}
-            progressValue={data.cpu.usage}
+            value={cpuSampleReady ? data.cpu.usage.toFixed(0) : ""}
+            progressValue={cpuSampleReady ? data.cpu.usage : 0}
             progressClass="[&>div]:bg-blue-500"
             stats={[
+              // 首次采样未就绪时给出「采样中」说明，避免主数值区空白被当成卡死
+              ...(cpuSampleReady
+                ? []
+                : [
+                    {
+                      icon: Loader2,
+                      iconClass: "animate-spin text-blue-300",
+                      text: "正在采样…",
+                    },
+                  ]),
               {
                 icon: Zap,
                 iconClass: "text-red-400",
@@ -1438,16 +1969,6 @@ export default function Dashboard() {
                   data.cpu.temperature > 0
                     ? `${data.cpu.temperature.toFixed(0)}°C`
                     : "—",
-                badge:
-                  data.cpu.temperature > 0 &&
-                  data.cpu.temp_source === "acpi" ? (
-                    <Badge
-                      variant="outline"
-                      className="h-4 px-1 text-[10px] font-normal"
-                    >
-                      低精度
-                    </Badge>
-                  ) : undefined,
               },
               {
                 icon: TrendingUp,
@@ -1457,17 +1978,14 @@ export default function Dashboard() {
                     ? `${(data.cpu.clock_mhz / 1000).toFixed(1)} GHz`
                     : "—",
                 // 频率数据源角标：pdh=实时估算（secondary，同功耗"估算"角标）；
-                // registry/sysinfo=静态标称（outline，同温度"低精度"角标）；ntapi/缺失/其它不加角标
+                // registry=静态标称（outline）；none/缺失/其它不加角标
                 badge:
                   data.cpu.clock_mhz > 0 &&
                   (data.cpu.freq_source === "pdh" ||
-                    data.cpu.freq_source === "registry" ||
-                    data.cpu.freq_source === "sysinfo") ? (
+                    data.cpu.freq_source === "registry") ? (
                     <Badge
                       variant={
-                        data.cpu.freq_source === "pdh"
-                          ? "secondary"
-                          : "outline"
+                        data.cpu.freq_source === "pdh" ? "secondary" : "outline"
                       }
                       className="h-4 px-1 text-[10px] font-normal"
                     >
@@ -1539,7 +2057,19 @@ export default function Dashboard() {
             }
             fallback={
               data.gpu.length === 0 ? (
-                <p className="text-sm text-muted-foreground">未检测到 GPU</p>
+                // 采集未就绪时区分「还在预热」与「确实没有 GPU」：
+                // PDH 首次采样前 GPU 列表必为空，此时断言「未检测到 GPU」
+                // 是错误结论，会让用户误以为硬件未被识别。
+                <p className="text-sm text-muted-foreground">
+                  {isPipelineWarmingUp(data, warmupDeadlinePassed) ? (
+                    <span className="flex items-center gap-1.5">
+                      <Loader2 className="size-3.5 animate-spin" />
+                      正在采集…
+                    </span>
+                  ) : (
+                    "未检测到 GPU"
+                  )}
+                </p>
               ) : undefined
             }
           />
@@ -1573,7 +2103,6 @@ export default function Dashboard() {
               },
             ]}
           />
-
         </div>
       </div>
 
@@ -1583,7 +2112,12 @@ export default function Dashboard() {
       )}
 
       {/* ── Trend Chart + 存储 + 网络流量（并排） ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {/* 实测（默认 1400px 窗口，右栏展开）：主内容容器内容宽仅 738px。3 列时「网络流量」卡头
+          需 ≥300px 卡宽才能单行显示标题，<300px 即逐字竖排（三栏布局引入的回归）。
+          实测阈值：3 列需内容宽 ≥1024px（卡宽 331px→1 行）；2 列需 ≥620px（卡宽 302px，
+          600px 时仍 2 行）。故 2 列取 @2xl(42rem=672px，留余量)，3 列取 @5xl(64rem=1024px)；
+          默认窗口 738px 落在 2 列区间（卡宽 361px，标题单行），不再竖排。 */}
+      <div className="grid grid-cols-1 @2xl/main:grid-cols-2 @5xl/main:grid-cols-3 gap-4">
         {/* ── 硬件使用趋势 ── */}
         {/* py-4 覆盖 shadcn Card 默认 py-6，减少卡片内部留白 */}
         <Card className="animate-scale-in stagger-4 py-4">

@@ -220,18 +220,37 @@ fn get_install_date() -> String {
 
     // 回退：ImageStateDate (REG_SZ "YYYYMMDD")
     if let Some(raw) = read_reg_string("HKLM", "SYSTEM\\Setup\\State", "ImageStateDate") {
-        let date_str = raw.trim();
-        if date_str.len() >= 8 {
-            let y = &date_str[0..4];
-            let m = &date_str[4..6];
-            let d = &date_str[6..8];
-            if y.parse::<u32>().is_ok() && m.parse::<u32>().is_ok() && d.parse::<u32>().is_ok() {
-                return format!("{}-{}-{}", y, m, d);
-            }
+        if let Some(formatted) = parse_image_state_date(&raw) {
+            return formatted;
         }
     }
 
     "无法获取".into()
+}
+
+/// 解析 `ImageStateDate`（形如 `"YYYYMMDD"`）为 `"YYYY-MM-DD"`。
+///
+/// 抽成纯函数以便直接单测（注册表读取无法在单测中构造）。
+///
+/// **按字符而非字节取前 8 位**（ADR-0001 D5「先证明，再访问」）：
+/// 原实现用 `date_str.len() >= 8` 判断后直接 `&date_str[0..4]` 切片，而 `len()` 是
+/// **字节**长度。该注册表值可被第三方工具改写；一旦首字节是多字节字符（如中文），
+/// 字节切片就落在字符边界之外并 panic——这是跨 FFI 边界不可恢复的失败。
+/// 现在改为先收集字符再切片，字符数不足 8 时返回 `None`。
+fn parse_image_state_date(raw: &str) -> Option<String> {
+    let chars: Vec<char> = raw.trim().chars().collect();
+    if chars.len() < 8 {
+        return None;
+    }
+    let y: String = chars[0..4].iter().collect();
+    let m: String = chars[4..6].iter().collect();
+    let d: String = chars[6..8].iter().collect();
+    // 仅接受全数字，避免把 "20xx-…" 之类误当日期
+    if y.parse::<u32>().is_ok() && m.parse::<u32>().is_ok() && d.parse::<u32>().is_ok() {
+        Some(format!("{}-{}-{}", y, m, d))
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -556,5 +575,47 @@ fn run_powershell_silent(script: &str) -> String {
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0001 D5 回归：`ImageStateDate` 含多字节前导字符时不得 panic。
+    ///
+    /// 修复前 `&date_str[0..4]` 会落在字符边界外并 panic（`len()` 是字节长度）。
+    #[test]
+    fn 安装日期_多字节前导不panic() {
+        // 4 个中文字符 = 12 字节，满足旧 `len() >= 8`，但字符数只有 4
+        assert_eq!(parse_image_state_date("系统安装日期"), None);
+        // 前导 1 个中文 + 8 个数字 = 11 字节，旧实现切片 [0..4] 落在多字节字符中间
+        assert_eq!(parse_image_state_date("安20240101"), None);
+    }
+
+    /// 正常与边界输入：合法返回格式化结果，非法返回 None。
+    #[test]
+    fn 安装日期_正常与边界() {
+        assert_eq!(
+            parse_image_state_date("20240101").as_deref(),
+            Some("2024-01-01")
+        );
+        // 前后空白被 trim
+        assert_eq!(
+            parse_image_state_date("  20240101  ").as_deref(),
+            Some("2024-01-01")
+        );
+        // 超过 8 位：只看前 8 位（与原行为一致）
+        assert_eq!(
+            parse_image_state_date("20240101999").as_deref(),
+            Some("2024-01-01")
+        );
+        // 不足 8 字符
+        assert_eq!(parse_image_state_date("2024"), None);
+        assert_eq!(parse_image_state_date(""), None);
+        // 非数字
+        assert_eq!(parse_image_state_date("20xx0101"), None);
+        // 全长空白
+        assert_eq!(parse_image_state_date("        "), None);
     }
 }

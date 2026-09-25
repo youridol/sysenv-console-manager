@@ -59,7 +59,15 @@ export interface SmartAttribute {
   worst: number;
   /** 阈值（0 表示无阈值） */
   threshold: number;
-  /** 状态：OK / FAILING / FAILED / UNKNOWN */
+  /**
+   * 状态。
+   *
+   * 生产者 `datasource/src/disk.rs` 只产出两个字面量：
+   * `"OK"` 与 `"FAILED"`（阈值存在且 `value <= threshold` 时判 FAILED）。
+   * 此处曾声明 `OK / FAILING / FAILED / UNKNOWN` 四态，其中 `FAILING` 与 `UNKNOWN`
+   * 的实现分支永不可达（ADR-0001 D11：契约取值域必须等于实现能产出的取值域）。
+   * 保留 `string` 类型是为了向前兼容未来的中间态；但不要把未产出的取值写进契约。
+   */
   status: string;
 }
 
@@ -177,13 +185,14 @@ export function formatDataUnits(units: number | null): string {
   return formatBytes(units * 512);
 }
 
-/** S.M.A.R.T 属性状态 → 语义色（OK 绿 / FAILING 黄 / FAILED 红 / 其余灰） */
+/** S.M.A.R.T 属性状态 → 语义色（FAILED 红 / OK 绿 / 其余灰）。
+ *
+ * 只有两态可达（见 `SmartAttribute.status` 注释）：曾有的 `"FAILING"` 黄色分支
+ * 永不可达，已删除（ADR-0001 D11）。`default` 保留给未知/缺失输入。 */
 export function attributeStatusClass(status: string): string {
   switch (status) {
     case "FAILED":
       return "text-red-500 font-semibold";
-    case "FAILING":
-      return "text-yellow-400 font-semibold";
     case "OK":
       return "text-green-400";
     default:
@@ -191,13 +200,11 @@ export function attributeStatusClass(status: string): string {
   }
 }
 
-/** 属性状态中文标签（表格列展示用） */
+/** 属性状态中文标签（表格列展示用）。两态可达，见 `SmartAttribute.status`。 */
 export function attributeStatusLabel(status: string): string {
   switch (status) {
     case "FAILED":
       return "失败";
-    case "FAILING":
-      return "将失败";
     case "OK":
       return "正常";
     default:

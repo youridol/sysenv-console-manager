@@ -1,6 +1,5 @@
 //! secm-datasource — SECM 纯 Rust 驱动采集模块
 //!
-//! 按设计文档 `docs/designs/2026-08-06-rust-data-source-migration.md` 实现，
 //! 替换原有 PowerShell / 外部命令（`sc` / `powercfg` / `wmic` / `ipconfig` / `curl`）
 //! 数据源，消除外部进程依赖。
 //!
@@ -22,10 +21,8 @@
 //! 中执行（S8 异步并发多线程：GUI 主线程永不接触采集逻辑）。
 
 pub mod activation;
-pub mod cpu_freq;
 pub mod dns;
 pub mod disk;
-pub mod disk_io;
 pub mod error;
 pub mod http;
 pub mod netif;

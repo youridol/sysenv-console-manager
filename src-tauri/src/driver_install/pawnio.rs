@@ -1,14 +1,13 @@
 //! driver_install::pawnio —— PawnIO 驱动服务部署模块（LHM 温度链依赖）。
 //!
-//! 依据 `docs/designs/2026-08-09-pawnio-bundle.md` §3.2 实现：
-//!
+//! 部署流程：
 //! ```text
 //! ensure_pawnio_ready()（幂等：30s 缓存 + 全局互斥；调用方置于 spawn_blocking）
 //!   ├─ L0: 服务已存在
 //!   │      运行中 → 直接复用（低权限查询，普通用户 + 官方预装场景零噪音）
 //!   │      已停止 → 管理员权限下 start_service_with_retry 复用（不重建、不覆盖）
 //!   ├─ L1: 服务不存在（需管理员）
-//!   │      定位随包 PawnIO.sys（复用 resolve_driver_dir 布局，与 WinRing0x64.sys 同目录）
+//!   │      定位随包 PawnIO.sys（复用 resolve_driver_dir 布局）
 //!   │      → driver_signature_valid 签名校验（WHQL 应通过；失败拒绝部署）
 //!   │      → 复制到 %windir%\System32\drivers\PawnIO.sys → 建服务 → 启动
 //!   └─ L2: 任一步失败 → 错误分类（复用 classify_install_error + start_service_with_retry
@@ -17,7 +16,7 @@
 //! ```
 //!
 //! 保守策略（设计 §3.2）：服务已存在时**不覆盖/不删除**用户已有实例（可能为官方
-//! DriverStore 安装）；版本/路径差异仅日志。卸载不清理本服务（与 WinRing0 一致）。
+//! DriverStore 安装）；版本/路径差异仅日志。卸载不清理本服务（保守策略）。
 
 use super::*;
 use std::fs;
@@ -102,7 +101,7 @@ fn plan_pawnio_action(service_state: Option<u32>) -> PawnioPlan {
 }
 
 /// PawnIO 部署错误分类标签（复用 mod.rs classify_install_error 判定语义，
-/// 但文案为 PawnIO 专属，避免误导用户去放行 WinRing0x64.sys）。
+/// 但文案为 PawnIO 专属，避免用户放行错误的驱动文件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PawnioErrorKind {
     /// 签名/加载策略错误（577/1275/0xC0000428）
@@ -191,7 +190,10 @@ pub fn ensure_pawnio_ready_opt(app: Option<&tauri::AppHandle>) -> Result<(), Str
     let _guard = match PAWNIO_MUTEX.try_lock() {
         Ok(g) => g,
         Err(_) => {
-            log_warn("PAWNIO_MUTEX", "另一线程正在执行 PawnIO 部署检测，返回缓存状态");
+            log_warn(
+                "PAWNIO_MUTEX",
+                "另一线程正在执行 PawnIO 部署检测，返回缓存状态",
+            );
             return cached_or_pending();
         }
     };
@@ -231,7 +233,10 @@ fn run_pawnio_ensure(app: Option<&tauri::AppHandle>) -> Result<(), String> {
     // L0 快路径：低权限查询（普通用户可查）；服务已运行 → 直接复用
     let low_state = query_service_state_low_priv(SERVICE_PAWNIO).map(|(s, _)| s);
     if matches!(plan_pawnio_action(low_state), PawnioPlan::Ready) {
-        log_info("QueryServiceStatus", &format!("{} 已运行，直接复用", SERVICE_PAWNIO));
+        log_info(
+            "QueryServiceStatus",
+            &format!("{} 已运行，直接复用", SERVICE_PAWNIO),
+        );
         return Ok(());
     }
     // 需要管理员操作（启动已存在服务 / 完整部署）；运行期不弹 UAC（权限模型铁律）
@@ -294,11 +299,23 @@ fn install_pawnio(driver_dir: &Path) -> Result<(), String> {
     // 复制到系统驱动目录（来源经签名校验；目标已存在则记录覆盖）
     let dest = pawnio_dest_path();
     if dest.exists() {
-        log_warn("fs::copy", &format!("目标已存在，将覆盖: {}", dest.display()));
+        log_warn(
+            "fs::copy",
+            &format!("目标已存在，将覆盖: {}", dest.display()),
+        );
     }
-    fs::copy(&src_sys, &dest)
-        .map_err(|e| format!("复制 {} → {} 失败: {}", src_sys.display(), dest.display(), e))?;
-    log_info("fs::copy", &format!("{} 已部署到 {}", PAWNIO_SYS, dest.display()));
+    fs::copy(&src_sys, &dest).map_err(|e| {
+        format!(
+            "复制 {} → {} 失败: {}",
+            src_sys.display(),
+            dest.display(),
+            e
+        )
+    })?;
+    log_info(
+        "fs::copy",
+        &format!("{} 已部署到 {}", PAWNIO_SYS, dest.display()),
+    );
 
     // 打开 SCM（管理员），防竞态复查服务是否存在
     let scm = open_scm().map_err(|code| failure_message("OpenSCManagerW", code, None))?;
@@ -308,7 +325,10 @@ fn install_pawnio(driver_dir: &Path) -> Result<(), String> {
     {
         // 竞态窗口内服务被创建（如用户手动安装）：按 L0 启动复用，绝不删除重建
         Some(service) => {
-            log_warn("install_pawnio", "检测到 PawnIO 服务已存在（竞态），改为启动复用");
+            log_warn(
+                "install_pawnio",
+                "检测到 PawnIO 服务已存在（竞态），改为启动复用",
+            );
             return start_service_with_retry(service.0, SERVICE_PAWNIO)
                 .map_err(|code| failure_message("StartServiceW", code, Some(&src_sys)));
         }
@@ -343,7 +363,10 @@ fn install_pawnio(driver_dir: &Path) -> Result<(), String> {
         return Err(failure_message("CreateServiceW", code, Some(&src_sys)));
     }
     let guard = ServiceGuard(service);
-    log_info("CreateServiceW", &format!("{} 服务创建成功（{}）", SERVICE_PAWNIO, bin_path));
+    log_info(
+        "CreateServiceW",
+        &format!("{} 服务创建成功（{}）", SERVICE_PAWNIO, bin_path),
+    );
     // 新建后启动（带退避重试）
     start_service_with_retry(guard.0, SERVICE_PAWNIO)
         .map_err(|code| failure_message("StartServiceW", code, Some(&src_sys)))
@@ -360,7 +383,10 @@ mod tests {
     #[test]
     fn plan_ready_when_running() {
         // 服务已运行 → 直接复用
-        assert!(matches!(plan_pawnio_action(Some(SERVICE_RUNNING)), PawnioPlan::Ready));
+        assert!(matches!(
+            plan_pawnio_action(Some(SERVICE_RUNNING)),
+            PawnioPlan::Ready
+        ));
     }
 
     #[test]
@@ -370,8 +396,14 @@ mod tests {
             plan_pawnio_action(Some(SERVICE_STOPPED)),
             PawnioPlan::StartExisting
         ));
-        assert!(matches!(plan_pawnio_action(Some(2)), PawnioPlan::StartExisting));
-        assert!(matches!(plan_pawnio_action(Some(0)), PawnioPlan::StartExisting));
+        assert!(matches!(
+            plan_pawnio_action(Some(2)),
+            PawnioPlan::StartExisting
+        ));
+        assert!(matches!(
+            plan_pawnio_action(Some(0)),
+            PawnioPlan::StartExisting
+        ));
     }
 
     #[test]
@@ -446,11 +478,7 @@ mod tests {
         assert!(msg.contains("安全软件"), "应含分类语义: {}", msg);
         assert!(msg.contains("PawnIO.sys"), "应含放行对象: {}", msg);
         // 用户名（不依赖真实 USERNAME，unknown 兜底也可接受，但格式必须存在）
-        assert!(
-            msg.contains("user="),
-            "应含用户名字段: {}",
-            msg
-        );
+        assert!(msg.contains("user="), "应含用户名字段: {}", msg);
     }
 
     #[test]
@@ -481,7 +509,10 @@ mod tests {
         // 部署路径契约：%windir%\System32\drivers\PawnIO.sys
         std::env::set_var("windir", r"C:\TestWindows");
         let p = pawnio_dest_path();
-        assert_eq!(p, PathBuf::from(r"C:\TestWindows\System32\drivers\PawnIO.sys"));
+        assert_eq!(
+            p,
+            PathBuf::from(r"C:\TestWindows\System32\drivers\PawnIO.sys")
+        );
         std::env::remove_var("windir");
         // windir 缺失 → 回退 C:\Windows
         let p2 = pawnio_dest_path();

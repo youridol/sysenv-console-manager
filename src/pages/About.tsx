@@ -50,7 +50,7 @@ const LICENSE_GROUPS: LicenseGroup[] = [
         name: "Tauri 2.x（含官方插件）",
         license: "MIT / Apache-2.0",
         url: "https://github.com/tauri-apps/tauri",
-        note: "含 tauri-build、tauri-plugin-single-instance / store / dialog / shell / fs",
+        note: "含 tauri-build、tauri-plugin-single-instance / dialog / fs",
       },
       {
         name: "React 19 / react-dom",
@@ -92,24 +92,14 @@ const LICENSE_GROUPS: LicenseGroup[] = [
         url: "https://github.com/dcastil/tailwind-merge",
       },
       {
-        name: "embla-carousel-react",
-        license: "MIT",
-        url: "https://www.embla-carousel.com",
-      },
-      {
         name: "react-router-dom",
         license: "MIT",
         url: "https://reactrouter.com",
       },
       { name: "Recharts", license: "MIT", url: "https://recharts.org" },
-      { name: "cmdk", license: "MIT", url: "https://github.com/pacocoursey/cmdk" },
-      {
-        name: "next-themes",
-        license: "MIT",
-        url: "https://github.com/pacocoursey/next-themes",
-        note: "暗色主题切换（shadcn/ui 组件栈）",
-      },
-      { name: "sonner", license: "MIT", url: "https://sonner.emilkowal.ski" },
+      // cmdk / embla-carousel-react / sonner / next-themes 的许可条目随依赖一并移除：
+      // 它们只被 `src/components/ui/` 下无任何导入者的组件引用（ADR-0001 D13/D15），
+      // 组件删除后这些包已不在分发包内，继续列出许可会造成清单与实物不符。
     ],
   },
   {
@@ -208,7 +198,6 @@ const LICENSE_GROUPS: LicenseGroup[] = [
         name: "tiny_http",
         license: "Apache-2.0 / MIT",
         url: "https://github.com/tiny-http/tiny-http",
-        note: "内置本地 JSON API 服务（127.0.0.1:17860）",
       },
       {
         name: "log",
@@ -260,12 +249,6 @@ const LICENSE_GROUPS: LicenseGroup[] = [
         license: "zlib",
         url: "https://nsis.sourceforge.io",
         note: "生成的 setup.exe 内含 NSIS stub",
-      },
-      {
-        name: "WinRing0（OpenLibSys）",
-        license: "BSD-2-Clause",
-        url: "https://openlibsys.org",
-        note: "resources/driver 分发的内核驱动（L1 降级通道：SMN 温度 / RAPL 功耗读取）；本机版本为 hiyohiyo 重编译变体（third_party/），以二进制形式分发未修改",
       },
       {
         name: "LibreHardwareMonitorLib",
@@ -431,8 +414,8 @@ export default function About() {
       </div>
 
       {/* ── 简介 + 赞助关于 + 构建信息 ── */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 animate-fade-in-up stagger-1">
-        <Card className="sm:col-span-2 lg:col-span-1 min-h-[300px]">
+      <div className="grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-4 animate-fade-in-up stagger-1">
+        <Card className="@md/main:col-span-2 @3xl/main:col-span-1 min-h-[300px]">
           <CardHeader>
             <CardTitle className="text-sm">项目简介</CardTitle>
           </CardHeader>

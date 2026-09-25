@@ -9,7 +9,6 @@
 /// - tray: System tray icon and menu
 
 /// - commands: Tauri command handlers
-
 pub mod cancel;
 
 pub mod cleanup;
@@ -19,6 +18,8 @@ pub mod commands;
 pub mod debug;
 
 pub mod dhcp_probe;
+
+pub mod dhcp_residue;
 
 pub mod disk_info;
 
@@ -30,11 +31,11 @@ pub mod environment;
 
 pub mod game_env;
 
-pub mod hardware;
-
 pub mod hpt;
 
 pub mod ip_info;
+
+pub mod iperf;
 
 pub mod lhm;
 
@@ -50,11 +51,15 @@ pub mod nvidia_drs;
 
 pub mod proc_util;
 
+pub mod runtime_paths;
+
 pub mod sensor;
 
 pub mod settings;
 
 pub mod sysinfo;
+
+pub mod startup_guard;
 
 pub mod temp_data;
 
@@ -64,70 +69,74 @@ pub mod tray;
 // 业务模块经此引用：use secm_lib::datasource::{service, power, ...};
 pub use secm_datasource as datasource;
 
-
-
 use std::sync::Arc;
 
 use tauri::Manager;
 
-
-
 /// Application state shared across all handlers
 
 pub struct AppState {
-
     pub log_buffer: Arc<log::LogBuffer>,
-
 }
-
-
 
 impl AppState {
-
     pub fn new() -> Self {
-
         Self {
-
             log_buffer: Arc::new(log::LogBuffer::new()),
-
         }
-
     }
-
 }
-
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 pub fn run() {
-
     let app_state = AppState::new();
-
-
 
     // 注册 log crate 桥接（datasource 的 log::* → SECM debug 体系，统一 debug.log）
     crate::debug::init_log_bridge();
 
+    // 初始化运行目录（开发期 <项目根>/build/runtime；发行版 <exe 同级>/runtime，
+    // 不可写时回退 %APPDATA%\SECM）。创建结果在下列日志初始化之后显式上报。
+    let runtime_failures = runtime_paths::try_init();
+
     // 初始化文件日志和诊断目录
 
     if let Err(e) = log::init_file_logger() {
-
         eprintln!(
-
             "Warning: Failed to initialize file logger: {}. Logging to memory only.",
-
             e
-
         );
+    }
 
+    // 运行目录创建失败显式上报（debug 体系此时已可用）；不阻断启动：
+    // 写入方各自的失败路径已按 fast-fail 语义返回错误或记日志。
+    for (name, reason) in &runtime_failures {
+        debug_error!(
+            "startup",
+            "运行目录子目录 {} 创建失败: {}（运行数据落点: {}）",
+            name,
+            reason,
+            runtime_paths::runtime_root().display()
+        );
+    }
+
+    // 一次性迁移历史 %APPDATA%\SECM 数据到新运行目录（幂等，只复制不删除源）
+    let (migrated, migration_failures) = runtime_paths::migrate_legacy_data();
+    if migrated > 0 {
+        debug_info!(
+            "startup",
+            "已从历史 %APPDATA%\\SECM 迁移 {} 个文件到 {}",
+            migrated,
+            runtime_paths::runtime_root().display()
+        );
+    }
+    for reason in &migration_failures {
+        debug_warn!("startup", "历史运行数据迁移跳过一项: {}", reason);
     }
 
     // 启动时清理过期诊断文件 + 强制总大小检查
 
     temp_data::init_temp_data();
-
-
 
     tauri::Builder::default()
 
@@ -135,23 +144,14 @@ pub fn run() {
 
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
 
-            // 聚焦已有实例的主窗口
+            // 聚焦已有实例的主窗口；已有实例处于「无主窗口」的启动失败状态时
+            // 给出中文提示，不再静默返回（用户看不到任何反馈即「闪退」）。
 
-            if let Some(window) = app.get_webview_window("main") {
-
-                let _ = window.show();
-
-                let _ = window.set_focus();
-
-            }
+            crate::startup_guard::focus_or_report_missing_main(app);
 
         }))
 
-        .plugin(tauri_plugin_store::Builder::new().build())
-
         .plugin(tauri_plugin_dialog::init())
-
-        .plugin(tauri_plugin_shell::init())
 
         .plugin(tauri_plugin_fs::init())
 
@@ -169,6 +169,12 @@ pub fn run() {
 
             );
 
+            // 后台确认主窗口真的带起了 WebView2。主窗口创建失败时 Tauri 只写日志
+            // 不返回错误（tauri-2.11.5/src/app.rs:2524-2532），实测失败态下进程会以
+            // 无界面状态继续运行并占用单实例互斥体，用户再次双击只会得到二十余毫秒的
+            // 静默退出。看门狗超时后提示用户并结束进程，释放互斥体（详见 startup_guard.rs）。
+            crate::startup_guard::spawn_startup_watchdog(app.handle());
+
 
 
             // Store app handle for event emission (log_buffer uses std::sync::Mutex, no async needed)
@@ -183,7 +189,7 @@ pub fn run() {
 
                 .log_buffer
 
-                .append("Info", "SECM application started successfully");
+                .append_scoped("Info", "SECM application started successfully", "system");
 
             debug_info!("startup", "log_buffer initialized");
 
@@ -195,7 +201,7 @@ pub fn run() {
 
                 Ok(_tray) => {
 
-                    state.log_buffer.append("Info", "System tray initialized");
+                    state.log_buffer.append_scoped("Info", "System tray initialized", "system");
 
                 }
 
@@ -207,39 +213,7 @@ pub fn run() {
 
                         .log_buffer
 
-                        .append("Warn", &format!("Tray creation failed: {}", e));
-
-                }
-
-            }
-
-
-
-            // 硬件传感器 HTTP 服务(non-fatal:绑定失败不中断主程序)
-
-            match crate::hardware::start_http_server() {
-
-                Ok(port) => {
-
-                    state.log_buffer.append(
-
-                        "Info",
-
-                        &format!("Hardware sensor HTTP service on 127.0.0.1:{}", port),
-
-                    );
-
-                }
-
-                Err(e) => {
-
-                    eprintln!("Hardware HTTP service failed (non-fatal): {}", e);
-
-                    state
-
-                        .log_buffer
-
-                        .append("Warn", &format!("Hardware HTTP service failed: {}", e));
+                        .append_scoped("Warn", &format!("Tray creation failed: {}", e), "system");
 
                 }
 
@@ -251,97 +225,96 @@ pub fn run() {
 
             crate::lhm::init(Some(app.handle()));
 
+            // LHM sidecar 预热（后台线程，非阻塞 setup）：把 .NET 冷启动 +
+            // 健康检查握手 + LHM 开树的等待从「首个 get_sensor_data 请求路径」
+            // 移到应用启动阶段。生产日志实测首个请求因此阻塞 4073ms 且返回
+            // available:false 空占位快照（硬件信息页长时间停在骨架屏）。
+            // 复用与请求路径完全相同的 lhm_snapshot()，不改变契约与降级语义，
+            // 不弹 UAC（sidecar 仍以普通权限启动，tier-2 需用户显式提权）。
+            crate::lhm::warm_up();
+
             // PawnIO 驱动资源目录定位（缓存供 lhm.rs / 自愈线程无 AppHandle 时使用）
 
             crate::driver_install::pawnio::init(Some(app.handle()));
 
+            // 这里曾有「隐藏 WebView2 页面测速窗口」与 `SECM_PAGE_PROBE_SELFTEST`
+            // 自检入口（v1.19.2 引入）。「网站测试」统一为 HTTP 延迟测试后，
+            // 浏览器页面测速不再存在，故测速窗口与自检一并移除：不再创建任何
+            // 隐藏 webview，也就不再需要处理 0x8007139F 那类
+            // "窗口在、webview 不在"的初始化陷阱。
 
 
-            // 驱动通道自愈（后台线程，非阻塞启动）：
-            // 启动时自动执行驱动安装/探测链（WinRing0 → ACPI），
-            // 修复「WinRing0 服务停止/被改动后 CPU 温度、功率数据永久丢失」问题
-            // （v0.17.5 修复：此前仅 driver_status/driver_install 命令触发且前端未调用，
-            //   服务停止后无人拉起，CPU 卡片温度/功率恒为 0）。
-            // 非管理员进程走既有通道探测（不弹 UAC）；管理员进程自动重建并启动
-            // 失效的驱动服务（scm_ensure_service_running 内置「存在但启动失败→重建」逻辑，
-            //   已在本机验证：系统目录旧实例启动失败 5，重建指向资源目录后正常加载）。
+
+            // PawnIO 驱动自愈（后台线程，非阻塞启动）：
+            // SECM 自身已无 WinRing0/ACPI 温度通道；驱动侧只剩 PawnIO 就绪探测，
+            // 供 LHM sidecar 的 tier-2（ring0）使用。失败仅记日志不阻断：
+            // 非管理员进程探测不到时由 sidecar 报 available=false，SECM 正常降级。
             {
                 let app_handle = app.handle().clone();
                 std::thread::Builder::new()
                     .name("driver-ensure".to_string())
                     .spawn(move || {
-                        // 并列自愈 PawnIO 服务（LHM 温度链依赖；失败仅日志不阻断——
-                        // sidecar 会报 available:false 由 SECM 降级原链，不劣化现状）
-                        if let Err(e) =
-                            crate::driver_install::pawnio::ensure_pawnio_ready_opt(Some(&app_handle))
+                        // PawnIO 服务自愈（LHM tier-2 ring0 依赖；失败仅日志不阻断）
+                        // 注意：不主动弹 UAC——提权由用户在前端按需触发。
+                        match crate::driver_install::pawnio::ensure_pawnio_ready_opt(Some(&app_handle))
                         {
-                            debug_info!(
-                                "driver_install",
-                                "PawnIO 服务自愈失败（LHM 将降级原链）: {}",
-                                e
-                            );
-                        }
-                        let status = crate::driver_install::ensure_temp_channel(&app_handle);
-                        debug_info!(
-                            "driver_install",
-                            "启动自愈完成: channel={} available={}",
-                            status.channel,
-                            status.available
-                        );
-                        // 通道状态写入主日志（用户日志页可见，便于排查）
-                        let degraded_note = if status.degraded.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" degraded={}", status.degraded.join("; "))
-                        };
-                        // channel=none 且检测到运行中安全软件时，追加显式拦截指引（火绒等
-                        // 驱动防护可能拦截 WinRing0 加载；0x430/0x431 服务标记删除需重启电脑）
-                        let security_note = if status.channel == "none"
-                            && status.security.iter().any(|s| s.active)
-                        {
-                            " 提示：检测到运行中的安全软件（火绒等），其驱动防护可能拦截 WinRing0 加载，请按引导卡步骤放行后一键重试；服务标记删除（0x430/0x431）时请重启电脑".to_string()
-                        } else {
-                            String::new()
-                        };
-                        if let Some(state) = app_handle.try_state::<AppState>() {
-                            state.log_buffer.append(
-                                "Info",
-                                &format!(
-                                    "驱动通道自愈完成: channel={} available={}{}{}",
-                                    status.channel,
-                                    status.available,
-                                    degraded_note,
-                                    security_note
-                                ),
-                            );
+                            Ok(()) => {
+                                debug_info!("driver_install", "PawnIO 就绪探测完成: available=true");
+                                if let Some(state) = app_handle.try_state::<AppState>() {
+                                    state
+                                        .log_buffer
+                                        .append_scoped(
+                                            "Info",
+                                            "PawnIO 驱动就绪（LHM tier-2 ring0 可用）",
+                                            "system",
+                                        );
+                                }
+                            }
+                            Err(e) => {
+                                debug_info!(
+                                    "driver_install",
+                                    "PawnIO 服务自愈失败（LHM 将仅提供 tier-1 用户态数据）: {}",
+                                    e
+                                );
+                                if let Some(state) = app_handle.try_state::<AppState>() {
+                                    state.log_buffer.append_scoped(
+                                        "Info",
+                                        &format!(
+                                            "PawnIO 驱动不可用（LHM tier-2 ring0 数据缺失，需管理员按需提权）: {}",
+                                            e
+                                        ),
+                                        "system",
+                                    );
+                                }
+                            }
                         }
                     })
                     .ok();
             }
 
             // Set up close-to-tray behavior
+            //
+            // 主窗口缺失时不在此处 panic：panic 会中断事件循环并跳过启动守卫的
+            // 提示与退出流程。缺少主窗口的情况统一由 startup_guard 的看门狗判定，
+            // 它会提示用户并结束进程。
+            if let Some(window) = app.get_webview_window(crate::startup_guard::MAIN_WINDOW_LABEL)
+            {
+                let window_clone = window.clone();
 
-            let window = app
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
 
-                .get_webview_window("main")
-
-                .expect("main window not found");
-
-            let window_clone = window.clone();
-
-            window.on_window_event(move |event| {
-
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-
-                    api.prevent_close();
-
-                    let _ = window_clone.hide();
-
-                }
-
-            });
-
-
+                        let _ = window_clone.hide();
+                    }
+                });
+            } else {
+                debug_error!(
+                    "startup",
+                    "关闭到托盘未注册：主窗口 {} 不可用",
+                    crate::startup_guard::MAIN_WINDOW_LABEL
+                );
+            }
 
             Ok(())
 
@@ -360,9 +333,11 @@ pub fn run() {
 
             commands::get_sensor_data,
 
-            commands::get_hardware_sensors,
+            commands::request_elevation,
 
-            commands::get_debug_logs,
+            commands::auto_elevate,
+
+            commands::get_runtime_paths,
 
             commands::flush_dns,
 
@@ -393,6 +368,16 @@ pub fn run() {
             commands::cancel_net_cmd,
 
             commands::iperf3_stream,
+
+            commands::iperf3_tool_info,
+
+            commands::iperf3_server_start,
+
+            commands::iperf3_server_stop,
+
+            commands::iperf3_server_status,
+
+            commands::iperf3_firewall_rule,
 
             commands::get_hags_state,
 
@@ -434,8 +419,6 @@ pub fn run() {
 
             commands::enable_ultimate_performance,
 
-            commands::get_services,
-
             commands::list_all_services,
 
             commands::start_service,
@@ -451,18 +434,6 @@ pub fn run() {
             commands::check_directx,
 
             commands::check_vc_runtimes,
-
-            commands::check_ai_tools,
-
-            commands::install_ai_tool,
-
-            commands::fetch_ai_latest_versions,
-            commands::check_npm_environment,
-            commands::uninstall_ai_tool,
-            commands::list_mcp_servers,
-            commands::install_mcp_server,
-            commands::uninstall_mcp_server,
-            commands::list_extensions,
 
             commands::get_game_presets,
 
@@ -480,6 +451,12 @@ pub fn run() {
 
             commands::deep_check_dhcp_servers,
 
+            commands::scan_dhcp_residue,
+
+            commands::clean_dhcp_residue,
+
+            commands::probe_url,
+
             commands::get_network_config,
 
             commands::apply_network_config,
@@ -496,8 +473,6 @@ pub fn run() {
 
             commands::driver_install,
 
-            commands::driver_uninstall,
-
             commands::list_disks,
 
             commands::get_disk_smart,
@@ -509,15 +484,12 @@ pub fn run() {
         .expect("error while building tauri application")
 
         .run(|_app, event| {
-            // M1：应用退出前释放 WinRing0 设备句柄，避免服务停止卡 STOP_PENDING
-            if let tauri::RunEvent::Exit = event {
-                crate::driver_install::winring0::close_device();
-            }
             // LHM sidecar 退出清理（kill 子进程 + taskkill 兜底孤儿）
             if let tauri::RunEvent::Exit = event {
                 crate::lhm::shutdown();
+                // iperf3 服务端退出清理：用户在页面上启动的是长驻 `iperf3 -s`
+                // 子进程，不显式杀死会在应用退出后继续占用端口（成为孤儿进程）。
+                crate::iperf::shutdown_server();
             }
         });
-
 }
-

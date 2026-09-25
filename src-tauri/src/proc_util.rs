@@ -63,8 +63,13 @@ pub(crate) fn run_ps_result(script: &str) -> Result<String, String> {
     }
 }
 
-/// 解码 PowerShell 输出：优先 UTF-8（stdout 已被强制 UTF-8），回退 GBK（中文系统 stderr）
-fn decode_ps(bytes: &[u8]) -> String {
+/// 解码外部进程输出：优先 UTF-8，回退 GBK（中文系统的 ANSI 代码页）。
+///
+/// 这是本 crate **唯一**的「UTF-8 优先、GBK 兜底」解码实现（ADR-0001 D14）。
+/// `net_config::decode_ansi` 与 `settings::decode_sc_output` 曾经是同构副本，
+/// 已改为复用它；`cleanup::decode_console_output` 策略不同（先试 CP_ACP），
+/// 不属于同一组，未合并。
+pub(crate) fn decode_ps(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }

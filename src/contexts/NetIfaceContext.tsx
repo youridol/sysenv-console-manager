@@ -191,9 +191,17 @@ export function NetIfaceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // 统一轮询 get_net_stats（单数据源，Dashboard 与侧边栏读同一份数据）
+  //
+  // in-flight 守卫（ADR-0001 D7）：`netInterval` 最小可到 500ms（见 Dashboard 的
+  // 刷新间隔选项），而后端 get_net_stats 要持 NETWORKS 互斥锁并做全量网卡刷新。
+  // 单次耗时超过间隔时，固定 setInterval 会让未完成的请求逐轮叠加。
+  // Dashboard 的传感器轮询已有同等守卫，两处必须一致。
   useEffect(() => {
     let mounted = true;
+    let inFlight = false;
     const fetch = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const r = await invoke<NetStatsData>("get_net_stats");
         if (!mounted) return;
@@ -205,9 +213,11 @@ export function NetIfaceProvider({ children }: { children: ReactNode }) {
         }
       } catch {
         /* 静默：轮询失败不中断 */
+      } finally {
+        inFlight = false;
       }
     };
-    fetch();
+    void fetch();
     const timer = setInterval(fetch, netInterval);
     return () => {
       mounted = false;
@@ -226,7 +236,8 @@ export function NetIfaceProvider({ children }: { children: ReactNode }) {
       } catch (e: unknown) {
         // 读取失败 → 保持空表，卡片隐藏速度显示（优雅降级，不打断流量轮询）
         if (import.meta.env.DEV) {
-          logger.warn("NetIfaceContext", 
+          logger.warn(
+            "NetIfaceContext",
             "get_link_speeds failed:",
             e instanceof Error ? e.message : String(e),
           );

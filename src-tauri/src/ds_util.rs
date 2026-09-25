@@ -1,6 +1,5 @@
 //! 数据源接入层工具 — 旧数据源（PowerShell/外部命令）与新驱动（secm-datasource）切换
 //!
-//! 设计文档 `docs/designs/2026-08-06-rust-data-source-migration.md` §6：
 //! - 过渡期保留 `legacy-data-source` feature：启用后 P1-P13 回退旧 PowerShell/外部命令实现
 //! - 错误显式化：新采集器返回 `Result<T, CollectError>`，本模块负责映射为
 //!   用户可见中文消息（`"中文操作描述: 技术细节"`）并打 R8 日志（含 API 名/操作名/详情）
@@ -44,11 +43,6 @@ pub fn err_message(e: &CollectError) -> String {
 /// 用法：`Err(ds::CollectError) => return Err(ds_util::log_err("net_stats", "获取链路速度", &e))`
 pub fn log_err(module: &str, op: &str, e: &CollectError) -> String {
     let msg = err_message(e);
-    crate::debug_error!(
-        module,
-        "{} | 建议: 检查系统服务与权限后重试 | {}",
-        op,
-        msg
-    );
+    crate::debug_error!(module, "{} | 建议: 检查系统服务与权限后重试 | {}", op, msg);
     msg
 }

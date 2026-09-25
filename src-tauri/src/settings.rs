@@ -602,7 +602,9 @@ fn power_plan_name(guid: &str, raw_name: &str) -> String {
                 "high performance" => "高性能".into(),
                 "power saver" => "节能".into(),
                 "ultimate performance" => "卓越性能".into(),
-                _ if name.is_empty() => guid[..8].to_string(),
+                // 子键名可能短于 8 字节或含多字节字符，直接 `guid[..8]` 会越界/
+                // 落在字符边界外并 panic（ADR-0001 D5）：不能取前 8 位时回退整串。
+                _ if name.is_empty() => guid.get(..8).unwrap_or(guid).to_string(),
                 _ => name,
             }
         }
@@ -893,11 +895,7 @@ pub fn set_hetero_policy(kind: &str, value: u32) -> Result<(), String> {
             crate::debug_warn!("settings", "异类策略写入成功但无激活方案可刷新");
         }
         Err(e) => {
-            return Err(crate::ds_util::log_err(
-                "settings",
-                "获取当前电源计划",
-                &e,
-            ));
+            return Err(crate::ds_util::log_err("settings", "获取当前电源计划", &e));
         }
     }
     Ok(())
@@ -1050,12 +1048,12 @@ pub fn get_services() -> Vec<ServiceInfo> {
     services
 }
 
-/// 解码 sc 命令输出：中文 Windows 的 sc 输出为 GBK（ANSI 代码页）编码，UTF-8 尝试失败时回退 GBK
+/// 解码 sc 命令输出：复用 `proc_util::decode_ps`（ADR-0001 D14）。
+///
+/// 原实现为 `String::from_utf8(bytes.to_vec())` 再回退 GBK，语义与 decode_ps 一致，
+/// 但多一次堆分配；合并后行为不变且只维护一份编码回退策略。
 fn decode_sc_output(bytes: &[u8]) -> String {
-    String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| {
-        let (cow, _, _) = encoding_rs::GBK.decode(bytes);
-        cow.into_owned()
-    })
+    crate::proc_util::decode_ps(bytes)
 }
 
 /// 枚举系统所有服务（legacy 旧实现：sc query type= service state= all + 8 线程并行 sc qc）
@@ -1417,6 +1415,28 @@ pub fn set_service_start_type(name: &str, start_type: &str) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0001 D5 回归：未知计划的 GUID 短于 8 字节时，
+    /// `guid[..8]` 越界 panic；修复后应回退整串。
+    #[test]
+    fn 电源计划名_短guid不panic() {
+        // 空友好名走 `_ if name.is_empty()` 分支；GUID 只有 3 字节
+        assert_eq!(power_plan_name("abc", ""), "abc");
+        // 5 字节：仍不足 8
+        assert_eq!(power_plan_name("abcd1", ""), "abcd1");
+        // 恰好 8 字节：取前 8 位即全串
+        assert_eq!(power_plan_name("abcdefgh", ""), "abcdefgh");
+        // 长 GUID：取前 8 位
+        assert_eq!(power_plan_name("0123456789abcdef", ""), "01234567");
+    }
+
+    /// 多字节字符的 GUID：按字节切分曾可能落在字符边界外。
+    #[test]
+    fn 电源计划名_多字节guid不panic() {
+        // 3 个中文字符 = 9 字节，旧逻辑 `guid[..8]` 会落在字符边界外 panic
+        let name = power_plan_name("电源计划", "");
+        assert!(!name.is_empty(), "应返回可读名称而非 panic");
+    }
 
     #[test]
     fn test_get_power_plans() {

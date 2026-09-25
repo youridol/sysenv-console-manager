@@ -23,19 +23,50 @@ const repoRoot = join(__dirname, "..");
 
 const failOnWarn = process.argv.includes("--fail-on-warn");
 
+/// Windows PowerShell 5.1 的模块搜索路径（只保留 5.1 自带/用户模块目录）。
+///
+/// 为什么必须收敛：本脚本用 `powershell.exe`（Windows PowerShell **5.1**）取签名，
+/// 但 Node 进程通常继承自 PowerShell 7（pwsh）启动的环境，其 `PSModulePath`
+/// 含 PS7 的模块目录（`...\PowerShell\7\Modules`、`...\PowerShell\Modules`）。
+/// 5.1 若去加载 PS7 模块，会因扩展类型数据（`types.ps1xml`）成员重复而
+/// **加载 `Microsoft.PowerShell.Security` 失败**，`Get-AuthenticodeSignature`
+/// 随即不可用 → 构建门禁误报失败（实测：`Import-Module` 报
+/// `FormatXmlUpdateException: The member AccessToString is already present`）。
+///
+/// 修复：把 `PSModulePath` 收敛为仅含 `WindowsPowerShell` 的条目
+/// （5.1 标准路径：`%USERPROFILE%\Documents\WindowsPowerShell\Modules`、
+/// `%ProgramFiles%\WindowsPowerShell\Modules`、
+/// `%WINDIR%\system32\WindowsPowerShell\v1.0\Modules`）。
+/// 未命中任何条目时返回 `undefined`，交给子进程沿用继承值（保持旧行为，
+/// 不引入新的失败模式——例如非标准安装位置）。
+function windowsPowerShellModulePath() {
+  const sep = ";";
+  const inherited = (process.env.PSModulePath || "")
+    .split(sep)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const only51 = inherited.filter((p) => /WindowsPowerShell/i.test(p));
+  return only51.length > 0 ? only51.join(sep) : undefined;
+}
+
+/// 子进程环境：仅在需要时覆写 PSModulePath（见上）
+const POWERSHELL_ENV = (() => {
+  const psModulePath = windowsPowerShellModulePath();
+  if (psModulePath === undefined) return process.env;
+  return { ...process.env, PSModulePath: psModulePath };
+})();
+
 function collectTargets() {
   const targets = [];
   const resDir = join(repoRoot, "src-tauri", "resources", "driver");
   const thirdDir = join(repoRoot, "third_party");
   const pawnioDir = join(thirdDir, "PawnIO");
   const candidates = [
-    { name: "WinRing0x64.sys（WinRing0 温度通道）", path: join(resDir, "WinRing0x64.sys"), kind: "kernel" },
-    { name: "PawnIO.sys（LHM 主通道，WHQL）", path: join(resDir, "PawnIO.sys"), kind: "kernel" },
+    { name: "PawnIO.sys（LHM tier-2 唯一 ring0 驱动，WHQL）", path: join(resDir, "PawnIO.sys"), kind: "kernel" },
     { name: "PawnIO.cat（LHM 目录文件）", path: join(resDir, "PawnIO.cat"), kind: "kernel" },
   ];
   const fallbacks = {
-    "WinRing0x64.sys（WinRing0 温度通道）": join(thirdDir, "WinRing0x64.sys"),
-    "PawnIO.sys（LHM 主通道，WHQL）": join(pawnioDir, "PawnIO.sys"),
+    "PawnIO.sys（LHM tier-2 唯一 ring0 驱动，WHQL）": join(pawnioDir, "PawnIO.sys"),
     "PawnIO.cat（LHM 目录文件）": join(pawnioDir, "PawnIO.cat"),
   };
   for (const c of candidates) {
@@ -49,22 +80,25 @@ function collectTargets() {
 }
 
 function querySignatures(files) {
-  // 逐文件调用 PowerShell（简单可靠；6 个文件约 2s，可接受）
+  // 逐文件调用 PowerShell（简单可靠；2 个 PawnIO 文件约 1s，可接受）
+  // 注：WinRing0x64.sys 已停止分发，故不再纳入审计（本仓库仅保留 PawnIO ring0 驱动）。
   return files.map((f) => {
-    const esc = f.path.replace(/\'/g, "\'\'");
+    // PowerShell 单引号字符串内的单引号需写成两个单引号；JS 侧直接输出 '' 即可
+    const esc = f.path.replace(/'/g, "''");
     const script =
-      "$s = Get-AuthenticodeSignature \'" + esc + "\'\n" +
+      "$s = Get-AuthenticodeSignature '" + esc + "'\n" +
       "[PSCustomObject]@{\n" +
       "  status = $s.Status.ToString()\n" +
-      "  signer = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { \'\' }\n" +
-      "  notBefore = if ($s.SignerCertificate) { $s.SignerCertificate.NotBefore.ToString(\'yyyy-MM-dd\') } else { \'\' }\n" +
-      "  notAfter = if ($s.SignerCertificate) { $s.SignerCertificate.NotAfter.ToString(\'yyyy-MM-dd\') } else { \'\' }\n" +
-      "  tsSubject = if ($s.TimeStamperCertificate) { $s.TimeStamperCertificate.Subject } else { \'\' }\n" +
-      "  tsNotAfter = if ($s.TimeStamperCertificate) { $s.TimeStamperCertificate.NotAfter.ToString(\'yyyy-MM-dd\') } else { \'\' }\n" +
+      "  signer = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '' }\n" +
+      "  notBefore = if ($s.SignerCertificate) { $s.SignerCertificate.NotBefore.ToString('yyyy-MM-dd') } else { '' }\n" +
+      "  notAfter = if ($s.SignerCertificate) { $s.SignerCertificate.NotAfter.ToString('yyyy-MM-dd') } else { '' }\n" +
+      "  tsSubject = if ($s.TimeStamperCertificate) { $s.TimeStamperCertificate.Subject } else { '' }\n" +
+      "  tsNotAfter = if ($s.TimeStamperCertificate) { $s.TimeStamperCertificate.NotAfter.ToString('yyyy-MM-dd') } else { '' }\n" +
       "} | ConvertTo-Json -Compress";
     const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
+      env: POWERSHELL_ENV,
     });
     return JSON.parse(out.trim());
   });
@@ -101,13 +135,10 @@ function judge(item, sig) {
       detail: "测试签名（" + signer + "）——仅测试签名模式（bcdedit /set testsigning on）可加载，Secure Boot 下自动回退其他通道；随包分发为设计行为",
     };
   }
-  // 用户态组件（exe 安装工具等）：未签名不阻断（非内核加载，最多 SmartScreen 提示）
-  if (item.kind === "user" && (status === "NotSigned" || status === "UnknownError")) {
-    return {
-      verdict: "WARN",
-      detail: "用户态组件未签名（" + status + "）——不影响运行（非内核驱动），首次运行可能触发 SmartScreen 提示",
-    };
-  }
+  // 此处曾有 `item.kind === "user"` 分支：`collectTargets()` 只构造 `kind: "kernel"`
+  // 的目标（PawnIO.sys / PawnIO.cat），全仓无 `kind: "user"` 生产者，该分支不可达。
+  // 删除以保证「审计覆盖全部随包驱动」的语义与实现一致（ADR-0001 D15）。
+  // 将来若纳入用户态组件，需同时恢复本分支与 collectTargets 的候选列表。
   return { verdict: "FAIL", detail: "签名状态 " + status + "——不可分发" };
 }
 
@@ -121,11 +152,15 @@ function main() {
   console.log("=".repeat(78));
   let failed = 0;
   let warned = 0;
-  const sigs = querySignatures(targets);
-  const list = sigs;
+  const list = querySignatures(targets);
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
-    const sig = list.find((s) => String(s.idx) === String(i)) ?? list[i];
+    // querySignatures 按入参顺序返回，直接按下标取即可。
+    // 原实现为 `list.find((s) => String(s.idx) === String(i)) ?? list[i]`，
+    // 但返回对象里从来没有 `idx` 字段（只有 status/signer/notBefore/notAfter/
+    // tsSubject/tsNotAfter），该 find 恒不命中，每次都退化为 list[i]
+    // ——一次空跑的 O(n) 扫描（ADR-0001 D15）。
+    const sig = list[i];
     const r = judge(t, sig);
     if (r.verdict === "FAIL") failed++;
     if (r.verdict === "WARN") warned++;

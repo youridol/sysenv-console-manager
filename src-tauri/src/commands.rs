@@ -1,4 +1,5 @@
 /// Tauri 命令处理器 — SECM
+/// Tauri 命令处理器 — SECM
 ///
 /// 原则：共性脚手架收拢到宏，差异化的自定义日志保留手动实现。
 /// 4 个宏覆盖 ~30 条命令，剩余 ~10 条复杂命令保留详细日志。
@@ -20,9 +21,10 @@ macro_rules! cmd_result {
             .map_err(|e| format!("{} panicked: {}", $label, e))?;
         let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
         let ok = result.is_ok();
-        buf.append(
+        buf.append_scoped(
             if ok { "Info" } else { "Error" },
             &format!("{}: ok={}, {}ms", $label, ok, elapsed),
+            crate::log::scope_for_command($label),
         );
         result
     }};
@@ -37,7 +39,11 @@ macro_rules! cmd_val {
             .await
             .map_err(|e| format!("{} panicked: {}", $label, e))?;
         let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-        buf.append("Info", &format!("{}: {}ms", $label, elapsed));
+        buf.append_scoped(
+            "Info",
+            &format!("{}: {}ms", $label, elapsed),
+            crate::log::scope_for_command($label),
+        );
         Ok(val)
     }};
 }
@@ -52,17 +58,12 @@ macro_rules! cmd_pure {
     }};
 }
 
-/// 无状态同步命令 — 目标函数已返回 Result<T, String>，仅 spawn_blocking
-macro_rules! cmd_pure_result {
-    ($func:expr) => {{
-        tokio::task::spawn_blocking(move || $func)
-            .await
-            .map_err(|e| format!("Command panicked: {}", e))?
-    }};
-}
-
 /// 同步命令 — spawn_blocking + 计时 + 自定义日志 + 包装为 Ok
 /// 日志闭包签名: |val: &T, elapsed_ms: i64| -> String
+///
+/// 本宏签名保持 3 个参数不变（契约 §B.3「宏签名不变」）。日志闭包的首行约定为
+/// `<命令标签>: <详情>`，故命令标签在运行时取自闭包输出（冒号前的前缀），
+/// 再经 `crate::log::scope_for_command` 解析来源页面 scope。
 macro_rules! cmd_log {
     ($state:expr, $func:expr, $log_fn:expr) => {{
         let start = Local::now();
@@ -71,7 +72,9 @@ macro_rules! cmd_log {
             .await
             .map_err(|e| format!("Command panicked: {}", e))?;
         let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-        buf.append("Info", &($log_fn)(&val, elapsed));
+        let msg = ($log_fn)(&val, elapsed);
+        let label = msg.split(':').next().unwrap_or("").trim();
+        buf.append_scoped("Info", &msg, crate::log::scope_for_command(label));
         Ok(val)
     }};
 }
@@ -80,11 +83,15 @@ macro_rules! cmd_log {
 // 日志命令
 // ============================================================================
 
-
-/// 前端日志上报（统一 debug.log：前端 console/logger 的 WARN/ERROR 经此落盘）
+/// 前端日志上报（双通道：debug.log 开发者诊断 + 用户可见日志缓冲）
 ///
 /// 参数：level（TRACE/DEBUG/INFO/WARN/ERROR）、module（组件名）、message（日志内容）。
-/// 校验：level 白名单 + message 长度上限（防滥用），失败静默（不影响前端）。
+/// 校验：level 白名单 + module 长度 + message 长度上限（防滥用），失败静默（不影响前端）。
+///
+/// 落点：
+/// 1. `crate::debug::append` → 运行目录 diag/debug.log（开发者通道，保持不变）；
+/// 2. `crate::log::append_frontend_entry` → 用户日志缓冲，按 module 解析来源页面 scope。
+///    前端页面动作（如网络诊断的 HEAD/端口探测）据此出现在日志卡片的「按页输出」中。
 #[tauri::command]
 pub fn append_frontend_log(
     state: State<'_, AppState>,
@@ -92,7 +99,6 @@ pub fn append_frontend_log(
     module: String,
     message: String,
 ) -> Result<(), String> {
-    let _ = state; // 仅校验+落盘，无需状态
     const MAX_LEN: usize = 4096;
     let level_ok = matches!(
         level.as_str(),
@@ -113,11 +119,12 @@ pub fn append_frontend_log(
         }
         msg.truncate(boundary);
     }
-    crate::debug::append(
-        &level,
-        if module_ok { module_trim } else { "frontend" },
-        &msg,
-    );
+    // 非法/缺失 module 统一回落 "frontend"（无法归属页面 → scope_for_module 解析为 system）
+    let effective_module = if module_ok { module_trim } else { "frontend" };
+    // 通道 1：开发者诊断（保持原有行为）
+    crate::debug::append(&level, effective_module, &msg);
+    // 通道 2：用户可见日志（带来源页面 scope）
+    crate::log::append_frontend_entry(&state.log_buffer, &level, effective_module, &msg);
     Ok(())
 }
 
@@ -127,9 +134,10 @@ pub async fn get_logs(state: State<'_, AppState>) -> Result<Vec<crate::log::LogE
     let buf = &state.log_buffer;
     let entries = buf.get_all();
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-    buf.append(
+    buf.append_scoped(
         "Info",
         &format!("get_logs: {} entries ({}ms)", entries.len(), elapsed),
+        crate::log::scope_for_command("get_logs"),
     );
     Ok(entries)
 }
@@ -140,7 +148,11 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
     let buf = &state.log_buffer;
     buf.clear();
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-    buf.append("Info", &format!("clear_logs ({}ms)", elapsed));
+    buf.append_scoped(
+        "Info",
+        &format!("clear_logs ({}ms)", elapsed),
+        crate::log::scope_for_command("clear_logs"),
+    );
     Ok(())
 }
 
@@ -150,9 +162,10 @@ pub async fn export_logs(state: State<'_, AppState>) -> Result<String, String> {
     let buf = &state.log_buffer;
     let content = buf.export_all_files()?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-    buf.append(
+    buf.append_scoped(
         "Info",
         &format!("export_logs: {} bytes ({}ms)", content.len(), elapsed),
+        crate::log::scope_for_command("export_logs"),
     );
     Ok(content)
 }
@@ -171,15 +184,21 @@ pub async fn get_log_capacity() -> Result<usize, String> {
     Ok(crate::log::CAPACITY)
 }
 
+/// 运行数据目录信息（前端展示真实路径，避免在界面文案中硬编码路径）。
+///
+/// 返回值与 `runtime_paths` 解析结果同源，是运行数据落点的唯一真源。
 #[tauri::command]
-pub async fn get_debug_logs() -> Result<Vec<crate::debug::DebugEntry>, String> {
-    Ok(crate::debug::get_all())
+pub async fn get_runtime_paths() -> Result<crate::runtime_paths::RuntimePathsInfo, String> {
+    Ok(crate::runtime_paths::info())
 }
 
 // ============================================================================
 // 传感器（特例 — 复杂诊断日志）
 // ============================================================================
 
+/// 传感器采集主命令（数据源：LHM sidecar 快照 + sysinfo 投影）。
+///
+/// 同时写入图表历史（每秒采样点，跨重启恢复），并把采样摘要与诊断写入用户日志。
 #[tauri::command]
 pub async fn get_sensor_data(
     state: State<'_, AppState>,
@@ -199,72 +218,47 @@ pub async fn get_sensor_data(
         gpu0.map_or(0.0, |g| g.usage),
         data.memory.usage_percent
     ));
-    buf.append("Info", &format!(
-        "[硬件传感器] CPU={:.1}% | freq={:.0}MHz | temp={:.1}°C | GPU={} | gpu_temp={:.1}°C | gpu_power={:.1}W | Mem={:.1}% | {}ms",
-        data.cpu.usage, data.cpu.clock_mhz, data.cpu.temperature,
+    buf.append_scoped("Info", &format!(
+        "[硬件传感器] CPU={:.1}% | freq={:.0}MHz({}) | temp={:.1}°C({}) | GPU={} | gpu_temp={:.1}°C | gpu_power={:.1}W | Mem={:.1}% | {}ms",
+        data.cpu.usage, data.cpu.clock_mhz, data.cpu.freq_source, data.cpu.temperature,
+        data.cpu.temp_source,
         gpu0.map_or("none".into(), |g| g.name.clone()),
         gpu0.map_or(0.0, |g| g.temperature), gpu0.map_or(0.0, |g| g.power_w),
         data.memory.usage_percent, elapsed,
-    ));
-    buf.append("Info", &format!("[硬件传感器诊断] {}", data.diag));
+    ), crate::log::scope_for_command("get_sensor_data"));
+    buf.append_scoped(
+        "Info",
+        &format!("[硬件传感器诊断] {}", data.diag),
+        crate::log::scope_for_command("get_sensor_data"),
+    );
     Ok(data)
 }
 
-/// 硬件传感器结构化接口(GPU/CPU 温度/频率/功耗,任务书 JSON 契约)
+// ============================================================================
+// tier-2 提权（sidecar 特权伴生进程；on-demand UAC）
+// ============================================================================
+
+/// 请求 sidecar tier-2 提权（POST /api/v1/elevate；阻塞 HTTP，置于 spawn_blocking）。
 ///
-/// 与 HTTP GET /api/hardware/sensors 同一采集链路,供前端 Tauri invoke 直连;
-/// 错误返回携带明确错误码(message 含修复建议)。
+/// 返回 `true` = 提权伴生进程已生效（CPU 温度/功耗与主板传感器可用）；
+/// `false` = 用户取消 UAC 或提权未生效（前端据此保持 tier-1 并给出说明）。
+/// 被拒绝的提权由 sidecar 记忆，不会每次轮询重复弹窗。
 #[tauri::command]
-pub async fn get_hardware_sensors(
-    state: State<'_, AppState>,
-) -> Result<crate::hardware::HardwareSensorsResponse, String> {
-    let start = Local::now();
-    let result = tokio::task::spawn_blocking(|| crate::hardware::collect_sensors())
+pub async fn request_elevation() -> Result<bool, String> {
+    tokio::task::spawn_blocking(crate::lhm::request_elevation)
         .await
-        .map_err(|e| format!("get_hardware_sensors panicked: {}", e))?;
-    let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-    let buf = &state.log_buffer;
-    match &result {
-        Ok(resp) => {
-            let gpu_summary = resp
-                .gpus
-                .iter()
-                .map(|g| {
-                    format!(
-                        "{} t={} f={} p={}",
-                        g.name,
-                        g.temperature
-                            .map(|v| format!("{:.0}", v))
-                            .unwrap_or_else(|| "null".into()),
-                        g.frequency
-                            .map(|v| format!("{:.0}", v))
-                            .unwrap_or_else(|| "null".into()),
-                        g.power
-                            .map(|v| format!("{:.1}", v))
-                            .unwrap_or_else(|| "null".into())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            buf.append(
-                "Info",
-                &format!(
-                    "[硬件传感器] GPU={} CPU={}核 | {}ms",
-                    resp.gpus.len(),
-                    resp.cpus.len(),
-                    elapsed
-                ),
-            );
-            buf.append("Info", &format!("[硬件传感器] GPU 明细: {}", gpu_summary));
-        }
-        Err(e) => {
-            buf.append(
-                "Error",
-                &format!("[硬件传感器] 采集失败: code={} message={}", e.code, e.message),
-            );
-        }
-    }
-    result.map_err(|e| format!("{} (code={})", e.message, e.code))
+        .map_err(|e| format!("request_elevation panicked: {}", e))?
+}
+
+/// 自动提权（零 UAC）：进入硬件信息页时后台调用，**不等待用户授权**。
+///
+/// 返回 `true` = tier-2 已由管理员直通或持久授权自动生效（用户零操作）；
+/// `false` = 自动路径不可行（非管理员且无持久授权），前端据此才发起一次 UAC 申请。
+#[tauri::command]
+pub async fn auto_elevate() -> Result<bool, String> {
+    tokio::task::spawn_blocking(crate::lhm::auto_elevate)
+        .await
+        .map_err(|e| format!("auto_elevate panicked: {}", e))?
 }
 
 // ============================================================================
@@ -444,6 +438,10 @@ pub async fn ping_stream(
         }
     };
 
+    // 入口注册取消标志：`cancel_command` 只置位已存在的键（cancel.rs:30-35），
+    // 未注册则全部 `is_cancelled` 检查点恒为 false，取消永不生效。
+    // 出口的 `clear_cancel` 与之严格配对，标志生命周期由本命令界定。
+    crate::cancel::cancel_flag(&cid);
     let result = crate::network::ping_streaming(
         &t,
         count,
@@ -469,7 +467,7 @@ pub async fn ping_stream(
 
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     match &result {
-        Ok(summary) => buf.append(
+        Ok(summary) => buf.append_scoped(
             "Info",
             &format!(
                 "ping {}: sent={} recv={} loss={:.1}% avg={:.1}ms ({}ms)",
@@ -480,8 +478,13 @@ pub async fn ping_stream(
                 summary.avg_rtt_ms,
                 elapsed
             ),
+            crate::log::scope_for_command("ping_stream"),
         ),
-        Err(e) => buf.append("Error", &format!("ping {}: {} ({}ms)", target, e, elapsed)),
+        Err(e) => buf.append_scoped(
+            "Error",
+            &format!("ping {}: {} ({}ms)", target, e, elapsed),
+            crate::log::scope_for_command("ping_stream"),
+        ),
     }
     result
 }
@@ -510,6 +513,10 @@ pub async fn traceroute_stream(
         }
     };
 
+    // 入口注册取消标志：`cancel_command` 只置位已存在的键（cancel.rs:30-35），
+    // 未注册则全部 `is_cancelled` 检查点恒为 false，取消永不生效。
+    // 出口的 `clear_cancel` 与之严格配对，标志生命周期由本命令界定。
+    crate::cancel::cancel_flag(&cid);
     let result = crate::network::traceroute_streaming(
         &target,
         max_hops,
@@ -531,7 +538,7 @@ pub async fn traceroute_stream(
 
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     match &result {
-        Ok(tr) => buf.append(
+        Ok(tr) => buf.append_scoped(
             "Info",
             &format!(
                 "traceroute {}: {} hops ({}ms)",
@@ -539,10 +546,12 @@ pub async fn traceroute_stream(
                 tr.hops.len(),
                 elapsed
             ),
+            crate::log::scope_for_command("traceroute_stream"),
         ),
-        Err(e) => buf.append(
+        Err(e) => buf.append_scoped(
             "Error",
             &format!("traceroute {}: {} ({}ms)", target, e, elapsed),
+            crate::log::scope_for_command("traceroute_stream"),
         ),
     }
     result
@@ -569,6 +578,10 @@ pub async fn nslookup_stream(
         }
     };
 
+    // 入口注册取消标志：`cancel_command` 只置位已存在的键（cancel.rs:30-35），
+    // 未注册则全部 `is_cancelled` 检查点恒为 false，取消永不生效。
+    // 出口的 `clear_cancel` 与之严格配对，标志生命周期由本命令界定。
+    crate::cancel::cancel_flag(&cid_ref);
     let result = tokio::task::spawn_blocking(move || {
         crate::network::nslookup_streaming(&d, &rt, &cid_val, emitter)
     })
@@ -591,7 +604,7 @@ pub async fn nslookup_stream(
 
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     match &result {
-        Ok(dr) => buf.append(
+        Ok(dr) => buf.append_scoped(
             "Info",
             &format!(
                 "nslookup {} ({}): {} records ({}ms)",
@@ -600,10 +613,12 @@ pub async fn nslookup_stream(
                 dr.records.len(),
                 elapsed
             ),
+            crate::log::scope_for_command("nslookup_stream"),
         ),
-        Err(e) => buf.append(
+        Err(e) => buf.append_scoped(
             "Error",
             &format!("nslookup {}: {} ({}ms)", domain, e, elapsed),
+            crate::log::scope_for_command("nslookup_stream"),
         ),
     }
     result
@@ -628,6 +643,10 @@ pub async fn detect_nat_type_stream(
         }
     };
 
+    // 入口注册取消标志：`cancel_command` 只置位已存在的键（cancel.rs:30-35），
+    // 未注册则全部 `is_cancelled` 检查点恒为 false，取消永不生效。
+    // 出口的 `clear_cancel` 与之严格配对，标志生命周期由本命令界定。
+    crate::cancel::cancel_flag(&cid_ref);
     let result = tokio::task::spawn_blocking(move || {
         crate::network::detect_nat_streaming(&s, &cid_val, emitter)
     })
@@ -650,94 +669,286 @@ pub async fn detect_nat_type_stream(
 
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     match &result {
-        Ok(nat) => buf.append(
+        Ok(nat) => buf.append_scoped(
             "Info",
             &format!(
                 "detect_nat_type: {} → {} ({}ms)",
                 server, nat.nat_label, elapsed
             ),
+            crate::log::scope_for_command("detect_nat_type_stream"),
         ),
-        Err(e) => buf.append(
+        Err(e) => buf.append_scoped(
             "Error",
             &format!("detect_nat_type: {} — {} ({}ms)", server, e, elapsed),
+            crate::log::scope_for_command("detect_nat_type_stream"),
         ),
     }
     result
 }
 
+/// iperf3 客户端带宽测试（流式）。
+///
+/// 参数由 `crate::iperf::Iperf3ClientOptions` 承载——覆盖 iperf3 官方手册中
+/// **在 Windows 上有意义**的全部客户端选项（协议/方向/结束条件/并行流/omit/
+/// 限速/缓冲/MSS/Nagle/网络栈/间隔/单位/TOS·DSCP/零拷贝/标题/服务端输出/
+/// 连接超时/亲和性/绑定/源端口/重复载荷/DF/64 位计数/收发超时/文件）。
+///
+/// 返回值是**结构化结果**（`Iperf3Result`），不再是原始 stderr 文本：
+/// 旧实现成功时返回 stderr（通常为空串），UI 只能显示"完成"，无法给出吞吐数字。
+///
+/// 参数经 `build_client_args` 白名单校验后才落到命令行；全程 `Command::args`
+/// 数组传参，不经 shell。
 #[tauri::command]
 pub async fn iperf3_stream(
     channel: tauri::ipc::Channel<crate::network::StreamEvent>,
     state: State<'_, AppState>,
-    host: String,
-    port: u16,
-    duration: u32,
+    app: tauri::AppHandle,
+    options: crate::iperf::Iperf3ClientOptions,
     cmd_id: String,
-) -> Result<String, String> {
+) -> Result<crate::iperf::Iperf3Result, String> {
     let start = Local::now();
     let buf = state.log_buffer.clone();
-    let h = host.clone();
-    let p = port;
-    let d = duration;
     let cid = cmd_id.clone();
-    let cid2 = cid.clone();
+    let cid_inner = cmd_id.clone();
+    crate::cancel::cancel_flag(&cid);
+    let desc = format!(
+        "{}:{} {} {} 并行{} 条件={}",
+        options.host,
+        options.port,
+        match options.protocol {
+            crate::iperf::Protocol::Tcp => "TCP",
+            crate::iperf::Protocol::Udp => "UDP",
+        },
+        if options.bidir {
+            "双向"
+        } else if options.reverse {
+            "反向"
+        } else {
+            "正向"
+        },
+        options.parallel,
+        crate::iperf::end_condition_label(&options),
+    );
 
     let result = tokio::task::spawn_blocking(move || {
-        use std::io::BufRead;
-        use std::os::windows::process::CommandExt;
-        use std::process::Stdio;
-        let mut child = std::process::Command::new("iperf3")
-            .args([
-                "-c",
-                &h,
-                "-p",
-                &p.to_string(),
-                "-t",
-                &d.to_string(),
-                "-f",
-                "m",
-            ])
-            // CREATE_NO_WINDOW：iperf3 持续运行，防止黑窗常驻
-            .creation_flags(0x08000000)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("iperf3 未安装或无法启动: {}", e))?;
-
-        let stdout = child.stdout.take().unwrap();
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                if crate::cancel::is_cancelled(&cid2) {
-                    let _ = child.kill();
-                    break;
-                }
-                let _ = channel.send(crate::network::StreamEvent {
-                    kind: "info".into(),
-                    data: l,
-                });
-            }
-        }
-        let output = child.wait_with_output().map_err(|e| format!("{}", e))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        }
+        let Some(exe) = crate::iperf::iperf3_exe(Some(&app)) else {
+            return Err(
+                "未找到 iperf3（已尝试随包内置 resources/iperf3 与系统 PATH）。\
+                 请确认安装包完整，或将 iperf3.exe 放入 resources/iperf3/ 目录。"
+                    .to_string(),
+            );
+        };
+        let version = crate::iperf::iperf3_version(Some(&app));
+        let probe = crate::iperf::Iperf3VersionProbe {
+            version,
+            raw: crate::iperf::tool_info(Some(&app)).version_raw,
+        };
+        crate::iperf::run_client_streaming(&options, &exe, &probe, &cid_inner, move |ev| {
+            let _ = channel.send(ev);
+        })
     })
     .await
-    .map_err(|e| format!("iperf3 panicked: {}", e))??;
+    .map_err(|e| format!("iperf3 panicked: {}", e))?;
 
     crate::cancel::clear_cancel(&cid);
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
-    buf.append(
-        "Info",
-        &format!(
-            "iperf3 {}:{} duration={}s ({}ms)",
-            host, port, duration, elapsed
+    let scope = crate::log::scope_for_command("iperf3_stream");
+
+    match &result {
+        Ok(r) => {
+            // 单行结果摘要（右侧栏「按页输出」）：吞吐/丢包/抖动按方向呈现
+            let fmt_dir = |label: &str, d: &crate::iperf::Iperf3DirectionSummary| {
+                if d.is_empty() {
+                    String::new()
+                } else {
+                    let mbps = d.mbps.map(|v| format!("{:.1}Mbps", v)).unwrap_or_default();
+                    let extra = if let Some(lp) = d.lost_percent {
+                        format!(" 丢包{:.2}%", lp)
+                    } else if let Some(j) = d.jitter_ms {
+                        format!(" 抖动{:.2}ms", j)
+                    } else {
+                        String::new()
+                    };
+                    format!(" | {}{}{}", label, mbps, extra)
+                }
+            };
+            let summary = format!(
+                "{}{}{}{}",
+                fmt_dir(
+                    if r.direction == "反向" {
+                        "收"
+                    } else {
+                        "发"
+                    },
+                    &r.sent
+                ),
+                fmt_dir("收", &r.received),
+                r.bidir_reverse_sent
+                    .as_ref()
+                    .map(|d| fmt_dir("反向发", d))
+                    .unwrap_or_default(),
+                r.bidir_reverse_received
+                    .as_ref()
+                    .map(|d| fmt_dir("反向收", d))
+                    .unwrap_or_default(),
+            );
+            let cancelled_note = if r.cancelled {
+                "（用户取消）"
+            } else {
+                ""
+            };
+            buf.append_scoped(
+                "Info",
+                &format!(
+                    "iperf3_stream: {} {} 区间{} 条{}{} ({}ms)",
+                    desc,
+                    r.protocol,
+                    r.intervals.len(),
+                    summary,
+                    cancelled_note,
+                    elapsed
+                ),
+                scope,
+            );
+        }
+        Err(e) => {
+            buf.append_scoped(
+                "Error",
+                &format!("iperf3_stream: {} — {} ({}ms)", desc, e, elapsed),
+                scope,
+            );
+        }
+    }
+
+    result
+}
+
+/// 查询随包/系统 iperf3 的可用性与版本能力（UI 用于门控与缺失提示）。
+///
+/// 有意**不记日志**（走 `cmd_pure!`）：页面会周期性刷新该信息，
+/// 每次都记一行会灌满 200 条环形缓冲，挤掉用户真正关心的操作日志。
+#[tauri::command]
+pub async fn iperf3_tool_info(
+    app: tauri::AppHandle,
+) -> Result<crate::iperf::Iperf3ToolInfo, String> {
+    cmd_pure!(crate::iperf::tool_info(Some(&app)))
+}
+
+/// 启动本机 iperf3 服务端（长驻进程，供对端测试）。
+#[tauri::command]
+pub async fn iperf3_server_start(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    port: u16,
+    one_off: Option<bool>,
+) -> Result<crate::iperf::Iperf3ServerStatus, String> {
+    let start = Local::now();
+    let buf = state.log_buffer.clone();
+    let scope = crate::log::scope_for_command("iperf3_server_start");
+    let once = one_off.unwrap_or(false);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let Some(exe) = crate::iperf::iperf3_exe(Some(&app)) else {
+            return Err("未找到 iperf3（已尝试随包内置 resources/iperf3 与系统 PATH）".to_string());
+        };
+        crate::iperf::server_start(&exe, port, once)
+    })
+    .await
+    .map_err(|e| format!("iperf3 server start panicked: {}", e))?;
+
+    let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
+    match &result {
+        Ok(s) => buf.append_scoped(
+            "Info",
+            &format!(
+                "iperf3_server_start: 端口={} pid={:?} one_off={} ({}ms)",
+                s.port.unwrap_or(port),
+                s.pid,
+                once,
+                elapsed
+            ),
+            scope,
         ),
+        Err(e) => buf.append_scoped(
+            "Error",
+            &format!("iperf3_server_start: 端口={} — {} ({}ms)", port, e, elapsed),
+            scope,
+        ),
+    }
+    result
+}
+
+/// 停止本机 iperf3 服务端（幂等）。
+#[tauri::command]
+pub async fn iperf3_server_stop(
+    state: State<'_, AppState>,
+) -> Result<crate::iperf::Iperf3ServerStatus, String> {
+    let start = Local::now();
+    let buf = state.log_buffer.clone();
+    let scope = crate::log::scope_for_command("iperf3_server_stop");
+
+    let result = tokio::task::spawn_blocking(crate::iperf::server_stop)
+        .await
+        .map_err(|e| format!("iperf3 server stop panicked: {}", e))?;
+
+    let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
+    buf.append_scoped(
+        "Info",
+        &format!("iperf3_server_stop: 已停止 ({}ms)", elapsed),
+        scope,
     );
     Ok(result)
+}
+
+/// 查询本机 iperf3 服务端状态（含最近输出行；UI 展开时轮询）。
+///
+/// 有意不记日志：轮询会以 1Hz 频率调用，记日志会灌满环形缓冲。
+#[tauri::command]
+pub async fn iperf3_server_status(
+    one_off: Option<bool>,
+) -> Result<crate::iperf::Iperf3ServerStatus, String> {
+    let once = one_off.unwrap_or(false);
+    cmd_pure!(crate::iperf::server_status(once))
+}
+
+/// 增删 Windows 防火墙入站规则（让对端能连上本机 iperf3 服务端）。
+///
+/// 需要管理员权限；规则名带固定前缀 `SECM iperf3 <port> <PROTO>`，便于成对移除。
+#[tauri::command]
+pub async fn iperf3_firewall_rule(
+    state: State<'_, AppState>,
+    action: String,
+    port: u16,
+    protocol: String,
+) -> Result<String, String> {
+    let start = Local::now();
+    let buf = state.log_buffer.clone();
+    let scope = crate::log::scope_for_command("iperf3_firewall_rule");
+    let act = action.clone();
+    let proto = protocol.clone();
+
+    let result =
+        tokio::task::spawn_blocking(move || crate::iperf::apply_firewall_rule(&act, port, &proto))
+            .await
+            .map_err(|e| format!("iperf3 firewall panicked: {}", e))?;
+
+    let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
+    match &result {
+        Ok(msg) => buf.append_scoped(
+            "Info",
+            &format!("iperf3_firewall_rule: {} ({}ms)", msg, elapsed),
+            scope,
+        ),
+        Err(e) => buf.append_scoped(
+            "Error",
+            &format!(
+                "iperf3_firewall_rule: action={} port={} — {} ({}ms)",
+                action, port, e, elapsed
+            ),
+            scope,
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -887,7 +1098,7 @@ pub async fn set_nvidia_power_mode(
         .map_err(|e| format!("set_nvidia_power_mode panicked: {}", e))?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     match (&result, before) {
-        (Ok(()), Some(b)) => buf.append(
+        (Ok(()), Some(b)) => buf.append_scoped(
             "Info",
             &format!(
                 "set_nvidia_power_mode: {} → {}, {}ms",
@@ -895,16 +1106,18 @@ pub async fn set_nvidia_power_mode(
                 mode.label_cn(),
                 elapsed
             ),
+            crate::log::scope_for_command("set_nvidia_power_mode"),
         ),
-        (Ok(()), None) => buf.append(
+        (Ok(()), None) => buf.append_scoped(
             "Info",
             &format!(
                 "set_nvidia_power_mode: ? → {}, {}ms",
                 mode.label_cn(),
                 elapsed
             ),
+            crate::log::scope_for_command("set_nvidia_power_mode"),
         ),
-        (Err(e), _) => buf.append(
+        (Err(e), _) => buf.append_scoped(
             "Error",
             &format!(
                 "set_nvidia_power_mode: 设置 {} 失败: {}, {}ms",
@@ -912,6 +1125,7 @@ pub async fn set_nvidia_power_mode(
                 e,
                 elapsed
             ),
+            crate::log::scope_for_command("set_nvidia_power_mode"),
         ),
     }
     result
@@ -959,7 +1173,11 @@ pub async fn set_power_plan(state: State<'_, AppState>, guid: String) -> Result<
 #[tauri::command]
 pub async fn delete_power_plan(state: State<'_, AppState>, guid: String) -> Result<(), String> {
     let g = guid.clone();
-    cmd_result!(state, "delete_power_plan", crate::settings::delete_power_plan(&g))
+    cmd_result!(
+        state,
+        "delete_power_plan",
+        crate::settings::delete_power_plan(&g)
+    )
 }
 
 /// 读取活动电源方案下异类线程/短运行线程调度策略（注册表）
@@ -996,13 +1214,6 @@ pub async fn enable_ultimate_performance(state: State<'_, AppState>) -> Result<S
         "enable_ultimate_perf",
         crate::settings::enable_ultimate_performance()
     )
-}
-
-#[tauri::command]
-pub async fn get_services(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::settings::ServiceInfo>, String> {
-    cmd_val!(state, "get_services", crate::settings::get_services())
 }
 
 #[tauri::command]
@@ -1058,58 +1269,6 @@ pub async fn check_vc_runtimes() -> Result<crate::environment::VcRuntimeInfo, St
 }
 
 #[tauri::command]
-pub async fn check_ai_tools() -> Result<crate::environment::AiToolsInfo, String> {
-    cmd_pure!(crate::environment::check_ai_tools())
-}
-
-#[tauri::command]
-pub async fn install_ai_tool(npm_package: String) -> Result<String, String> {
-    cmd_pure_result!(crate::environment::install_or_upgrade_tool(&npm_package))
-}
-
-#[tauri::command]
-pub async fn fetch_ai_latest_versions() -> Result<Vec<(String, String)>, String> {
-    cmd_pure!(crate::environment::fetch_ai_latest_versions())
-}
-
-/// npm 运行环境检测（node/npm 版本 + 全局目录 + 包统计）
-#[tauri::command]
-pub async fn check_npm_environment() -> Result<crate::environment::NpmEnvironment, String> {
-    cmd_pure!(crate::environment::check_npm_environment())
-}
-
-/// 卸载 AI 工具（npm uninstall -g，白名单校验）
-#[tauri::command]
-pub async fn uninstall_ai_tool(npm_package: String) -> Result<String, String> {
-    cmd_pure_result!(crate::environment::uninstall_ai_tool(&npm_package))
-}
-
-/// 列出 MCP 服务器安装状态
-#[tauri::command]
-pub async fn list_mcp_servers() -> Result<Vec<crate::environment::McpServerInfo>, String> {
-    cmd_pure!(crate::environment::list_mcp_servers())
-}
-
-/// 安装 MCP 服务器（npm install -g，白名单校验）
-#[tauri::command]
-pub async fn install_mcp_server(package: String) -> Result<String, String> {
-    cmd_pure_result!(crate::environment::install_mcp_server(&package))
-}
-
-/// 卸载 MCP 服务器（npm uninstall -g，白名单校验）
-#[tauri::command]
-pub async fn uninstall_mcp_server(package: String) -> Result<String, String> {
-    cmd_pure_result!(crate::environment::uninstall_mcp_server(&package))
-}
-
-/// 列出各 AI 工具的 skills / 插件
-#[tauri::command]
-pub async fn list_extensions() -> Result<Vec<crate::environment::AiExtension>, String> {
-    cmd_pure!(crate::environment::list_extensions())
-}
-
-
-#[tauri::command]
 pub async fn get_game_presets() -> Result<Vec<crate::game_env::GamePreset>, String> {
     cmd_pure!(crate::game_env::get_game_presets())
 }
@@ -1145,6 +1304,59 @@ pub async fn get_net_stats(
 #[tauri::command]
 pub async fn get_chart_history(limit: usize) -> Result<Vec<String>, String> {
     cmd_pure!(crate::temp_data::chart_load(limit))
+}
+
+/// HTTP 延迟探测（**服务端**执行，绕开 WebView CSP）。
+///
+/// 网络诊断页的「HTTP 延迟测试」与「端口检测」原本用浏览器 `fetch` 直连，
+/// v1.19.0 收紧 CSP `connect-src` 后发行版全部被判为"不可达"（详见
+/// `crate::network::probe_url` 注释）。改由 Rust 侧探测，CSP 无需放开通配、
+/// 且支持用户自定义的任意站点。
+///
+/// ## 唯一耗时口径：HTTP 延迟
+///
+/// 返回的 `ms` 是**应用层 HTTP 延迟**（DNS + TCP + TLS 握手 + 请求/响应），
+/// 由 `crate::network::probe_url` 测量。历史上这里曾并列两个口径：裸 HTTP
+/// 耗时与「隐藏 WebView2 真实加载页面的耗时」`page_ms`；本版本起统一为
+/// HTTP 延迟，原因见下。
+///
+/// 为什么砍掉浏览器页面测速：首页「HTTP 延迟测试」的自动检测会按
+/// `autoTestInterval`（默认 5s）对全部站点轮询，而浏览器测速要为**每个站点**
+/// 开一次隐藏 WebView2 引擎并下载全套子资源——开销与轮询频率完全不匹配，
+/// 读数也随子资源/脚本执行波动，不适合做"延迟"这类可反复对比的指标。
+///
+/// 因此本命令**不再接受 `measure_page` 开关，也不再返回 `page_ms`**：
+/// 只给一个明确口径，避免 UI 在两种口径之间回退显示。
+///
+/// 注意本口径**不是 ICMP ping**：ICMP 是网络层往返，HTTP 延迟额外包含
+/// TCP/TLS 与应用层往返，两者数值不可互换（见 `probe_url_live.rs` 守卫）。
+///
+/// **有意不在后端记日志**（走 `cmd_pure!`/手工实现而非 `cmd_log!`）：
+/// 自动检测会按 `autoTestInterval`（默认 5s）对全部站点轮询，每次都记一行
+/// 会迅速灌满 200 条环形缓冲，把用户真正关心的操作日志挤掉，使右侧栏
+/// 「按页输出」失效。可达性结果由**前端**在用户显式触发时上报
+/// （见 Network.tsx `testSite` 的 `report` 参数），自动轮询静默。
+#[tauri::command]
+pub async fn probe_url(
+    url: String,
+    timeout_ms: Option<u64>,
+) -> Result<crate::network::UrlProbeResult, String> {
+    // 超时上限收敛到 30s，避免前端传入异常大值导致一次探测长时间占住线程
+    let timeout = timeout_ms.unwrap_or(8000).min(30_000);
+
+    // ureq 是阻塞客户端 → 放 spawn_blocking，不占住 tokio worker 线程
+    let probe = tokio::task::spawn_blocking(move || crate::network::probe_url(&url, timeout)).await;
+
+    match probe {
+        Ok(r) => Ok(r),
+        // spawn_blocking 内部 panic：当作"探测失败"如实上报，不伪装成不可达
+        Err(e) => Ok(crate::network::UrlProbeResult {
+            reachable: false,
+            ms: 0,
+            status: None,
+            error: Some(format!("探测任务异常终止: {}", e)),
+        }),
+    }
 }
 
 /// 获取各网卡链路协商速度（准静态数据，前端挂载/网卡集合变化时一次性查询）
@@ -1207,9 +1419,10 @@ pub async fn check_dhcp_servers(
         ),
         Err(e) => format!("error={}", e),
     };
-    buf.append(
+    buf.append_scoped(
         if ok { "Info" } else { "Error" },
         &format!("check_dhcp_servers: {} {}ms", summary, elapsed),
+        crate::log::scope_for_command("check_dhcp_servers"),
     );
     result
 }
@@ -1230,9 +1443,10 @@ pub async fn get_network_config(
         .map_err(|e| crate::ds_util::log_err("netif", "获取网络配置", &e))?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let count = result.len();
-    buf.append(
+    buf.append_scoped(
         "Info",
         &format!("get_network_config: adapters={} {}ms", count, elapsed),
+        crate::log::scope_for_command("get_network_config"),
     );
     Ok(result)
 }
@@ -1255,15 +1469,13 @@ pub async fn apply_network_config(
     let start = Local::now();
     let buf = state.log_buffer.clone();
     let ifname_log = req.ifname.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::net_config::apply_network_config(&req)
-    })
-    .await
-    .map_err(|e| format!("apply_network_config panicked: {}", e))?;
+    let result = tokio::task::spawn_blocking(move || crate::net_config::apply_network_config(&req))
+        .await
+        .map_err(|e| format!("apply_network_config panicked: {}", e))?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let ok_count = result.steps.iter().filter(|s| s.ok).count();
     let fail_count = result.steps.len() - ok_count;
-    buf.append(
+    buf.append_scoped(
         if fail_count == 0 { "Info" } else { "Error" },
         &format!(
             "apply_network_config: ifname={} ok={}/{} fail={} {}ms",
@@ -1273,6 +1485,7 @@ pub async fn apply_network_config(
             fail_count,
             elapsed
         ),
+        crate::log::scope_for_command("apply_network_config"),
     );
     Ok(result)
 }
@@ -1302,7 +1515,7 @@ pub async fn set_dns(
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let ok_count = result.steps.iter().filter(|s| s.ok).count();
     let fail_count = result.steps.len() - ok_count;
-    buf.append(
+    buf.append_scoped(
         if fail_count == 0 { "Info" } else { "Error" },
         &format!(
             "set_dns: ifname={} ok={}/{} fail={} {}ms",
@@ -1312,6 +1525,7 @@ pub async fn set_dns(
             fail_count,
             elapsed
         ),
+        crate::log::scope_for_command("set_dns"),
     );
     Ok(result)
 }
@@ -1333,14 +1547,13 @@ pub async fn get_doh_config(
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let ok = result.is_ok();
     let count = result.as_ref().map(|v| v.len()).unwrap_or(0);
-    buf.append(
+    buf.append_scoped(
         if ok { "Info" } else { "Error" },
         &format!(
             "get_doh_config: ifname={} entries={} {}ms",
-            ifname_log,
-            count,
-            elapsed
+            ifname_log, count, elapsed
         ),
+        crate::log::scope_for_command("get_doh_config"),
     );
     result
 }
@@ -1365,15 +1578,14 @@ pub async fn set_doh_config(
     let buf = state.log_buffer.clone();
     let ifname_log = ifname.clone();
     let entries_log = entries.len();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::net_config::set_doh_config(&ifname, &entries)
-    })
-    .await
-    .map_err(|e| format!("set_doh_config panicked: {}", e))?;
+    let result =
+        tokio::task::spawn_blocking(move || crate::net_config::set_doh_config(&ifname, &entries))
+            .await
+            .map_err(|e| format!("set_doh_config panicked: {}", e))?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let ok_count = result.steps.iter().filter(|s| s.ok).count();
     let fail_count = result.steps.len() - ok_count;
-    buf.append(
+    buf.append_scoped(
         if fail_count == 0 { "Info" } else { "Error" },
         &format!(
             "set_doh_config: ifname={} entries={} ok={}/{} fail={} {}ms",
@@ -1384,6 +1596,7 @@ pub async fn set_doh_config(
             fail_count,
             elapsed
         ),
+        crate::log::scope_for_command("set_doh_config"),
     );
     Ok(result)
 }
@@ -1414,14 +1627,13 @@ pub async fn set_network_mac(
     .map_err(|e| format!("set_network_mac panicked: {}", e))?;
     let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
     let ok = result.is_ok();
-    buf.append(
+    buf.append_scoped(
         if ok { "Info" } else { "Error" },
         &format!(
             "set_network_mac: ifname={} ok={} {}ms",
-            ifname_log,
-            ok,
-            elapsed
+            ifname_log, ok, elapsed
         ),
+        crate::log::scope_for_command("set_network_mac"),
     );
     result
 }
@@ -1449,9 +1661,77 @@ pub async fn deep_check_dhcp_servers(
         ),
         Err(e) => format!("error={}", e),
     };
-    buf.append(
+    buf.append_scoped(
         if ok { "Info" } else { "Error" },
         &format!("deep_check_dhcp_servers: {} {}ms", summary, elapsed),
+        crate::log::scope_for_command("deep_check_dhcp_servers"),
+    );
+    result
+}
+
+/// 扫描已移除网卡遗留的 DHCP 注册表记录（只读，无需管理员权限）
+///
+/// 背景：网卡被拔出/卸载后，`Tcpip\Parameters\Interfaces\{guid}` 仍保留
+/// `DhcpServer` / `DhcpIPAddress` / 租约时间等 DHCP 分配记录，导致
+/// `check_dhcp_servers` 的基线合并把**已不存在的** DHCP 服务器报出来
+/// （本机实测 192.168.11.1 来自一台已移除的 USB/RNDIS 网卡）。
+/// 本命令只报告，不修改任何注册表内容。
+#[tauri::command]
+pub async fn scan_dhcp_residue(
+    state: State<'_, AppState>,
+) -> Result<crate::dhcp_residue::DhcpResidueScanResult, String> {
+    cmd_log!(
+        state,
+        crate::dhcp_residue::scan_dhcp_residue(),
+        |r: &crate::dhcp_residue::DhcpResidueScanResult, ms| format!(
+            "scan_dhcp_residue: adapters={} values={} checked={} absent={}, {}ms",
+            r.adapters.len(),
+            r.value_count,
+            r.checked_adapters,
+            r.absent_adapters,
+            ms
+        )
+    )
+}
+
+/// 清理已移除网卡遗留的 DHCP 注册表记录（需管理员权限）
+///
+/// 安全约束：
+/// - 服务端**重新扫描**决定删除对象，不接受前端传入的键路径/值名；
+/// - 只删除 DHCP 分配/租约值（`DhcpServer` 等），不删 `IPAddress` /
+///   `SubnetMask` / `DefaultGateway` 等静态配置，也不删除接口子键；
+/// - 删除前必须成功写出备份（失败即中止，绝不无备份删除）。
+#[tauri::command]
+pub async fn clean_dhcp_residue(
+    state: State<'_, AppState>,
+) -> Result<crate::dhcp_residue::DhcpResidueCleanResult, String> {
+    if !crate::cleanup::is_admin() {
+        return Err(
+            "clean_dhcp_residue: 需要管理员权限才能清理 DHCP 注册表残留（建议：以管理员身份重新运行本程序）"
+                .to_string(),
+        );
+    }
+    let start = Local::now();
+    let buf = state.log_buffer.clone();
+    let result = tokio::task::spawn_blocking(crate::dhcp_residue::clean_dhcp_residue)
+        .await
+        .map_err(|e| format!("clean_dhcp_residue panicked: {}", e))?;
+    let elapsed = Local::now().signed_duration_since(start).num_milliseconds();
+    let ok = result.is_ok();
+    let summary = match &result {
+        Ok(r) => format!(
+            "removed={} adapters={} failed={} backup={:?}",
+            r.removed_values,
+            r.cleaned.len(),
+            r.failed.len(),
+            r.backup_path
+        ),
+        Err(e) => format!("error={}", e),
+    };
+    buf.append_scoped(
+        if ok { "Info" } else { "Error" },
+        &format!("clean_dhcp_residue: {} {}ms", summary, elapsed),
+        crate::log::scope_for_command("clean_dhcp_residue"),
     );
     result
 }
@@ -1476,7 +1756,9 @@ pub async fn get_system_info(
 
 /// 查询温度采集通道状态（幂等：内部 30s 缓存；不阻塞 UI）。
 #[tauri::command]
-pub async fn driver_status(app: tauri::AppHandle) -> Result<crate::driver_install::DriverStatus, String> {
+pub async fn driver_status(
+    app: tauri::AppHandle,
+) -> Result<crate::driver_install::DriverStatus, String> {
     tokio::task::spawn_blocking(move || crate::driver_install::ensure_temp_channel(&app))
         .await
         .map_err(|e| format!("driver_status panicked: {}", e))
@@ -1484,7 +1766,9 @@ pub async fn driver_status(app: tauri::AppHandle) -> Result<crate::driver_instal
 
 /// 手动触发驱动安装/修复（后台执行，幂等；返回最新通道状态）。
 #[tauri::command]
-pub async fn driver_install(app: tauri::AppHandle) -> Result<crate::driver_install::DriverStatus, String> {
+pub async fn driver_install(
+    app: tauri::AppHandle,
+) -> Result<crate::driver_install::DriverStatus, String> {
     tokio::task::spawn_blocking(move || {
         // 手动触发：清缓存后重新执行完整安装链
         crate::driver_install::invalidate_cache();
@@ -1494,17 +1778,8 @@ pub async fn driver_install(app: tauri::AppHandle) -> Result<crate::driver_insta
     .map_err(|e| format!("driver_install panicked: {}", e))
 }
 
-/// 卸载本模块自建的 WinRing0 驱动服务（幂等；需管理员权限）。
-#[tauri::command]
-pub async fn driver_uninstall() -> Result<(), String> {
-    tokio::task::spawn_blocking(crate::driver_install::driver_uninstall)
-        .await
-        .map_err(|e| format!("driver_uninstall panicked: {}", e))?
-}
-
 // ============================================================================
 // 磁盘枚举 / S.M.A.R.T 命令（GET /api/disks ↔ list_disks；GET /api/disks/:id/smart ↔ get_disk_smart）
-// 设计文档：docs/designs/2026-08-07-disk-smart.md
 // S8：磁盘 IOCTL 为同步阻塞采集，MUST spawn_blocking 不阻塞 UI
 // ============================================================================
 
@@ -1575,9 +1850,5 @@ pub async fn set_hpt_state(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<crate::settings::SettingState, String> {
-    cmd_result!(
-        state,
-        "set_hpt_state",
-        crate::hpt::set_hpt_state(enabled)
-    )
+    cmd_result!(state, "set_hpt_state", crate::hpt::set_hpt_state(enabled))
 }

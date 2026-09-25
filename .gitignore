@@ -2,6 +2,16 @@
 node_modules/
 dist/
 
+# 构建产物与运行数据（源码在项目根，构建产物与临时产物不入库）
+build/
+tmp/
+
+# GPUI 重构工作区（独立 git 仓库，见 SysEnv-Console-Manager/）
+SysEnv-Console-Manager/
+# 临时 spike 验证目录（不入库）
+gpui-spike/
+tray-spike/
+
 # Rust / Tauri 构建产物
 src-tauri/target/
 datasource/target/
@@ -14,9 +24,14 @@ src-tauri/resources/driver/
 # LHM sidecar stage 产物（由 scripts/stage-lhm.mjs 复制，.NET publish 运行时与随包源码/许可）
 src-tauri/resources/lhm/
 
+# iperf3 stage 产物（由 scripts/stage-iperf3.mjs 从 third_party/iperf3 复制；源码/许可见 third_party/）
+src-tauri/resources/iperf3/
+
 # .NET 构建产物
-sidecar-lhm/bin/
-sidecar-lhm/obj/
+# 用 `**` 覆盖子项目（如 tests/LhmSidecar.Tests/）下的嵌套 bin/obj：
+# 只写顶层路径时 `git status` 会残留上百条未跟踪的 DLL（ADR-0001 D8）。
+sidecar-lhm/**/bin/
+sidecar-lhm/**/obj/
 
 # 发行包归档（二进制不入库，仅保留文档）
 dist_releases/
@@ -33,6 +48,9 @@ __pycache__/
 # 临时验证
 .verify_tmp/
 
+# 运行数据（历史布局：APPDATA 缺失时曾落到源码树内）
+src-tauri/SECM/
+
 # 系统文件
 Thumbs.db
 Desktop.ini
@@ -40,3 +58,11 @@ Desktop.ini
 
 # pi agent 运行时记忆（不入库）
 .pi/
+
+# 未展开环境变量导致的误建目录（工具把 "%SystemDrive%\..." 当字面路径在本目录下创建；
+# 内容为 Windows 注册表/图标缓存，属运行残留，不得入库）
+%SystemDrive%/
+
+# Rust 编译中间产物（源码树内不应出现；交叉编译尝试曾在此留下 NUL.* 文件）
+*.pdb
+*.rcgu.o

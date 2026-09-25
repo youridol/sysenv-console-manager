@@ -53,6 +53,11 @@ pub struct PingSummary {
 }
 
 /// Streaming ping: emits net-stream events and checks cancel flag each iteration.
+///
+/// `ttl` 会写入 ICMP socket 的 TTL 选项（surge_ping `Config::ttl` → `set_ttl_v4` /
+/// `set_unicast_hops_v6`）。此前该参数名为 `_ttl`，即**静默丢弃**用户设置：
+/// 前端「TTL」输入框（1–255，默认 64）展示的值从未生效（ADR-0001 D11）。
+/// 取值收敛到 1..=255：0 或越界值会让部分平台直接建 socket 失败。
 pub async fn ping_streaming(
     target: &str,
     count: u32,
@@ -62,7 +67,7 @@ pub async fn ping_streaming(
     ip_version: &str,
     _proto: &str,
     size: u32,
-    _ttl: u32,
+    ttl: u32,
     deadline_secs: u32,
     emitter: impl Fn(StreamEvent),
 ) -> Result<PingSummary, String> {
@@ -86,7 +91,9 @@ pub async fn ping_streaming(
     let mut results = Vec::new();
 
     let icmp_kind = if addr.is_ipv6() { ICMP::V6 } else { ICMP::V4 };
-    let cfg = Config::builder().kind(icmp_kind).build();
+    // TTL 收敛到 1..=255（0 在部分平台会让 socket 创建失败，且用户输入框本就限定该区间）
+    let ttl = ttl.clamp(1, 255);
+    let cfg = Config::builder().kind(icmp_kind).ttl(ttl).build();
     let client = Client::new(&cfg).map_err(|e| format!("Ping client error: {}", e))?;
 
     for seq in 0..count {
@@ -377,6 +384,12 @@ fn parse_ipv4_icmp_reply(buf: &[u8]) -> Option<(u8, u8, u16, u16, IpAddr)> {
         11 => {
             // Time Exceeded：ICMP 头(8B 含 unused)之后 = 内嵌原始 IP 头 + 原始 echo 头(8B)
             let inner = &buf[ihl + 8..];
+            // 上面的长度检查只保证 `buf.len() >= ihl + 8`，故 `inner` 可能是空切片。
+            // 必须先判空再取 `inner[0]`，否则空切片索引 panic（ADR-0001 D5）。
+            // 对照 IPv6 分支（下方 parse_ipv6_icmp_reply）：其长度校验在索引之前，写法正确。
+            if inner.is_empty() {
+                return None;
+            }
             // 内嵌 IP 头：inner[0] 是版本/IHL 字段（inner[4] 是 TTL）
             let inner_ihl = ((inner[0] & 0x0f) as usize) * 4;
             if inner.len() < inner_ihl + 8 {
@@ -445,14 +458,18 @@ async fn traceroute_probe_hop(
         Err(_) => socket2::Socket::new(domain, Type::RAW, Some(proto))
             .map_err(|e| format!("创建 ICMP socket 失败（需要管理员权限）: {}", e))?,
     };
-    sock2.set_nonblocking(true).map_err(|e| format!("设置非阻塞失败: {}", e))?;
+    sock2
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞失败: {}", e))?;
     // 设置 TTL（IPv4: IP_TTL；IPv6: IPV6_UNICAST_HOPS）
     {
         let sref = socket2::SockRef::from(&sock2);
         if target.is_ipv4() {
-            sref.set_ttl_v4(ttl).map_err(|e| format!("设置 TTL 失败: {}", e))?;
+            sref.set_ttl_v4(ttl)
+                .map_err(|e| format!("设置 TTL 失败: {}", e))?;
         } else {
-            sref.set_unicast_hops_v6(ttl).map_err(|e| format!("设置 TTL 失败: {}", e))?;
+            sref.set_unicast_hops_v6(ttl)
+                .map_err(|e| format!("设置 TTL 失败: {}", e))?;
         }
     }
     let udp = UdpSocket::from(sock2);
@@ -514,7 +531,10 @@ async fn traceroute_probe_hop(
 
                 if let Some((itype, _code, id, seq, src)) = parsed {
                     let _ = itype;
-                    if id == ident && seqs.contains(&seq) && !results.iter().any(|(s, _, _)| *s == seq) {
+                    if id == ident
+                        && seqs.contains(&seq)
+                        && !results.iter().any(|(s, _, _)| *s == seq)
+                    {
                         let idx = seqs.iter().position(|s| *s == seq).unwrap_or(0);
                         let rtt = send_times[idx].elapsed().as_secs_f64() * 1000.0;
                         results.push((seq, rtt, src.to_string()));
@@ -540,7 +560,6 @@ async fn traceroute_probe_hop(
     }
     Ok((rtts, hop_src, got_target))
 }
-
 
 // ============================================================================
 // Nslookup (streaming)
@@ -703,22 +722,31 @@ pub struct NatDetectionResult {
     pub error_message: String,
 }
 
+/// 内置 STUN 服务器列表（顺序即首选优先级）。
+///
+/// 排序依据 2026-09 实测（UDP Binding Request 往返）：可用者前置，失效者后置。
+/// 实测结果：`stun.l.google.com` / `stun1/2.l.google.com` / `stun.freeswitch.org` /
+/// `global.stun.twilio.com` / `stun.miwifi.com` / `stun.nextcloud.com` /
+/// `stun.linphone.org` 正常响应；`stun.qq.com`（连接被重置）与 `stun.sipgate.net`
+/// （无响应）已失效，故移到末尾并保留（服务可能恢复，且 detect_nat_streaming 会
+/// 自动顺延，不会阻塞用户）。
 const STUN_SERVERS: &[(&str, &str, u16)] = &[
-    ("stun.qq.com", "stun.qq.com", 3478),
     ("Google Primary", "stun.l.google.com", 19302),
     ("Google Alt", "stun1.l.google.com", 19302),
-    ("Google v6", "stun2.l.google.com", 19302),
     ("Freeswitch", "stun.freeswitch.org", 3478),
     ("Twilio", "global.stun.twilio.com", 3478),
-    ("Numb", "stun.counterpath.com", 3478),
-    ("Sipgate", "stun.sipgate.net", 3478),
-    ("Ekiga", "stun.ekiga.net", 3478),
-    ("3CX", "stun.3cx.com", 3478),
-    ("Blink", "stun.blink.de", 3478),
-    ("Vivox", "stun.vivox.com", 3478),
+    ("Miwifi", "stun.miwifi.com", 3478),
     ("Nextcloud", "stun.nextcloud.com", 3478),
     ("Linphone", "stun.linphone.org", 3478),
-    ("Miwifi", "stun.miwifi.com", 3478),
+    ("Google v6", "stun2.l.google.com", 19302),
+    ("Ekiga", "stun.ekiga.net", 3478),
+    ("3CX", "stun.3cx.com", 3478),
+    ("Vivox", "stun.vivox.com", 3478),
+    ("Blink", "stun.blink.de", 3478),
+    ("Numb", "stun.counterpath.com", 3478),
+    // 实测失效（保留在列表末尾，恢复后自动可用）
+    ("QQ", "stun.qq.com", 3478),
+    ("Sipgate", "stun.sipgate.net", 3478),
 ];
 
 pub fn get_stun_servers() -> Vec<String> {
@@ -726,6 +754,146 @@ pub fn get_stun_servers() -> Vec<String> {
         .iter()
         .map(|s| format!("{}:{}", s.1, s.2))
         .collect()
+}
+
+// ============================================================================
+// 网站/端口 HTTP 延迟探测（服务端执行）
+// ============================================================================
+
+/// 单次 HTTP 延迟探测结果（`probe_url` 命令载荷）。
+#[derive(Debug, Clone, Serialize)]
+pub struct UrlProbeResult {
+    /// 探测是否成功（收到任何 HTTP 响应即算可达，含 4xx/5xx）
+    pub reachable: bool,
+    /// **HTTP 延迟**（毫秒）：本机发起请求到收到 HTTP 响应头之间的真实墙钟时间，
+    /// 即 DNS + TCP + TLS 握手 + 请求/响应（HEAD 优先，405/501 时 GET 兜底）。
+    ///
+    /// 口径说明（避免再次被误读）：这是**应用层 HTTP 往返**，不是 ICMP ping 的
+    /// 网络往返，也不是浏览器打开网页的耗时——它不含子资源加载与渲染。
+    /// 「网站延迟测试」展示的就是本字段，UI 与日志必须标注为 HTTP 延迟，
+    /// 不得用 ICMP 数值或浏览器页面耗时冒充（见 `network_probe_contract.rs`）。
+    pub ms: u64,
+    /// HTTP 状态码；未取得响应时为 None
+    pub status: Option<u16>,
+    /// 失败原因（可达时为 None）
+    pub error: Option<String>,
+}
+
+/// 探测目标的归一化 URL（无协议时补 `http://`）。
+///
+/// 「HTTP 延迟测试」与「端口检测」共用同一归一化结果，
+/// 保证两者测的是同一个地址。
+pub fn normalize_probe_url(url: &str) -> String {
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{}", url)
+    }
+}
+
+/// 探测目标 URL / host:port 的 HTTP 延迟与可达性（**服务端**执行，不受 WebView CSP 限制）。
+///
+/// 为什么必须在后端做：
+///   HTTP 延迟测试原本用浏览器 `fetch(url, {mode:"no-cors"})` 直连外部站点，
+///   但 v1.19.0 收紧了 CSP `connect-src`（移除通配 `https:`/`http:`），
+///   于是**发行版**里所有外部 fetch 都被 WebView2 拦截 → 全部显示"不可达"。
+///   用户还能自定义任意站点（localStorage `secm_sites`），无法用固定的
+///   CSP 白名单覆盖；把探测移到 Rust 侧即可**保持 CSP 收紧**，
+///   同时支持任意目标。v0.9.x 曾用"往 CSP 加回 https: http:"修过同一 BUG，
+///   那次改动在 v1.19.0 的安全收紧中被回退，故本次改为不依赖 CSP 的方案。
+///
+/// 语义与前端旧的 `headProbe` 对齐：**收到任何 HTTP 响应即视为可达**
+/// （4xx/5xx 也算——目标服务确实在应答；只有连接/超时/协议错误才算不可达）。
+/// 返回的 `ms` 是 HTTP 层延迟，即本命令对外承诺的**唯一**耗时口径。
+///
+/// 连接超时单独设置：ureq 的 `.timeout()` 只作用于读写阶段，连接阶段受
+/// `timeout_connect` 控制（默认 30s，实测回环"拒绝连接"要等 ~2s）。
+/// 不显式设置会让一次探测在异常网络下悬挂很久。
+pub fn probe_url(url: &str, timeout_ms: u64) -> UrlProbeResult {
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+
+    // 未带协议时按 http 处理（端口探测传 "http://host:port"，站点传完整 URL）
+    let normalized = normalize_probe_url(url);
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .timeout_write(timeout)
+        .build();
+
+    // 整个探测（含 HEAD→GET 兜底）共享**同一个**总预算。
+    // 若把 timeout 按"每次尝试"计，不可达目标会 HEAD 超时 + GET 再超时 = 2×budget
+    // （实测预算 2s 时耗 4.0s），前端"检测中"转圈时间翻倍。
+    let deadline = started + timeout;
+
+    // HEAD 优先（轻量）；部分站点对 HEAD 返回 405/501，此时 GET 兜底。
+    // `ureq` 把 4xx/5xx 也作为 Err(Status) 返回，需区分"有响应"与"真不可达"。
+    // 预算耗尽时直接返回 None，不再启动第二次尝试。
+    //
+    // 每次尝试**单独计时**：可达时对外展示的 HTTP 延迟必须是"成功那次尝试"的
+    // 耗时，不能把先前失败尝试（例如站点拒绝 HEAD）的时间累加进延迟，
+    // 否则同一站点的读数会因兜底路径而虚高约一倍。
+    let attempt = |method: &str| -> Option<Result<(u16, u64), String>> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let attempt_started = std::time::Instant::now();
+        let req = if method == "HEAD" {
+            agent.head(&normalized)
+        } else {
+            agent.get(&normalized)
+        };
+        let took = |t: &std::time::Instant| t.elapsed().as_millis() as u64;
+        Some(match req.call() {
+            Ok(resp) => Ok((resp.status(), took(&attempt_started))),
+            Err(ureq::Error::Status(code, _)) => Ok((code, took(&attempt_started))),
+            Err(ureq::Error::Transport(t)) => Err(t.to_string()),
+        })
+    };
+
+    let (reachable, status, error, ms) = match attempt("HEAD") {
+        Some(Ok((code, took))) => (true, Some(code), None, took),
+        head => {
+            let head_err = match head {
+                Some(Err(e)) => Some(e),
+                // 预算已耗尽（None）：也走不可达，理由如实说明
+                None => None,
+                Some(Ok(_)) => unreachable!("Ok 分支已在上面处理"),
+            };
+            match attempt("GET") {
+                Some(Ok((code, took))) => (true, Some(code), None, took),
+                get => {
+                    let get_err = match get {
+                        Some(Err(e)) => Some(e),
+                        None => None,
+                        Some(Ok(_)) => unreachable!("Ok 分支已在上面处理"),
+                    };
+                    let detail = match (head_err, get_err) {
+                        (Some(h), Some(g)) => format!("HEAD: {}; GET: {}", h, g),
+                        (Some(h), None) => format!("HEAD: {}（预算已耗尽，未再尝试 GET）", h),
+                        (None, Some(g)) => format!("GET: {}", g),
+                        (None, None) => "预算已耗尽（连接超时）".to_string(),
+                    };
+                    // 不可达时无可用的单次尝试耗时，如实给出总消耗（即超时预算）
+                    (
+                        false,
+                        None,
+                        Some(detail),
+                        started.elapsed().as_millis() as u64,
+                    )
+                }
+            }
+        }
+    };
+
+    UrlProbeResult {
+        reachable,
+        ms,
+        status,
+        error,
+    }
 }
 
 fn build_binding_request(transaction_id: &[u8; 12]) -> Vec<u8> {
@@ -819,14 +987,94 @@ fn stun_step(emitter: &impl Fn(StreamEvent), phase: &str, description: &str) {
     });
 }
 
+/// STUN 候选列表：用户选定服务器优先，其后依次追加内置列表（去重）。
+///
+/// 动机：公网 STUN 服务长期存在失效情况（实测 `stun.qq.com`、
+/// `stun.sipgate.net` 均无响应/连接被重置），而 NAT 检测三阶段必须使用**同一个**
+/// 服务器，因此不能只在阶段一重试。原实现只尝试用户选中的单个服务器，导致
+/// 默认项失效时整个功能在首次使用即报错。此处改为按序探测并自动顺延。
+fn stun_candidates(requested: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(STUN_SERVERS.len() + 1);
+    let trimmed = requested.trim();
+    if !trimmed.is_empty() {
+        v.push(trimmed.to_string());
+    }
+    for (_, host, port) in STUN_SERVERS {
+        let s = format!("{}:{}", host, port);
+        if !v.iter().any(|x| x.eq_ignore_ascii_case(&s)) {
+            v.push(s);
+        }
+    }
+    v
+}
+
 pub fn detect_nat_streaming(
     stun_server: &str,
     cmd_id: &str,
     emitter: impl Fn(StreamEvent),
 ) -> Result<NatDetectionResult, String> {
-    let server_addr = resolve_stun(stun_server)?;
     let local_ip = get_local_ip();
     let mut rng = rand::thread_rng();
+
+    // Phase 1：对候选服务器依次探测（首个有响应者胜出），失败自动顺延。
+    let mut chosen: Option<(SocketAddr, IpAddr, u16, String)> = None;
+    let mut last_err = String::from("无候选服务器");
+    for cand in stun_candidates(stun_server) {
+        if is_cancelled(cmd_id) {
+            emitter(StreamEvent {
+                kind: "error".into(),
+                data: "用户取消".into(),
+            });
+            return Err("Cancelled".into());
+        }
+        let addr = match resolve_stun(&cand) {
+            Ok(a) => a,
+            Err(e) => {
+                last_err = format!("{}: {}", cand, e);
+                continue;
+            }
+        };
+        let sk = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = format!("UDP bind失败: {}", e);
+                continue;
+            }
+        };
+        sk.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        let tid: [u8; 12] = rng.gen();
+        if let Err(e) = sk.send_to(&build_binding_request(&tid), addr) {
+            last_err = format!("{}: STUN send失败: {}", cand, e);
+            continue;
+        }
+        let mut b = [0u8; 2048];
+        match sk.recv_from(&mut b) {
+            Ok((l, _)) => match parse_mapped_address(&b[..l]) {
+                Some(m) => {
+                    chosen = Some((addr, m.0, m.1, cand.clone()));
+                    break;
+                }
+                None => last_err = format!("{}: 无法解析 MAPPED-ADDRESS", cand),
+            },
+            Err(e) => last_err = format!("{}: 阶段1超时: {}", cand, e),
+        }
+    }
+
+    let (server_addr, mapped_ip, mapped_port, used) = match chosen {
+        Some(v) => v,
+        None => {
+            let msg = format!(
+                "所有 STUN 服务器均不可用（已尝试 {} 个，最后错误: {}）",
+                stun_candidates(stun_server).len(),
+                last_err
+            );
+            emitter(StreamEvent {
+                kind: "error".into(),
+                data: msg.clone(),
+            });
+            return Err(msg);
+        }
+    };
 
     stun_step(
         &emitter,
@@ -838,28 +1086,20 @@ pub fn detect_nat_streaming(
             local_ip
         ),
     );
-
-    if is_cancelled(cmd_id) {
-        emitter(StreamEvent {
-            kind: "error".into(),
-            data: "用户取消".into(),
-        });
-        return Err("Cancelled".into());
+    // 发生顺延时透出，便于用户理解为何不是自己选的服务器
+    if !used.eq_ignore_ascii_case(stun_server.trim()) {
+        stun_step(
+            &emitter,
+            "服务器自动切换",
+            &format!(
+                "选定服务器 {} 无响应，已改用 {}（公网 STUN 服务可能已失效）",
+                stun_server.trim(),
+                used
+            ),
+        );
     }
 
-    // Phase 1
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("UDP bind失败: {}", e))?;
-    socket.set_read_timeout(Some(Duration::from_secs(3))).ok();
-    let tid1: [u8; 12] = rng.gen();
-    socket
-        .send_to(&build_binding_request(&tid1), server_addr)
-        .map_err(|e| format!("STUN send失败: {}", e))?;
-    let mut buf = [0u8; 2048];
-    let (len, _) = socket
-        .recv_from(&mut buf)
-        .map_err(|e| format!("阶段1超时: {}", e))?;
-    let mapped =
-        parse_mapped_address(&buf[..len]).ok_or_else(|| "无法解析MAPPED-ADDRESS".to_string())?;
+    let mapped = (mapped_ip, mapped_port);
     stun_step(
         &emitter,
         "阶段1: 绑定请求",
@@ -1016,7 +1256,9 @@ fn resolve_host_with_dns(
             let server_ip: IpAddr = srv
                 .parse()
                 .map_err(|_| format!("DNS 服务器地址无效: {}", srv))?;
-            use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+            use trust_dns_resolver::config::{
+                NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
+            };
             use trust_dns_resolver::Resolver;
 
             let ns = NameServerConfig::new(SocketAddr::new(server_ip, 53), Protocol::Udp);
@@ -1027,8 +1269,8 @@ fn resolve_host_with_dns(
             opts.timeout = Duration::from_secs(2);
             opts.attempts = 1;
             opts.try_tcp_on_error = false;
-            let resolver = Resolver::new(cfg, opts)
-                .map_err(|e| format!("DNS 解析器初始化失败: {}", e))?;
+            let resolver =
+                Resolver::new(cfg, opts).map_err(|e| format!("DNS 解析器初始化失败: {}", e))?;
 
             let mut ipv4: Option<IpAddr> = None;
             let mut ipv6: Option<IpAddr> = None;
@@ -1058,12 +1300,16 @@ fn resolve_host_with_dns(
                 "v4" => ipv4.ok_or_else(|| {
                     v4_err
                         .map(|e| format!("通过 DNS {} 查询 {} 的 IPv4 记录失败: {}", srv, host, e))
-                        .unwrap_or_else(|| format!("通过 DNS {} 查询 {} 的 IPv4 记录失败", srv, host))
+                        .unwrap_or_else(|| {
+                            format!("通过 DNS {} 查询 {} 的 IPv4 记录失败", srv, host)
+                        })
                 }),
                 "v6" => ipv6.ok_or_else(|| {
                     v6_err
                         .map(|e| format!("通过 DNS {} 查询 {} 的 IPv6 记录失败: {}", srv, host, e))
-                        .unwrap_or_else(|| format!("通过 DNS {} 查询 {} 的 IPv6 记录失败", srv, host))
+                        .unwrap_or_else(|| {
+                            format!("通过 DNS {} 查询 {} 的 IPv6 记录失败", srv, host)
+                        })
                 }),
                 _ => ipv4.or(ipv6).ok_or_else(|| {
                     let detail = v4_err
@@ -1115,6 +1361,50 @@ fn resolve_host_with_version(host: &str, ip_version: &str) -> Result<IpAddr, Str
 mod tests {
     use super::*;
 
+    /// ADR-0001 D5 回归：ICMP Time Exceeded 报文长度恰好为 `IP 头 + 8` 时，
+    /// 内嵌载荷为空切片；修复前在长度校验之前取 `inner[0]`，会 panic。
+    ///
+    /// 该形态可由同网段设备构造，panic 发生在 spawn_blocking 内，
+    /// 会让整次 traceroute 以 "Traceroute panicked" 失败。
+    #[test]
+    fn icmp报文_空内嵌载荷不panic() {
+        // 20 字节 IPv4 头（IHL=5）+ 8 字节 ICMP 头，总长 28，无内嵌报文
+        let mut buf = vec![0u8; 28];
+        buf[0] = 0x45; // version=4, IHL=5
+        buf[12..16].copy_from_slice(&[192, 168, 1, 1]); // 源 IP
+        buf[20] = 11; // ICMP Time Exceeded
+        assert_eq!(
+            parse_ipv4_icmp_reply(&buf),
+            None,
+            "空内嵌载荷应返回 None 而非 panic"
+        );
+    }
+
+    /// 内嵌 IP 头存在但不足以容纳 echo 头（8 字节）时同样返回 None。
+    #[test]
+    fn icmp报文_内嵌载荷过短应返回空() {
+        // 20 + 8 + 4（内嵌 4 字节，不足 IHL+8）
+        let mut buf = vec![0u8; 32];
+        buf[0] = 0x45;
+        buf[20] = 11;
+        assert_eq!(parse_ipv4_icmp_reply(&buf), None);
+    }
+
+    /// 正常 Echo Reply 仍能被解析（确认判空没有破坏主路径）。
+    #[test]
+    fn icmp报文_正常echo回复可解析() {
+        let mut buf = vec![0u8; 28];
+        buf[0] = 0x45;
+        buf[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        buf[20] = 0; // Echo Reply
+        buf[24..26].copy_from_slice(&0x1234u16.to_be_bytes()); // identifier
+        buf[26..28].copy_from_slice(&7u16.to_be_bytes()); // sequence
+        let parsed = parse_ipv4_icmp_reply(&buf).expect("应能解析 Echo Reply");
+        assert_eq!(parsed.2, 0x1234);
+        assert_eq!(parsed.3, 7);
+        assert_eq!(parsed.4, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
     #[test]
     fn test_resolve_localhost() {
         let addr = resolve_host("127.0.0.1").unwrap();
@@ -1133,5 +1423,50 @@ mod tests {
     fn test_get_stun_servers() {
         let servers = get_stun_servers();
         assert!(servers.len() >= 15);
+    }
+
+    /// 首选服务器必须是实测可用项：stun.qq.com 已失效，不得再排第一
+    /// （否则用户首次点「检测」即失败）。
+    #[test]
+    fn test_stun_first_choice_is_live_server() {
+        let first = get_stun_servers().into_iter().next().expect("至少一台");
+        assert_ne!(first, "stun.qq.com:3478", "失效服务器不得作为首选");
+        assert_ne!(first, "stun.sipgate.net:3478", "失效服务器不得作为首选");
+    }
+
+    /// 候选列表：用户选择优先，其后补齐内置列表且去重（大小写不敏感）。
+    #[test]
+    fn test_stun_candidates_dedup_and_priority() {
+        let c = stun_candidates("stun.l.google.com:19302");
+        assert_eq!(
+            c[0], "stun.l.google.com:19302",
+            "用户选择必须排在首位（不重复追加）"
+        );
+        // 用户选择已在内置列表中 → 只应出现一次
+        assert_eq!(
+            c.iter()
+                .filter(|x| x.as_str() == "stun.l.google.com:19302")
+                .count(),
+            1,
+            "候选列表必须去重: {:?}",
+            c
+        );
+        // 内置列表全部覆盖
+        for s in get_stun_servers() {
+            assert!(c.contains(&s), "候选列表缺少内置项 {}", s);
+        }
+        // 大小写不敏感去重：不同大小写视为同一项
+        let c2 = stun_candidates("STUN.L.GOOGLE.COM:19302");
+        assert_eq!(
+            c2.iter()
+                .filter(|x| x.to_ascii_lowercase() == "stun.l.google.com:19302")
+                .count(),
+            1,
+            "大小写不敏感去重失败: {:?}",
+            c2
+        );
+        // 空/空白选择 → 仅内置列表，且与 get_stun_servers() 完全一致
+        assert_eq!(stun_candidates(""), get_stun_servers());
+        assert_eq!(stun_candidates("   "), get_stun_servers());
     }
 }

@@ -146,12 +146,13 @@ fn load_nvdrs_api() -> Result<&'static NvDrsApi, String> {
             // SAFETY: "nvapi_QueryInterface" 为静态 NUL 结尾 ASCII 字符串
             let qi_raw = unsafe { GetProcAddress(dll, b"nvapi_QueryInterface\0".as_ptr()) };
             if qi_raw.is_null() {
-                return Err("GetProcAddress(nvapi_QueryInterface) 失败: nvapi64.dll 缺少入口".into());
+                return Err(
+                    "GetProcAddress(nvapi_QueryInterface) 失败: nvapi64.dll 缺少入口".into(),
+                );
             }
             // SAFETY: nvapi_QueryInterface 签名固定为 (u32) -> void*（NVAPI 公开契约）
-            let qi: unsafe extern "C" fn(u32) -> *mut c_void = unsafe {
-                std::mem::transmute(qi_raw)
-            };
+            let qi: unsafe extern "C" fn(u32) -> *mut c_void =
+                unsafe { std::mem::transmute(qi_raw) };
 
             // 通过 QueryInterface 按序数解析各 DRS 函数
             // SAFETY: 每个函数指针均来自 nvapi_QueryInterface(ordinal)，序数与
@@ -190,9 +191,7 @@ fn nvapi_version() -> u32 {
 
 /// 在 DRS 会话内执行闭包：创建会话 → 加载设置 → 取全局 profile → 闭包 → 销毁会话
 /// 闭包参数：(&NvDrsApi, session, hprofile)
-fn with_session<T>(
-    f: impl FnOnce(&NvDrsApi, u64, u64) -> Result<T, String>,
-) -> Result<T, String> {
+fn with_session<T>(f: impl FnOnce(&NvDrsApi, u64, u64) -> Result<T, String>) -> Result<T, String> {
     let api = load_nvdrs_api()?;
     let mut session: u64 = 0;
     // SAFETY: session 为输出参数，指向有效 u64 栈变量
@@ -233,8 +232,6 @@ fn with_session<T>(
 
 /// 解析「电源管理模式」的 settingId（按设置名动态解析，避免硬编码 id）
 fn power_mode_setting_id(api: &NvDrsApi) -> Result<u32, String> {
-
-
     let mut name: Vec<u16> = SETTING_POWER_MANAGEMENT_MODE.encode_utf16().collect();
     name.push(0);
     let mut id: u32 = 0;
@@ -311,7 +308,10 @@ pub fn get_power_mode() -> Result<NvidiaPowerMode, String> {
         dword_current_value(&setting)
             .and_then(NvidiaPowerMode::from_raw)
             .ok_or_else(|| {
-                format!("NVIDIA 电源管理模式未知值: {:?}（驱动版本异常？）", dword_current_value(&setting))
+                format!(
+                    "NVIDIA 电源管理模式未知值: {:?}（驱动版本异常？）",
+                    dword_current_value(&setting)
+                )
             })
     })
 }
@@ -362,7 +362,11 @@ pub fn set_power_mode(mode: NvidiaPowerMode) -> Result<(), String> {
         // SAFETY: setting 由 GetSetting 完整填充（或按新建设置项构造）后仅改值字段
         let rc = unsafe { (api.set_setting)(session, hprofile, &setting) };
         if rc != NVAPI_OK {
-            return Err(format!("NvAPI_DRS_SetSetting({}) 失败: rc=0x{:08X}", mode.label_cn(), rc));
+            return Err(format!(
+                "NvAPI_DRS_SetSetting({}) 失败: rc=0x{:08X}",
+                mode.label_cn(),
+                rc
+            ));
         }
         // SAFETY: 会话句柄有效
         let rc = unsafe { (api.save_settings)(session) };
@@ -375,21 +379,27 @@ pub fn set_power_mode(mode: NvidiaPowerMode) -> Result<(), String> {
         // SAFETY: verify 为有效栈缓冲；session/hprofile 句柄有效
         let rc = unsafe { (api.get_setting)(session, hprofile, id, &mut verify) };
         if rc != NVAPI_OK {
-            return Err(format!("写入后验证读取失败: NvAPI_DRS_GetSetting rc=0x{:08X}", rc));
+            return Err(format!(
+                "写入后验证读取失败: NvAPI_DRS_GetSetting rc=0x{:08X}",
+                rc
+            ));
         }
         let actual = dword_current_value(&verify);
         if actual != Some(mode as u32) {
-            return Err(format!("写入后验证不一致: 期望 {}（{}），实际 {:?}（{}）",
+            return Err(format!(
+                "写入后验证不一致: 期望 {}（{}），实际 {:?}（{}）",
                 mode as u32,
                 mode.label_cn(),
                 actual,
-                actual.and_then(NvidiaPowerMode::from_raw).map(|m| m.label_cn()).unwrap_or("未知"),
+                actual
+                    .and_then(NvidiaPowerMode::from_raw)
+                    .map(|m| m.label_cn())
+                    .unwrap_or("未知"),
             ));
         }
         Ok(())
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -407,7 +417,10 @@ mod tests {
     #[test]
     fn 电源管理模式值域映射() {
         // 值域以 NVIDIA App featureEnum 为准：0=Adaptive 1=Max 5=Optimal
-        assert_eq!(NvidiaPowerMode::from_raw(0), Some(NvidiaPowerMode::Adaptive));
+        assert_eq!(
+            NvidiaPowerMode::from_raw(0),
+            Some(NvidiaPowerMode::Adaptive)
+        );
         assert_eq!(
             NvidiaPowerMode::from_raw(1),
             Some(NvidiaPowerMode::MaxPerformance)
@@ -427,7 +440,10 @@ mod tests {
         let mut s: NvDrsSetting = unsafe { std::mem::zeroed() };
         // 写入 MaxPerformance=1
         set_dword_current_value(&mut s, 1);
-        assert_eq!(s.binary_current_value.value_length, 4, "value_length 应为 DWORD 长度 4");
+        assert_eq!(
+            s.binary_current_value.value_length, 4,
+            "value_length 应为 DWORD 长度 4"
+        );
         assert_eq!(dword_current_value(&s), Some(1), "值应从 value_data 读取");
         // 写入 Optimal=5
         set_dword_current_value(&mut s, 5);
@@ -447,5 +463,4 @@ mod tests {
         assert!(!is_profile_not_found(-1));
         assert!(!is_profile_not_found(0xFFFFFF08u32 as i32)); // INCOMPATIBLE_STRUCT_VERSION
     }
-
 }

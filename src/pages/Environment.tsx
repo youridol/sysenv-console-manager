@@ -3,11 +3,7 @@ import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "../lib/utils";
-import {
-  Card,
-  CardHeader,
-  CardContent,
-} from "../components/ui/card";
+import { Card, CardHeader, CardContent } from "../components/ui/card";
 import { Skeleton } from "../components/ui/skeleton";
 import { Button } from "../components/ui/button";
 import { Switch } from "../components/ui/switch";
@@ -222,7 +218,6 @@ export default function Environment() {
   }, [loadSystem, loadDx, loadVc, loadGames]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -256,9 +251,9 @@ export default function Environment() {
       />
 
       {/* ── 4×4 布局 ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 @2xl/main:grid-cols-2 @5xl/main:grid-cols-4 gap-4">
         {/* ── 系统信息 ── */}
-        <Card className="xl:col-span-2 animate-scale-in stagger-1">
+        <Card className="@5xl/main:col-span-2 animate-scale-in stagger-1">
           <CardHeader className="pb-2">
             <SectionHeader
               icon={Monitor}
@@ -346,7 +341,7 @@ export default function Environment() {
         </Card>
 
         {/* ── 游戏环境 ── */}
-        <Card className="xl:col-span-2 animate-scale-in stagger-2">
+        <Card className="@5xl/main:col-span-2 animate-scale-in stagger-2">
           <CardHeader className="pb-2">
             <SectionHeader
               icon={Gamepad2}
@@ -457,7 +452,7 @@ export default function Environment() {
         </Card>
 
         {/* ── DirectX 诊断 ── */}
-        <Card className="xl:col-span-2 animate-scale-in stagger-3">
+        <Card className="@5xl/main:col-span-2 animate-scale-in stagger-3">
           <CardHeader className="pb-2">
             <SectionHeader
               icon={MonitorPlay}
@@ -491,7 +486,7 @@ export default function Environment() {
         </Card>
 
         {/* ── VC++ 运行库 ── */}
-        <Card className="xl:col-span-2 animate-scale-in stagger-4">
+        <Card className="@5xl/main:col-span-2 animate-scale-in stagger-4">
           <CardHeader className="pb-2">
             <SectionHeader
               icon={Package}

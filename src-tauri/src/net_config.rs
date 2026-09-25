@@ -161,16 +161,9 @@ fn run_netsh(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 解码 netsh 输出：优先 UTF-8（UTF-8 代码页系统），回退 GBK（中文 ANSI 代码页）
+/// 解码 netsh 输出：复用 `proc_util::decode_ps`（ADR-0001 D14 合并同构实现）。
 fn decode_ansi(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_string();
-    }
-    let (cow, _, _) = encoding_rs::GBK.decode(bytes);
-    cow.into_owned()
+    crate::proc_util::decode_ps(bytes)
 }
 
 /// 执行单个步骤并包装为 ApplyStep（成功/失败均不中断后续步骤）
@@ -271,13 +264,26 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                     steps.push(run_step("IPv4 静态配置（主地址）", || {
                         if first_gw.is_empty() {
                             run_netsh(&[
-                                "interface", "ip", "set", "address", &quoted, "static",
-                                &first_ip, &first_mask,
+                                "interface",
+                                "ip",
+                                "set",
+                                "address",
+                                &quoted,
+                                "static",
+                                &first_ip,
+                                &first_mask,
                             ])
                         } else {
                             run_netsh(&[
-                                "interface", "ip", "set", "address", &quoted, "static",
-                                &first_ip, &first_mask, &first_gw,
+                                "interface",
+                                "ip",
+                                "set",
+                                "address",
+                                &quoted,
+                                "static",
+                                &first_ip,
+                                &first_mask,
+                                &first_gw,
                             ])
                         }
                     }));
@@ -291,13 +297,24 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                         steps.push(run_step(&name, || {
                             if g.is_empty() {
                                 run_netsh(&[
-                                    "interface", "ip", "add", "address", &quoted,
-                                    &e_ip, &e_mask,
+                                    "interface",
+                                    "ip",
+                                    "add",
+                                    "address",
+                                    &quoted,
+                                    &e_ip,
+                                    &e_mask,
                                 ])
                             } else {
                                 run_netsh(&[
-                                    "interface", "ip", "add", "address", &quoted,
-                                    &e_ip, &e_mask, &g,
+                                    "interface",
+                                    "ip",
+                                    "add",
+                                    "address",
+                                    &quoted,
+                                    &e_ip,
+                                    &e_mask,
+                                    &g,
                                 ])
                             }
                         }));
@@ -322,7 +339,12 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
         "dhcp" => {
             steps.push(run_step("IPv6 自动获取 (DHCP)", || {
                 run_netsh(&[
-                    "interface", "ipv6", "set", "address", &quoted, "source=dhcp",
+                    "interface",
+                    "ipv6",
+                    "set",
+                    "address",
+                    &quoted,
+                    "source=dhcp",
                 ])
             }));
         }
@@ -330,11 +352,20 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
             let ipv6 = req.ipv6.as_deref().unwrap_or("").trim().to_string();
             if !ipv6.is_empty() {
                 if let Err(e) = validate_ipv6(&ipv6) {
-                    steps.push(ApplyStep { name: "IPv6 静态地址".into(), ok: false, message: e });
+                    steps.push(ApplyStep {
+                        name: "IPv6 静态地址".into(),
+                        ok: false,
+                        message: e,
+                    });
                 } else {
                     // 先 add；地址已存在时 netsh 报错 → 改用 set 更新
                     let r1 = run_netsh(&[
-                        "interface", "ipv6", "add", "address", &quoted, &format!("address={}", ipv6),
+                        "interface",
+                        "ipv6",
+                        "add",
+                        "address",
+                        &quoted,
+                        &format!("address={}", ipv6),
                     ]);
                     match r1 {
                         Ok(_) => steps.push(ApplyStep {
@@ -344,7 +375,12 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                         }),
                         Err(_) => {
                             let r2 = run_netsh(&[
-                                "interface", "ipv6", "set", "address", &quoted, &format!("address={}", ipv6),
+                                "interface",
+                                "ipv6",
+                                "set",
+                                "address",
+                                &quoted,
+                                &format!("address={}", ipv6),
                             ]);
                             match r2 {
                                 Ok(_) => steps.push(ApplyStep {
@@ -372,14 +408,21 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
             let gw6 = req.ipv6_gateway.as_deref().unwrap_or("").trim().to_string();
             if !gw6.is_empty() {
                 if let Err(e) = validate_ipv6(&gw6) {
-                    steps.push(ApplyStep { name: "IPv6 默认网关".into(), ok: false, message: e });
+                    steps.push(ApplyStep {
+                        name: "IPv6 默认网关".into(),
+                        ok: false,
+                        message: e,
+                    });
                 } else {
-                    let _ = run_netsh(&[
-                        "interface", "ipv6", "delete", "route", "::/0", &quoted,
-                    ]);
+                    let _ = run_netsh(&["interface", "ipv6", "delete", "route", "::/0", &quoted]);
                     steps.push(run_step("IPv6 默认网关", || {
                         run_netsh(&[
-                            "interface", "ipv6", "add", "route", "::/0", &quoted,
+                            "interface",
+                            "ipv6",
+                            "add",
+                            "route",
+                            "::/0",
+                            &quoted,
                             &format!("nexthop={}", gw6),
                         ])
                     }));
@@ -450,7 +493,13 @@ fn apply_dns4_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quot
                     let name = format!("IPv4 附加 DNS #{}", i + 1);
                     steps.push(run_step(&name, || {
                         run_netsh(&[
-                            "interface", "ip", "add", "dns", quoted, d, &format!("index={}", idx),
+                            "interface",
+                            "ip",
+                            "add",
+                            "dns",
+                            quoted,
+                            d,
+                            &format!("index={}", idx),
                         ])
                     }));
                 }
@@ -502,7 +551,13 @@ fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quot
                 let primary = &dns_list[0];
                 steps.push(run_step("IPv6 DNS 静态配置", || {
                     run_netsh(&[
-                        "interface", "ipv6", "set", "dnsservers", quoted, "static", primary,
+                        "interface",
+                        "ipv6",
+                        "set",
+                        "dnsservers",
+                        quoted,
+                        "static",
+                        primary,
                     ])
                 }));
                 // 附加 DNS：add dnsservers（index 递增）
@@ -511,7 +566,12 @@ fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quot
                     let name = format!("IPv6 附加 DNS #{}", i + 1);
                     steps.push(run_step(&name, || {
                         run_netsh(&[
-                            "interface", "ipv6", "add", "dnsservers", quoted, d,
+                            "interface",
+                            "ipv6",
+                            "add",
+                            "dnsservers",
+                            quoted,
+                            d,
                             &format!("index={}", idx),
                         ])
                     }));
@@ -573,10 +633,7 @@ fn validate_doh_template(url: &str) -> Result<(), String> {
         return Err("DoH 模板 URL 不能为空".to_string());
     }
     if !t.starts_with("https://") {
-        return Err(format!(
-            "DoH 模板 URL 必须以 https:// 开头（当前: {}）",
-            t
-        ));
+        return Err(format!("DoH 模板 URL 必须以 https:// 开头（当前: {}）", t));
     }
     Ok(())
 }
@@ -807,8 +864,9 @@ pub fn set_doh_config(ifname: &str, entries: &[DohEntryInput]) -> NetworkConfigA
 /// 备份原值 → 写入 NetworkAddress → 禁用/启用网卡使生效。
 /// 返回消息含原值备份提示（回滚方式：重新填写原值应用，或网卡高级属性清空）。
 ///
-/// 注意：重启网卡瞬间会短暂断网（毫秒级~秒级），部分网卡驱动不支持覆盖 MAC，
-/// 失败时原值已备份于返回消息，可恢复。
+/// 注意：重启网卡瞬间会短暂断网（毫秒级~秒级），部分网卡驱动不支持覆盖 MAC。
+/// 禁用/启用失败的两条错误消息均携带原值（回滚线索）与「网卡可能停在禁用状态」的
+/// 显式后果说明——注册表此时已写入，失败消息是用户唯一的恢复信息来源（ADR-0001 D6）。
 pub fn set_network_mac(ifname: &str, mac: &str, guid: Option<&str>) -> Result<String, String> {
     // 1. 校验 MAC 格式：允许 AA:BB:CC:DD:EE:FF / AA-BB-... / AABBCCDDEEFF
     let clean: String = mac
@@ -826,7 +884,9 @@ pub fn set_network_mac(ifname: &str, mac: &str, guid: Option<&str>) -> Result<St
     }
     let guid = guid.map(|s| s.trim()).filter(|s| !s.is_empty());
     if guid.is_none() {
-        return Err("未获取到接口 GUID，无法定位网卡注册表实例（请重新加载网络配置后重试）".to_string());
+        return Err(
+            "未获取到接口 GUID，无法定位网卡注册表实例（请重新加载网络配置后重试）".to_string(),
+        );
     }
     let guid = guid.unwrap();
 
@@ -842,18 +902,47 @@ pub fn set_network_mac(ifname: &str, mac: &str, guid: Option<&str>) -> Result<St
     // 4. 写入新值（REG_SZ）
     instance
         .set_value(REG_NETWORK_ADDRESS, &clean)
-        .map_err(|e| format!("写入注册表 NetworkAddress 失败: {}（错误码 {}）", e, e.raw_os_error().unwrap_or(-1)))?;
+        .map_err(|e| {
+            format!(
+                "写入注册表 NetworkAddress 失败: {}（错误码 {}）",
+                e,
+                e.raw_os_error().unwrap_or(-1)
+            )
+        })?;
 
     // 5. 重启网卡使生效（禁用→启用）
+    //
+    // 失败路径必须携带回滚信息（ADR-0001 D6）：注册表**已经**写入新 MAC，
+    // 此时报告错误却不告诉用户原值，用户就失去了唯一的恢复线索；
+    // 而函数头注释明确承诺「失败时原值已备份于返回消息」，此前并未实现。
+    // 另外「启用失败」还会让网卡停在禁用状态，必须显式说明。
+    let rollback: String = match backup.as_deref() {
+        Some(b) => format!("原物理地址 {}（请重新应用该值以恢复）", b),
+        None => "该网卡此前未覆盖 MAC，可在网卡高级属性中清空「网络地址」恢复".to_string(),
+    };
     let quoted = netsh_quoted(ifname);
-    run_netsh(&["interface", "set", "interface", &quoted, "admin=disable"])
-        .map_err(|e| format!("禁用网卡失败（注册表已写入，恢复原值需手动）：{}", e))?;
+    run_netsh(&["interface", "set", "interface", &quoted, "admin=disable"]).map_err(|e| {
+        format!(
+            "禁用网卡失败：{}。注册表已写入新值（{}），{}。",
+            e,
+            format_mac(&clean),
+            rollback
+        )
+    })?;
     run_netsh(&["interface", "set", "interface", &quoted, "admin=enable"])
-        .map_err(|e| format!("启用网卡失败（网卡当前为禁用状态）：{}", e))?;
+        .map_err(|e| {
+            format!(
+                "启用网卡失败：{}。**该网卡当前处于禁用状态，网络会中断**，请先在「网络连接」中手动启用。注册表已写入新值（{}），{}。",
+                e,
+                format_mac(&clean),
+                rollback
+            )
+        })?;
 
     let backup_hint = match backup {
         Some(b) => format!("原物理地址 {} 已备份，如需恢复请重新应用该值。", b),
-        None => "网卡此前未覆盖 MAC（系统默认地址），如需恢复请在网卡高级属性中清空网络地址。".to_string(),
+        None => "网卡此前未覆盖 MAC（系统默认地址），如需恢复请在网卡高级属性中清空网络地址。"
+            .to_string(),
     };
     Ok(format!(
         "物理地址已修改为 {} 并重启网卡生效（可能短暂断网）。{}",
@@ -868,9 +957,19 @@ fn find_nic_instance(guid: &str, ifname: &str) -> Result<RegKey, String> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let class = hklm
         .open_subkey_with_flags(NIC_CLASS_KEY, KEY_READ)
-        .map_err(|e| format!("打开网卡 Class 注册表键失败: {}（错误码 {}）", e, e.raw_os_error().unwrap_or(-1)))?;
+        .map_err(|e| {
+            format!(
+                "打开网卡 Class 注册表键失败: {}（错误码 {}）",
+                e,
+                e.raw_os_error().unwrap_or(-1)
+            )
+        })?;
 
-    let guid_norm = guid.trim().trim_start_matches('{').trim_end_matches('}').to_lowercase();
+    let guid_norm = guid
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .to_lowercase();
     let mut by_desc: Option<RegKey> = None;
     let mut by_desc_name: Option<String> = None;
 
@@ -881,7 +980,11 @@ fn find_nic_instance(guid: &str, ifname: &str) -> Result<RegKey, String> {
         };
         let instance_id: Option<String> = inst.get_value(REG_NETCFG_INSTANCE_ID).ok();
         if let Some(id) = instance_id {
-            let id_norm = id.trim().trim_start_matches('{').trim_end_matches('}').to_lowercase();
+            let id_norm = id
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .to_lowercase();
             if id_norm == guid_norm {
                 return Ok(inst);
             }
@@ -1108,7 +1211,10 @@ mod tests {
         assert_eq!(entries[1].ip, "192.168.1.1");
         assert!(entries[1].template.is_none());
         assert_eq!(entries[2].ip, "8.8.8.8");
-        assert_eq!(entries[2].template.as_deref(), Some("https://dns.google/dns-query"));
+        assert_eq!(
+            entries[2].template.as_deref(),
+            Some("https://dns.google/dns-query")
+        );
     }
 
     #[test]
@@ -1170,7 +1276,10 @@ mod tests {
         let r = apply_network_config(&req);
         assert!(!r.all_ok);
         assert!(
-            r.steps.iter().any(|s| s.message.contains("无效的IPv4 地址") || s.message.contains("无效的 IPv4 地址")),
+            r.steps
+                .iter()
+                .any(|s| s.message.contains("无效的IPv4 地址")
+                    || s.message.contains("无效的 IPv4 地址")),
             "应包含 IP 校验失败: {:?}",
             r.steps
         );

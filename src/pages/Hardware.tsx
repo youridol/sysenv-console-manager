@@ -1,11 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  RefreshCw,
-  Loader2,
-  AlertTriangle,
-  Database,
-} from "lucide-react";
+import { RefreshCw, Loader2, AlertTriangle, Database } from "lucide-react";
 import { cn, withTimeout } from "../lib/utils";
 import { Card, CardContent } from "../components/ui/card";
 import { Skeleton } from "../components/ui/skeleton";
@@ -152,7 +147,7 @@ export default function Hardware() {
 
       {/* ── 磁盘加载状态（首次）：骨架卡片 ── */}
       {loading && !disks && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 @md/main:grid-cols-2 @4xl/main:grid-cols-3 gap-4">
           {[1, 2, 3, 4].map((i) => (
             <Skeleton key={i} className="h-44 rounded-md" />
           ))}
@@ -182,7 +177,7 @@ export default function Hardware() {
 
       {/* ── 磁盘卡片网格（每块物理磁盘一张；入场动画在父级统一编排，stagger 连续） ── */}
       {!loading && disks && disks.length > 0 && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 @md/main:grid-cols-2 @4xl/main:grid-cols-3 gap-4">
           {disks.map((disk, i) => (
             <div
               key={`disk-${disk.id}`}

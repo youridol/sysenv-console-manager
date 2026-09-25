@@ -1117,7 +1117,13 @@ fn wmi_build_from_storage(
     }
     Ok(Some(WmiFallbackData {
         health: WmiHealthInfo {
-            health_status: disk.HealthStatus.unwrap_or(5) as u8,
+            // 收敛到契约声明的取值域 {0,1,2,5}（ADR-0001 D11）：
+            // 原实现用 `as u8` 截断——宽度超出 u8 的值会被静默取模（300 as u8 == 44），
+            // 下发一个契约里不存在的枚举值。无法判定时归 Unknown(5)。
+            health_status: match disk.HealthStatus {
+                Some(v @ (0 | 1 | 2 | 5)) => v as u8,
+                _ => 5,
+            },
             temperature_c,
             power_on_hours,
             read_errors_total: read_errors,

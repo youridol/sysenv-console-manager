@@ -286,9 +286,9 @@ fn is_valid_ipv6(candidate: &str) -> bool {
     if candidate.len() < 2 || !candidate.contains(':') || candidate.contains('.') {
         return false;
     }
-    candidate.split(':').all(|seg| {
-        seg.is_empty() || (seg.len() <= 4 && seg.chars().all(|c| c.is_ascii_hexdigit()))
-    })
+    candidate
+        .split(':')
+        .all(|seg| seg.is_empty() || (seg.len() <= 4 && seg.chars().all(|c| c.is_ascii_hexdigit())))
 }
 
 // ============================================================================
@@ -327,15 +327,44 @@ fn http_get(url: &str) -> String {
     }
 }
 
+/// 从 JSON 文本中取出 `key` 对应的字符串值；缺失/类型不符/解析失败 → 空串。
+///
+/// 用 `serde_json` 而非手写扫描（ADR-0001 D11）：原实现按 `"key":"` 定位后找下一个
+/// `"`，遇到值内含转义引号（`\"`）会提前截断，得到被截断的城市名/时区。
+/// 项目本就依赖 `serde_json`，手写解析属重复实现成熟能力。
 fn json_val(json: &str, key: &str) -> String {
-    let pattern = format!("\"{}\":\"", key);
-    if let Some(start) = json.find(&pattern) {
-        let start = start + pattern.len();
-        if let Some(rest) = json.get(start..) {
-            if let Some(end) = rest.find('"') {
-                return rest[..end].to_string();
-            }
-        }
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get(key).and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_val;
+
+    #[test]
+    fn 取值_普通字段() {
+        let body = r#"{"query":"1.2.3.4","city":"Hangzhou","timezone":"Asia/Shanghai"}"#;
+        assert_eq!(json_val(body, "query"), "1.2.3.4");
+        assert_eq!(json_val(body, "city"), "Hangzhou");
+        assert_eq!(json_val(body, "timezone"), "Asia/Shanghai");
     }
-    String::new()
+
+    /// 回归：值内含转义引号时，旧的手写扫描会提前截断。
+    #[test]
+    fn 取值_值内含转义引号不截断() {
+        let body = r#"{"city":"He said \"hi\"","query":"9.9.9.9"}"#;
+        assert_eq!(json_val(body, "city"), "He said \"hi\"");
+    }
+
+    #[test]
+    fn 取值_缺失与非法输入() {
+        assert_eq!(json_val(r#"{"a":"1"}"#, "b"), "");
+        assert_eq!(json_val("not json at all", "a"), "");
+        assert_eq!(json_val("", "a"), "");
+        // 值不是字符串（数字/对象）时返回空串，不做类型强转
+        assert_eq!(json_val(r#"{"n":123}"#, "n"), "");
+        assert_eq!(json_val(r#"{"o":{"k":"v"}}"#, "o"), "");
+    }
 }

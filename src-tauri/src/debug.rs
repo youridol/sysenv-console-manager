@@ -43,7 +43,7 @@ fn log_buf() -> &'static Mutex<VecDeque<DebugEntry>> {
 
 /// 追加一条调试日志条目
 pub fn append(level: &str, module: &str, message: &str) {
-    // 统一落盘：所有级别写入 %APPDATA%\SECM\diag\debug.log（与前端调试面板一致），
+    // 统一落盘：所有级别写入运行目录 diag/debug.log（与前端调试面板一致），
     // 实现「所有前后端功能函数的 debug.log 统一出口」（temp_data 自带轮转）
     crate::temp_data::debug_file_log(level, module, message);
     let entry = DebugEntry {
@@ -53,37 +53,27 @@ pub fn append(level: &str, module: &str, message: &str) {
         message: message.to_string(),
         context: None,
     };
-    let mut buf = log_buf().lock().unwrap();
+    // 中毒恢复：见 log.rs 同名注释（ADR-0001 D16）。
+    let mut buf = log_buf().lock().unwrap_or_else(|p| p.into_inner());
     if buf.len() >= CAPACITY {
         buf.pop_front();
     }
     buf.push_back(entry);
 }
 
-/// 追加一条带上下文的调试日志条目
-pub fn append_ctx(level: &str, module: &str, message: &str, context: &str) {
-    let entry = DebugEntry {
-        timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
-        level: level.to_string(),
-        module: module.to_string(),
-        message: message.to_string(),
-        context: Some(context.to_string()),
-    };
-    let mut buf = log_buf().lock().unwrap();
-    if buf.len() >= CAPACITY {
-        buf.pop_front();
-    }
-    buf.push_back(entry);
-}
+// 此处曾有 `append_ctx`（带上下文的调试条目）与 `clear_log`（清空缓冲）：
+// 全局检索确认二者的调用点均为 0（含测试），ADR-0001 D13 已删除。
+// `append_ctx` 是 `DebugEntry.context` 的唯一写入者，删除后该字段恒为 None；
+// 字段本身保留在序列化契约中（前端调试面板按既有形状读取，缺字段会破坏兼容）。
 
 /// 获取全部缓冲条目（克隆）
 pub fn get_all() -> Vec<DebugEntry> {
-    log_buf().lock().unwrap().iter().cloned().collect()
-}
-
-/// 清空调试日志缓冲
-pub fn clear_log() {
-    log_buf().lock().unwrap().clear();
+    log_buf()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 // ============================================================================
@@ -122,7 +112,7 @@ macro_rules! debug_error {
 // log crate 桥接（统一 datasource crate 的 log::* 到 SECM debug 体系）
 // ============================================================================
 
-/// 全局 log::Log 实现：把 datasource crate（disk/cpu_freq/registry/service 等）
+/// 全局 log::Log 实现：把 datasource crate（disk/registry/service/netif 等）
 /// 的 log::info!/warn!/debug!/error! 转发到 SECM debug 缓冲 + debug.log 文件。
 ///
 /// 背景：datasource 是叶子 crate（禁止反向依赖 secm_lib），其 30 处 log::* 调用

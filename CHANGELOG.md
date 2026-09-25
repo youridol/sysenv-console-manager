@@ -1,3 +1,579 @@
+## [v2.1.0] - 2026-09-25
+
+> 硬件信息页加载提速 + 提权改为「零 UAC 自动优先，非管理员才申请一次授权」。
+> 同时修复「预热线程持状态锁导致首个采样请求排队」的初始化阻塞。
+
+### 新增（进入硬件信息页自动提权，不等待用户授权）
+
+**问题定位**：提权只有一个入口——用户点击授权卡上的「授权并启用」按钮
+（`Tier2PrivilegeCard`）。管理员环境与「曾授权一次」环境本可零 UAC 拿到 tier-2，
+却仍要等用户点击；用户观察到的是「硬件信息页的提权过慢」。
+
+**解决方案设计**：把提权拆成**两步**，自动路径与用户授权彻底分离。
+
+- sidecar 新增 `TryAutoElevate()` 与 `POST /api/v1/elevate/auto`：只走
+  「本进程已是管理员」与「已注册持久授权 `schtasks /Run`」两条零 UAC 路径，
+  **任何分支都不回退 `runas`**；两条都不可用时返回 `elevated:false` 表示需用户授权。
+- Rust 新增 `lhm::auto_elevate()` 与 Tauri 命令 `auto_elevate`（`log.rs` 登记为 `dashboard`）。
+  该入口**有界等待** sidecar 就绪（`LHM_AUTO_ELEVATE_AWAIT`=15s，每 100ms 重试且每轮重新取锁、
+  不持锁睡眠）：页面挂载时预热线程通常正在做同一次启动，若把 `ensure_running` 的
+  `Retryable` 当失败，冷启动的自动尝试几乎必然落空。HTTP 侧单独用
+  `LHM_AUTO_ELEVATE_TIMEOUT`=15s（不含 UAC 思考时间，与 `request_elevation` 的 90s 分离）。
+- 前端 `Dashboard` 挂载后自动调 `auto_elevate`：返回 `true` 则用户零操作，
+  返回 `false`（确认非管理员且从未授权）才调 `request_elevation` 申请**一次** UAC。
+  两条路径各只自动发起一次，用户取消后 sidecar 记忆该状态（`_elevationRefused`）不再重复弹窗。
+- sidecar `Main` 在**首次打开 LHM 硬件树之前**置位管理员直通：原实现把该判定放在
+  `AutoAuthorizeLoop` 里，而该线程要先等 tier-1 出数（最多 10s），导致管理员环境
+  首次开树 `tier2=False`、出数后再关树重开一次。现在首次开树即含 tier-2 组，
+  温度/功耗与 tier-1 同批出现；`AutoAuthorizeLoop` 也不再等 tier-1。
+
+**验证结果**：sidecar `dotnet test -c Release` → **264 passed; 0 failed**
+（新增 3 个 `TryAutoElevate` 用例，覆盖管理员直通 / 任务不存在 / 持久授权三条分支，
+并逐一断言 `runAsLaunches == 0`）；`npm run build`、`npm run lint` 退出 0；
+`bash scripts/test-lib.sh` → **249 passed; 0 failed**。
+
+### 修复（首个采样请求被 sidecar 启动握手阻塞）
+
+**问题定位**：`lhm_snapshot()` 用阻塞 `state().lock()`。预热线程 `warm_up()`
+在持锁状态下完成 sidecar spawn 与健康检查握手（`LHM_START_WAIT` 预算 5s），
+前端首个 `get_sensor_data` 若落在该窗口，就整段排在互斥量上——「预热」只是把等待
+从「请求内同步握手」换成了「请求等锁」，首帧依旧慢。
+
+**解决方案设计**：请求路径改 `try_lock`。取不到锁即刻返回「预热中」诊断
+（`(None, "lhm(预热中:sidecar 握手进行中，本周期跳过)")`），等待留在后台线程；`sensor.rs` 拿到 `snap=None`
+仍会输出 tier-1 字段（sysinfo CPU / `GlobalMemoryStatusEx` 内存，不依赖 sidecar），
+页面立即可渲染，下一轮轮询通常已能拿到真实快照。语义不放宽：本路径绝不用 0 或旧值冒充新采样。
+
+**验证结果**：`cargo test --test hardware_coldstart_latency` → **ok**，
+首帧 773ms、首份实质数据 4414ms；`cargo test --test lhm_prewarm` → **ok**，
+预热后单次请求 487ms（预算 1500ms）；`hardware_contract`（8 用例）与
+`lhm_selfheal`（1 用例）全绿。
+
+## [v2.0.2] - 2026-09-24
+
+> 依据全量全链路审查（ADR-0001）修复 2 项阻断、9 项严重与若干一般缺陷，并加固构建/发布/提交门禁。
+> 无破坏性接口变更；应用对外契约与数据格式不变。
+
+### 阻断
+
+#### 1. 网络诊断「停止」按钮永不生效（取消注册表无写入方）
+
+**问题定位**：`cancel::cancel_command` 只对**已存在**的键置位（`cancel.rs:30-35`），
+而唯一注册入口 `cancel_flag` 的生产调用点为 0——五条流式命令只做出口 `clear_cancel`，
+从不注册。于是 `is_cancelled` 的全部 11 个检查点恒为 false。
+
+**关键日志证据**：全局检索 `cancel_flag` 仅命中定义、re-export 与测试
+（`iperf3_live.rs:511` 是**测试自己**预先注册，恰好绕过了缺口）。
+
+**解决方案设计**：五条流式命令（ping/traceroute/nslookup/NAT/iperf3）在进入执行体前
+调用 `cancel::cancel_flag(&cmd_id)`，与出口 `clear_cancel` 严格配对（ADR-0001 D1）。
+
+**验证结果**：新增 `tests/stream_cancel_registration_contract.rs`（3 用例）锁定
+「入口注册、出口清理、注册早于清理」；变异测试确认三种破坏方式（删除注册、注册挪到清理后、
+用错标志变量）均被捕获。
+
+#### 2. 测试运行器在测试失败时仍以 0 退出（门禁形同虚设）
+
+**问题定位**：`scripts/test-lib.sh` 只有 `set -e`，`cargo test ... 2>&1 | tail -40` 的退出码
+取管道末命令 `tail` 的 0，任何测试失败都被吞掉。
+
+**关键日志证据**：用桩 cargo（正式运行阶段返回 101）复刻原写法，脚本退出码为 **0**；
+修复后同一探针退出码为 **101**，编译失败分支回显 cargo 原始错误。
+
+**解决方案设计**：`set -euo pipefail`；编译与测试输出分别落 `build/tmp/*.log`；
+测试阶段不经管道，直接运行**已注入 manifest 的测试二进制**（`cargo test` 会重编译并抹掉
+注入的 comctl32 v6 manifest，实测导致 0xc0000139 崩溃）；exe 定位改用 cargo JSON 的
+`executable` 字段；`mt.exe` 同时探测 Git Bash 与 WSL 挂载点（ADR-0001 D2）。
+
+**验证结果**：三态探针（测试失败 101 / 编译失败 101 / 测试通过 0）全部符合预期；
+真实仓库运行 `240 → 249 passed; 0 failed`。
+
+### 严重
+
+#### 3. sidecar tier-2 跨线程共享可变状态
+
+**问题定位**：`GET /api/v1/tier2` 由 HTTP 线程直接调用 `BuildLocalTier2Payload()`，
+而采集线程每轮也在调用它。`ReadTier2()` 全程无锁却要读 `_computer`，采集线程的 `Close()`
+会在持锁时把它置 null；`DiskManager._lastValidMap` 是无锁 `Dictionary`，同一调用内既读又写。
+
+**解决方案设计**：改为单写者模型——采集线程把负载作为不可变值发布到 `_tier2Snapshot`
+（`PublishTier2Snapshot`），HTTP 线程只 `ReadTier2Snapshot()` 读引用后序列化（ADR-0001 D3）。
+代价是 HTTP 最多滞后一轮采集，而采集周期本身即数据新鲜度上限。
+
+**验证结果**：新增 `Tier2SnapshotTests`（3 用例）断言访问器有锁保护、与整份快照同批发布、
+并断言生产代码中 `BuildLocalTier2Payload()` 只出现「定义 + 采集分支」两处（HTTP 分支不得调用）；
+变异测试确认把 HTTP 分支改回现场采集即被捕获。sidecar `261 passed; 0 failed`。
+
+#### 4. 外部 HTTP 白名单可被前缀绕过
+
+**问题定位**：`datasource/src/http.rs` 用 `url.starts_with(allowed)` 校验，
+以下四类输入全部通过并会真正发起请求：主机后缀伪装（`api64.ipify.org.evil.com`）、
+userinfo 伪装（`api64.ipify.org:8080@evil.com`）、端口伪装、路径穿越（`/json/../evil`）。
+
+**解决方案设计**：白名单改为 `(scheme, host, port)` 三元组 + 路径前缀，解析 URL 后逐项全等
+比较并拒绝 userinfo（ADR-0001 D4）。函数签名与错误类型不变。
+
+**验证结果**：新增 3 个测试（10 条绕过输入 + 路径前缀结构性 + `split_url` 畸形输入），
+datasource `50 passed; 0 failed`。当前调用点均为字面量，属恢复约束强度而非修复在利用漏洞。
+
+#### 5. 三处字节切片/越界索引可 panic
+
+**问题定位**：`sysinfo.rs` 按字节切 `ImageStateDate`（`len()>=8` 后 `&s[0..4]`，非 ASCII 首字节
+即 panic）；`network.rs` 在长度校验**之前**取 `inner[0]`（空切片 panic）；`settings.rs` 的
+`guid[..8]` 在子键名短于 8 字节或含多字节字符时越界。
+
+**解决方案设计**：统一「先证明，再访问」——字符边界安全截断、索引前判空、`get(..8)` 加回退
+（ADR-0001 D5）。日期解析抽为纯函数以便单测。
+
+**验证结果**：新增 7 个用例（多字节前导、空内嵌载荷、短/多字节 GUID、正常路径不回归）；
+`sysinfo 2 + network 3 + settings 2` 全部通过。
+
+#### 6. MAC 修改失败路径丢失回滚信息
+
+**问题定位**：`set_network_mac` 写入注册表后禁用/启用网卡失败，错误消息不含原 MAC，
+与函数头注释「失败时原值已备份于返回消息」不符；启用失败还会让网卡停在**禁用**状态。
+
+**解决方案设计**：两条失败消息均拼接原值回滚提示，并在启用失败时显式说明「网卡当前处于
+禁用状态，网络会中断」（ADR-0001 D6）。
+
+#### 7. 前端传感器轮询在挂起时累积并发请求
+
+**问题定位**：`withTimeout` 只让定时器 reject、**无法取消底层 invoke**，而 `finally` 立即把
+`inFlight` 置回 false，超时后 1s 即再发新请求，pending 数线性累积。
+
+**解决方案设计**：改为 settle-then-schedule（本轮真实回调结束后才排下一次）；
+`NetIfaceContext` 的网卡轮询补 in-flight 守卫（ADR-0001 D7）。
+
+**验证结果**：`npm run build` 通过（tsc + vite）。
+
+#### 8. 发布与提交门禁加固
+
+**问题定位**：`.husky/pre-commit` 缺失（husky 垫片 `[ ! -f "$s" ] && exit 0` 直接放行，
+`git hook run pre-commit` 实测退出 0 且无输出，lint-staged 从未执行）；`package-portable.mjs`
+只判 `resources/driver` 目录存在（stage-driver 失败会留下空目录，导致便携包静默缺失 ring0 驱动）；
+`SHA256SUMS` 注释声称 zip 内有逐文件哈希（实际没有）；`.gitignore` 未覆盖嵌套 `bin/obj`
+（实测 131 条未跟踪 DLL）；`stage-iperf3` 提示的 `--pin` 不存在。
+
+**解决方案设计**：补齐 `.husky/pre-commit`；驱动按 `FILES` 逐项校验；纠正失实注释；
+`.gitignore` 改 `sidecar-lhm/**/bin/`、`obj/`；把 `--pin` 提示改为可实际执行的生成方式（ADR-0001 D8）。
+
+**验证结果**：`git hook run pre-commit` 现执行 lint-staged；`git check-ignore` 确认嵌套产物被忽略；
+驱动逐项校验在空目录下报出三项缺失；`node --check` 与 `audit:drivers` 均通过。
+
+### 一般
+
+- **日志 scope 唯一真源**：删除 `src/lib/logs.ts` 中零调用的 `MODULE_TO_SCOPE`/`normalizeModule`/`scopeForModule`，
+  真源收敛到后端 `log.rs::scope_for_module`；`cleanup_action_log_contract` 相应改为断言真正生效的解析函数（D10）。
+- **前端错误不再静默**：`Settings` 读取失败改为可见横幅 + 一键重试，且 `null` 状态不再渲染成「关闭」；
+  `Cleanup` 进程列表失败与「无进程」空态区分显示（D9）。
+- **定时器与监听器生命周期**：`LogsCard` 的 `log-event` 订阅改用 `disposed` 标记（与 `WindowControls` 一致），
+  `Cleanup` 的高亮复位定时器在卸载时统一清理（D12）。
+- **契约收窄**：`diskSmart.ts` 的四态契约收敛为生产端实际产出的两态；`disk.rs` 的 `health_status`
+  不再用 `as u8` 截断（越界归 Unknown(5)）；ping 的 TTL 参数由静默丢弃改为真正写入 socket；
+  `ip_info` 手写 JSON 扫描改用 `serde_json`（值内转义引号不再截断）；删除顺序相反且无消费者的
+  `lhm::tier2_state`（D11）。
+- **死代码清理**：删除 Rust 侧 `append_ctx`/`clear_log`/`diag_dir_size`/`interval_count`/
+  `parse_version_number`/`driver_uninstall`；前端 10 个无导入者 UI 组件；sidecar 的
+  `UpdateAll`/`UpdateVisitor`/`PerfCounters`/`LastNetworkRate`/`_perfReady`（D13）。
+  **例外**：`NetworkManager.SelectBestNetworkHardware` 未删除——CONTRACT-v3.md §8 要求完整移植并驱动，
+  改为在开树后正确接线（此前从未选定目标硬件，导致整条吞吐链路空转）。
+- **重复代码合并**：GBK/UTF-8 解码统一到 `proc_util::decode_ps`；提权检测统一到
+  `driver_install::is_elevated`；`withTimeout`/`oneLine` 前端副本删除改用共享实现（D14）。
+- **依赖清理**：移除 `cmdk`/`embla-carousel-react`/`next-themes`/`sonner`/`@eslint/compat`，
+  `About` 的许可清单同步移除（D15）。
+- **可观测性**：`log.rs`/`debug.rs`/`iperf.rs` 的 Mutex 全部改用中毒恢复写法，
+  与 `lhm.rs`/`net_stats.rs`/`sensor.rs` 的既有约定一致（D16）。
+- **注释与实现一致性**：按实测更正 `fix-deliverable-integrity.mjs` 关于 `icacls /T` 的注释
+  （复测显示 `/T` **会**改写已存在文件的标签，与原文及 v2.0.1 第 5 条结论相反；逐文件循环保留，
+  但其作用是把继承 ACE 换成显式 ACE）。
+
+### 验证命令与结果
+
+```
+npm run build                                 # 通过（tsc -b + vite build）
+npm run lint                                  # 0 error（11 warning，均为既有风格提示）
+cd datasource && cargo check --all-targets    # 通过
+cd datasource && cargo test                   # 50 passed; 0 failed; 1 ignored
+cd src-tauri && cargo check --all-targets     # 通过
+bash scripts/test-lib.sh                      # 249 passed; 0 failed; 6 ignored（退出码 0）
+cargo test --test <16 个集成目标>              # 135 passed; 0 failed
+dotnet test sidecar-lhm/tests/LhmSidecar.Tests # 261 passed; 0 failed
+node scripts/audit-driver-signatures.mjs      # OK=2 WARN=0 FAIL=0
+```
+
+### 决策记录
+
+本次全部修复的决策、理由与被否决方案见 `docs/adr/ADR-0001-审查缺陷修复基线.md`；
+任务分解与验收判据见 `docs/plans/2026-09-24-ADR-0001-执行计划.md`。
+
+---
+## [v2.0.1] - 2026-09-24
+
+> 修复本地构建产出的安装包无法运行的问题（PATCH：打包流程修复，不改动应用功能）。
+
+### 修复（安装包报 `Error writing temporary file`）
+
+#### [问题定位]
+
+本地构建的 `SysEnv Console Manager_2.0.0_x64-setup.exe` 双击后弹出：
+
+```
+NSIS Error
+Error writing temporary file. Make sure your temp folder is valid.
+```
+
+**根因不在安装包内容，而在交付文件携带的 NTFS 完整性标签**。本仓库工作区目录带
+`Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)` 标签（`icacls` 实测），该标签会被目录内
+新建文件继承。Windows 创建进程时，若可执行文件带完整性标签，**该标签决定新进程的完整性
+级别**，于是安装程序以低完整性（Low）运行；而 NSIS 自解压安装程序必须在系统 `%TEMP%`
+（中完整性对象）下释放 `$PLUGINSDIR`，低完整性进程受「禁止向上写入（no-write-up）」约束，
+写入被拒绝，安装程序随即弹出上述错误并退出。
+
+用户从网络下载的正式发行包不受影响——浏览器下载会重建文件，不保留本地标签；只有在本仓库
+内就地构建、并用资源管理器直接双击时才会触发。
+
+#### [关键日志证据]
+
+1. **报错逐字复现**：启动归档内安装包，窗口标题为 `NSIS Error`，文案与用户报告完全一致
+   （`cua-driver` 读取窗口文本：`Error writing temporary file. Make sure your temp folder is valid.`）。
+2. **对照实验（决定性）**：同一安装包复制到 `%TEMP%`（复制后 `icacls` 无 `Mandatory` 行，
+   即不带标签）再启动，**正常显示安装界面**（窗口标题 `SysEnv Console Manager 安装`），
+   并在 `%TEMP%` 成功释放 `ns*.tmp` 插件目录；从归档目录（带 Low 标签）启动则必然报错。
+3. **完整性继承方向验证**：同一个 `whoami.exe`，复制到本仓库目录后自报
+   `Mandatory Label\Low Mandatory Level S-1-16-4096`，复制到 `%TEMP%` 后自报
+   `Mandatory Label\High Mandatory Level S-1-16-12288`。即起始进程为 High，
+   仍被文件的 Low 标签降级。
+4. **目录标签不覆盖文件标签**：把 `whoami.exe` 复制进带 Low 标签的目录、再对其
+   单独 `icacls /setintegritylevel Medium`，子进程为 `Medium Mandatory Level S-1-16-8192`，
+   证明以**文件**标签为准。
+5. **`/T` 不会改写已存在文件的标签**：对含 `a.exe`/`b.exe` 的目录执行
+   `icacls <目录> /setintegritylevel "(OI)(CI)Medium" /T`，目录变为
+   `Medium Mandatory Level:(OI)(CI)(NW)`，而两个 exe **仍为 Low**——该参数只对之后新建的
+   文件生效。构建产物全部是"已存在文件"，故必须逐个文件显式设置。
+6. **文件上不能用继承语法**：对文件执行 `icacls <文件> /setintegritylevel "(OI)(CI)Medium"`
+   时 icacls 仍打印 `Successfully processed 1 files`，但标签**保持不变**（仍为 Low）；
+   改用不带继承标志的 `Medium` 才生效。据此脚本改为按类型分派语法，并在修复后回读标签校验，
+   不以退出码判定成功。
+
+#### [解决方案设计]
+
+新增 `scripts/fix-deliverable-integrity.mjs`，在打包流程中把**交付物**的完整性标签规范化为
+Medium：
+
+- 目录设 `(OI)(CI)Medium`（覆盖将来新建文件），并**逐个遍历已存在文件**设 `Medium`
+  （`/T` 不改写已存在文件，故不能只依赖它）；按目录/文件分派语法（文件上 `(OI)(CI)` 被
+  静默忽略）。
+- 修复后**回读每个 exe/dll 的标签**，凡仍为 `Low` 即判定失败并以退出码 1 终止，避免
+  "icacls 报成功但实际未生效"被当成已修复。
+- 覆盖全部三条用户可获取交付物的路径：`dist_releases/v<版本>/`、
+  `src-tauri/target/release/bundle/nsis/`、`src-tauri/target/release/*.exe`。
+- 只改 NTFS 安全描述符中的完整性 ACE，**不触碰文件数据**：实测同一文件改标签前后
+  SHA256 完全一致（`23240EF9...56CD3`），故 `SHA256SUMS.txt` 无需因该步骤重算。
+- **不修改工作区目录自身的 ACL 或标签**（那属于放宽环境权限，且仓库仍会继续产出带标签的
+  新文件），只处理最终交付物。
+
+`scripts/package-portable.mjs` 末尾自动调用该脚本，使任何一次 `npm run package:portable`
+都会产出可正常运行的安装包；另注册为独立命令 `npm run fix:integrity` 以便单独执行与核查。
+
+#### [验证结果]
+
+- `node scripts/fix-deliverable-integrity.mjs dist_releases/v2.0.0`：逐个处理 **312 个文件**，
+  回读校验通过，退出 0。
+- 修复后实测 v2.0.0 归档三个顶层交付物标签均为 `Mandatory Label\Medium Mandatory Level:(NW)`，
+  归档内 `resources/**` 已无任何带 Low 标签的 exe/dll。
+- 负向测试：向归档内放入一个带 Low 标签的 `_probe.dll`，脚本**成功检出并以退出码 1 失败**
+  （输出该文件路径与标签），证明校验逻辑有效；该设计在加固前确实捕获到
+  `sysenv-console-manager_v2.0.0.exe` 与 `_probe.dll` 两个未被修复的遗漏。
+- 应用功能未改动，`tsc --noEmit`、`npm run lint`、`cargo check --lib --tests` 均无新增问题。
+
+## [v2.0.0] - 2026-09-23
+
+> 严格模式全链路审计后的破坏性版本。包含对外 IPC 命令删除、插件与权限面收缩、
+> 以及**用户可见的数据落点变更**（运行数据从 `%APPDATA%\SECM` 迁到运行目录）。
+
+### 变更（运行数据落点迁移，破坏性）
+
+#### [问题定位]
+
+程序自身产生的用户日志、诊断日志、驱动日志、图表历史与 sidecar 输出原先分别写入
+`%APPDATA%\SECM\{logs,diag}` 与 `%TEMP%`，违反项目目录模型（程序运行数据应落在运行目录）。
+两个可直接复现的后果：
+
+1. **受限完整性环境下写入失败**。`icacls` 实测本仓库工作区目录及其全部子目录带
+   `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)` 标签，从该目录启动的进程即低完整性
+   进程，实测无法在 `%TEMP%` 建目录，也无法向 `%APPDATA%\SECM\logs` 追加。
+2. **变量缺失时落到当前工作目录**。原代码用 `std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string())`，
+   `APPDATA` 不可得时把运行数据写到进程当前目录，实测在源码树内产生了未跟踪的
+   `src-tauri/SECM/{diag,logs}`（5 个文件）。
+
+#### [关键日志证据]
+
+同一测试二进制、同一环境的对照结果（决定性实验）：
+
+| 运行方式 | 环境变量 | 结果 |
+| --- | --- | --- |
+| 测试 exe 在项目目录内运行 | 默认 `TEMP`/`APPDATA` | `cleanup` 2 例 + `log` 2 例**全部失败** |
+| 同一 exe 复制到 `%TEMP%`（无低完整性标签）后运行 | 默认 `TEMP`/`APPDATA` | **通过** |
+| 测试 exe 在项目目录内运行 | `TEMP`/`TMP`/`APPDATA` 指向项目内目录 | **4 例全部通过** |
+
+失败形态：
+
+- `cleanup.rs:1101` / `cleanup.rs:1128`：`create test dir: Os { code: 5, kind: PermissionDenied, message: "拒绝访问。" }`
+- `log.rs:652` / `log.rs:818`：断言找不到刚落盘的标记行（写入静默失败）
+
+残留证据：`%TEMP%` 下 2352 个 `secm-*` 历史测试目录；`src-tauri/SECM/` 未跟踪运行数据；
+`%APPDATA%\SECM` 34.45 MB。
+
+#### [解决方案设计]
+
+新增 `src-tauri/src/runtime_paths.rs` 作为运行目录**唯一真源**，解析优先级：
+`SECM_RUNTIME_DIR`（绝对路径注入）→ debug 构建 `<项目根>/build/runtime` →
+release 构建 `<exe 同级>/runtime`（先做创建+写入探测）→ 回退 `%APPDATA%\SECM`。
+全部写入点改为经该模块取路径：`log.rs::get_log_dir`、`temp_data.rs::get_diag_dir`、
+`driver_install::driver_log_path`、`lhm::spawn_sidecar` 的 sidecar 日志，并删除
+`unwrap_or(".")` 形式的静默回退。首次以新布局启动时一次性**复制**（不移动、不删除源）
+历史 `%APPDATA%\SECM\{logs,diag}` 到运行目录，完成后写 `state/migrated-from-appdata.marker`；
+已存在的目标文件不覆盖，单项失败仅告警不阻断启动（日志为辅助数据，不作数据链路单点）。
+
+### 修复（集成测试 4 个文件失败）
+
+- **症状**：`src-tauri/tests/` 下 4 个文件在初始全量运行中失败，共 15 个用例：
+  `hardware_contract` 8 例全失败、`cleanup_temp_files_latency` 2 例、`iperf3_live` 5 例、
+  `datasource_native` 1 例。
+- **根因结论**：四个文件与失败用例均**未被本轮改动触及**（`git diff HEAD` 为空），
+  失败源于同一环境属性——工作区目录带 `Mandatory Label\Low Mandatory Level` 标签，
+  测试进程为低完整性进程：
+
+  1. `hardware_contract` / `cleanup_temp_files_latency`：夹具用 `std::env::temp_dir()`，
+     在系统 `%TEMP%` 下建目录被拒（OS 错误 5）。
+  2. `iperf3_live`：iperf3 能绑定监听，但客户端建数据流被拒
+     （`unable to create a new stream: Permission denied`）。
+  3. `datasource_native`：`PowerSetActiveScheme` 返回错误码 5（既有环境限制，v1.21.2 已记录）。
+- **关键日志证据**：同一 `iperf3.exe` 复制到无低完整性标签的目录后，TCP 测试**完全正常**
+  （实测 4.02 Gbit/s、`iperf Done`），从本仓库目录运行则报 `Permission denied`；
+  `cleanup_temp_files_latency` 报 `create bucket: Os { code: 5, kind: PermissionDenied }`。
+- **修复内容**（不放宽断言、不放宽权限）：
+  - 新增 `src-tauri/tests/common/mod.rs`，提供 `fixture_dir()`，夹具根目录改到项目内
+    `build/tmp/fixtures/`；`hardware_contract`、`cleanup_temp_files_latency` 的 3 处
+    `std::env::temp_dir()` 夹具改用该模块。
+  - `iperf3_live` 新增 `tcp_stream_unavailable()` 环境自检：**仅在明确观测到**
+    `unable to create a new stream: Permission denied` 时打印原因并跳过（沿用该文件既有的
+    「缺素材时显式跳过而非失败」约定），其它失败照旧失败。注意实现细节：自检服务端
+    **不能加 `-1`**，否则就绪探测会把唯一连接消耗掉、使真实客户端只看到 Connection refused。
+  - `datasource_native` 的 `power_scheme_roundtrip_idempotent` 仅在错误为**明确的权限拒绝**
+    时跳过，并用 `assert!` 排除其它原因（非权限错误仍失败）。
+
+### 修复（`npm run build` 无法完成）
+
+- **症状**：`npm run build` 退出 1，报
+  `[vite:esbuild-transpile] remove C:\Users\...\Temp\esbuild-<hash>: Access is denied.`
+- **根因结论**：与上文单元测试失败同源。esbuild（Vite 用它转译 `vite.config.ts` 与各模块）
+  在系统 `%TEMP%` 下创建临时文件后尝试删除，受限完整性下该删除被拒绝。`os.tmpdir()`
+  在 Windows 上读取 `TEMP`/`TMP`，属官方可配置机制。
+- **关键日志证据**：同一命令重定向 `TEMP`/`TMP` 到项目内 `build/tmp/` 后退出 0 且构建产物一致；
+  不经包装脚本直接用 `npx vite build` 亦复现同样错误，证明非本项目源码问题。
+- **修复内容**：新增 `scripts/run-with-project-tmp.mjs`，在启动前端构建工具前把
+  `TEMP`/`TMP` 指向 `<项目根>/build/tmp/tool-temp`（必须早于 `vite.config.ts` 被转译，
+  故用包装脚本而非在配置内设置环境变量）；`package.json` 的 `dev` / `build` / `preview`
+  改为经该脚本执行。不放宽任何系统权限。
+
+### 修复（单元测试 4 例恒失败，测试结论不可用）
+
+- **症状**：`cleanup::tests::test_clean_directory_deletes_files`、`test_clean_directory_counts_only_deleted`、
+  `log::tests::test_file_log_line_includes_scope`、`test_append_frontend_entry_lands_in_user_buffer_with_scope`
+  在本机稳定失败，`cargo test --lib` 结果为 231 通过 / 4 失败。
+- **根因结论**：失败源于运行数据落点越界（见上节决定性实验），非被测代码缺陷。
+- **修复内容**：`scripts/test-lib.sh` 在运行测试前把 `TEMP`/`TMP`/`APPDATA`/`SECM_RUNTIME_DIR`
+  统一指向 `<项目根>/build/tmp/`，使测试数据不越界且可随 `build/` 整体清理；同时把
+  `mt.exe`（comctl32 v6 manifest 注入）缺失从「警告后继续」改为**明确错误退出**，
+  并新增 `REQUIRE_MANIFEST=1` 门禁供干净环境使用。
+
+### 变更（对外接口收缩，破坏性）
+
+- **删除 3 条无调用方的 Tauri 命令**：`driver_uninstall`（v3 后仅清状态缓存，无实际卸载行为）、
+  `get_services`（16 项预设服务查询，已被 `list_all_services` 全量枚举取代）、`get_debug_logs`。
+  经全仓（前端 `invoke` 字面量、动态调用点、`scripts/`、`src-tauri/tests/`、文档）核对确认零调用方。
+  底层函数 `settings::get_services` / `debug::get_all` **保留**：前者被 P11 服务契约测试与
+  `ds_adapter_integration` 使用，后者被 `dhcp_probe_live` 使用，删除会损失数据源覆盖。
+  命令注册数 79 → 77（删除 3 条、新增 `get_runtime_paths` 1 条）。
+- **同步 `log.rs` 命令 scope 双向一致表**：删除 `get_services` 在 `scope_for_command` 匹配臂与
+  `EMITTED_COMMAND_SCOPES` 中的登记（该表受既有一致性测试约束，漏改会导致测试失败）。
+- **新增 `get_runtime_paths` 命令**：返回 `RuntimePathsInfo`（root/logs/diag/sidecar_log），
+  供前端展示真实路径，替代界面中硬编码的 `%TEMP%\secm-lhm-sidecar.log`。
+
+### 变更（插件与权限面收缩）
+
+- 移除 `tauri-plugin-store` 与 `tauri-plugin-shell`：二者在 Rust 与前端均无调用，
+  此前已在 `lib.rs` 注册并在 `capabilities/default.json` 授予 `store:default`、`shell:default`，
+  属超出实际使用的最小权限偏差。同步清理 `Cargo.toml`、`Cargo.lock`、`package.json`、
+  `package-lock.json`，并从 `capabilities/default.json` 移除两项权限（保留被 `LogsCard`
+  实际使用的 `dialog:*` 与 `fs:default`）。应用内「关于 → 第三方许可」文案同步更新。
+
+### 修复（ESLint 配置无任何规则）
+
+- **症状**：`eslint.config.js` 只含 `ignores`，无任何规则，`npm run lint` 退出 0 但不具备检查能力。
+- **修复内容**：补齐 `js.configs.recommended`、`tseslint.configs.recommended`、React 经典
+  Hooks 规则（`rules-of-hooks` error、`exhaustive-deps` warn）与 `react-refresh`，
+  并为前端（browser）与脚本（node）分别声明全局量。不启用该插件 7.x `recommended` 中的
+  React Compiler 专用规则（`set-state-in-effect` 等），理由与边界写在配置注释中。
+- **顺带修复的既有问题**：`scripts/audit-driver-signatures.mjs` 20 处与 `scripts/package-portable.mjs`
+  4 处多余转义（`\'`）；`src/components/ui/carousel.tsx` 的 `any` 改为 embla 官方类型 `CarouselApi`；
+  清理 4 处指向未启用规则的过期 `eslint-disable` 指令。修复后 `npm run lint` 退出 0，
+  0 错误、10 警告（fast-refresh 惯例提示与 2 处缺失依赖）。
+- **回归验证**：修复转义后 `node scripts/audit-driver-signatures.mjs` 输出与修复前一致
+  （`OK=2 WARN=0 FAIL=0`），证明行为不变。
+
+### 修复（文档与仓库卫生）
+
+- **README 漂移 5 处**：命令数 70 → 77；页面数 8 → 9；删除已移除的 `/logs` 独立页面行
+  （改为右侧日志栏说明）；删除已不存在的 `hardware.rs` 行；`hooks/` 补 `useIperf3`、`use-mobile`；
+  「数据与日志存储」整节改为运行目录相对路径，并补运行目录解析表与 WebView2 UDF 说明；
+  故障排查表中的路径同步更新；集成测试命令改为 `scripts/test-lib.sh` 与逐文件写法。
+- **`.gitignore` 未忽略 `build/` 与 `tmp/`**：以 `git add -n` 与 `git status --porcelain --ignored`
+  为准（两者此前均显示未忽略），新增 `build/`、`tmp/`、`src-tauri/SECM/` 三条。
+  修复后 `git status --ignored build tmp` 输出 `!! build/`、`!! tmp/`。
+- **源码中指向不存在文档的引用**：清理 `ds_util.rs`、`commands.rs`、`driver_install/pawnio.rs`、
+  `lhm.rs`、`datasource/src/lib.rs` 中对 `docs/designs/*.md`（该目录不存在）的引用。
+- **新增项目根 `AGENTS.md`**：按全局规则以实际仓库为依据编写，覆盖项目概述、构建命令、
+  发布版本规范、代码风格、安全注意、测试要求、目录说明与常见任务。
+
+### 新增（运行目录与安全约束的契约测试）
+
+- `runtime_paths` 模块内置 5 个单测：运行根目录必须为绝对路径、各子目录必须位于运行根之下、
+  sidecar 日志不得落在系统临时目录、项目根可从测试二进制上溯定位、绝对路径判定。
+
+### 验证结果
+
+- `npx tsc --noEmit` 退出 0
+- `npm run build` 退出 0（tsc -b + vite build，经 `run-with-project-tmp.mjs` 隔离工具临时目录）
+- `npm run lint` 退出 0（0 错误 / 10 警告）
+- `cd src-tauri && cargo check --lib --tests` 退出 0 且零警告
+- `bash scripts/test-lib.sh`：**240 通过、0 失败、6 忽略**（修复前 231 通过、4 失败）
+- `src-tauri/tests/` 全部 **18 个文件逐个执行，0 失败**（146 个用例通过）：
+  `cleanup_action_log_contract` 4、`cleanup_temp_files_latency` 3、`cpu_first_sample_artifact` 1、
+  `datasource_native` 12、`dhcp_probe_contract` 7、`dhcp_probe_live` 2、`dhcp_residue_contract` 9、
+  `ds_adapter_integration` 13、`ds_regression_edge` 12、`hardware_coldstart_latency` 1、
+  `hardware_contract` 8、`iperf3_contract` 47、`iperf3_live` 10、`lhm_prewarm` 1、`lhm_selfheal` 1、
+  `network_probe_contract` 5、`probe_url_live` 4、`startup_guard_contract` 6
+  （修复前 4 个文件失败；`iperf3_live` 与 `datasource_native` 各 1 例在受限环境下按上文
+  显式跳过并打印原因）
+- `cd datasource && cargo check --all-targets` 退出 0 且零警告；`cargo test`：**47 通过、
+  0 失败、1 忽略**（`real_machine_delete_scheme`）——`power::tests::test_set_active_scheme_noop`
+  与集成测试侧的 `power_scheme_roundtrip_idempotent` 同源，均按上文「仅对明确的权限拒绝跳过」
+  处理（修复前 46 通过、1 失败）
+- `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release`：**258 通过、0 失败**
+- `node scripts/audit-driver-signatures.mjs`：`OK=2 WARN=0 FAIL=0`，全部通过
+- `node scripts/audit/licenses-npm.mjs --copyleft`：389 个包，13 项传递依赖为
+  CC-BY-4.0 / MPL-2.0（需署名，非传染），退出 0
+- `node scripts/audit/licenses-cargo.mjs --copyleft`：537 个 crate，15 项传递依赖为
+  Unlicense/MIT、MPL-2.0、CC0 等宽松或弱传染许可，退出 0
+- 五处版本一致：`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` /
+  `src-tauri/Cargo.lock` / `README.md` 徽章 均为 `2.0.0`
+
+## [v1.21.2] - 2026-09-23
+### 修复（托盘图标丢失）
+- **症状**：通知区域看不到托盘图标，关闭主窗口后无法从托盘恢复
+- **复现结论**：在 High 完整性环境下**未能复现**该症状。取 `dist_releases/v1.21.1/sysenv-console-manager_v1.21.1.exe` 复制到无低完整性标签的目录运行，`Shell_NotifyIconGetRect` 能查到图标矩形（`命中=1 uid=2@1898,1392`），重启 explorer 触发任务栏重建后图标自动补登记，主窗口关闭后图标仍在。此前把工作区目录中复现到的注册失败当作产品缺陷，实际成因是该目录带 `Low Mandatory Level` 标签，进程以低完整性运行，而低完整性进程无法向高完整性的 explorer 注册托盘图标（`NIM_ADD` 返回 FALSE，`GetLastError` 为 5 拒绝访问）
+- **关键日志证据**：同一份探针源码在带低完整性标签的目录运行时 `NIM_ADD = 0 lastError = 5`、`Shell_NotifyIconGetRect` 命中 0 次；复制到无该标签的目录后 `NIM_ADD = 1 lastError = 0`、命中 1 次。`tray-icon` 的 Windows 后端在 `register_tray_icon` 中丢弃了 `Shell_NotifyIcon` 的返回值（源码注释写明「Explorer/taskbar may not be ready yet」），因此注册失败不会反映到 `TrayIconBuilder::build` 的返回值上
+- **修复内容（登记结果校验）**：`src-tauri/src/tray.rs` 新增 `verify_registered`，在 `build` 之后用 `TrayIcon::rect()`（Windows 实现走 `Shell_NotifyIconGetRect`）确认图标是否真的登记进外壳，未登记时以 `set_visible(false)` + `set_visible(true)` 触发重新登记并重试 10 次、间隔 200ms。这样「窗口建好但图标没进通知区域」不再只留下一句 `System tray initialized`。校验失败**不返回 `Err`**：返回错误会让 `TrayIcon` 被丢弃，而它的 `Drop` 会注销图标，反而放弃 `tray-icon` 内建的任务栏重建补登记路径；因此只记录 `debug_error!` 并保留托盘对象
+- **修复内容（依赖升级）**：`src-tauri/Cargo.lock` 把 `tray-icon` 从 `0.24.1` 提升到 `0.24.2`（仍满足 `tauri 2.11.5` 的 `version = "0.24"` 约束，API 未变）。该版本补齐了 `register_tray_icon`、`remove_tray_icon`、`set_icon`、`set_tooltip` 四处 `NOTIFYICONDATAW` 的 `cbSize` 字段，0.24.1 在这四处均以 `..std::mem::zeroed()` 构造结构体而未写入 `cbSize`。本机实测两个版本都能成功注册，因此该升级属于补全库内已修复的字段缺陷，不作为本机症状的成因结论
+
+### 修复（硬件信息页无法获取传感器数据）
+- **症状**：诊断串长期为 `温度源: none | 功耗源: none | 频率源: none`，`temp=n/a pwr=n/a mb=n/a`，`diag` 显示 `sidecar 启动中（退避期内）`，此后变为 `sidecar 服务不可达已超过重启上限（N 次），降级` 并整场会话不再恢复（src-tauri/src/lhm.rs）
+- **根因结论**：sidecar 生命周期状态机存在两处**不可自愈**缺陷。其一，`lhm_snapshot` 在连续 3 次轮询失败后置 `degraded = true`，此后一进入就直接返回「已降级」，本会话内再无任何探测或重启机会；其二，`ensure_running` 的 E 分支用 `restarts > LHM_MAX_RESTARTS`（1）判定超限后只返回可重试错误，既不置降级也不清零计数，且 `restarts` 只增不减——第一次重启失败之后本会话内再也不会重启 sidecar。两者叠加，使一次短暂的连接拒绝演变为整场会话硬件信息页无数据，并连带使 `request_elevation` 失败
+- **关键日志证据**：`%APPDATA%\SECM\logs\2026-09-22.log` 中 13:44:13 出现一次 `轮询失败(1/3) ... os error 10061`，13:44:14 起连续 `sidecar 启动中（退避期内）`，13:44:17 起 `sidecar 服务不可达已超过重启上限（2 次），降级`，其后计数一路增长到「（13 次）」；同期 `%APPDATA%\SECM\diag\debug.log` 记录 `sidecar 服务不可达，自动重启（第 1 次）`。同一 sidecar 二进制手工启动后 `/health` 与 `/api/v1/snapshot` 均正常（`tier2_available=true`），证明故障在 SECM 侧的状态机
+- **修复内容**：新增 `LHM_RECOVERY_COOLDOWN`（60 秒）自愈冷却与纯函数 `cooldown_remaining`、`clear_degraded_for_retry`。降级态与「重启预算耗尽」不再视为会话终态：冷却期内按剩余时间给出可操作诊断且不重复累加预算，冷却期满后清零降级标记、重启预算与失败计数并重新走完整启动/探测路径；端口已有服务时直接恢复而不新起进程
+- **修复内容（预算计量）**：服务被证实可用时（`fetch_sensors` 成功、端口探测成功）清零 `restarts`，使重启预算计量「连续故障」而非会话累计
+- **修复内容（显式动作）**：`request_elevation` 在用户显式点击时不再被降级冷却阻塞，立即重置为可重试状态
+- **修复内容（日志重定向不阻断启动）**：`spawn_sidecar` 原先把「打开 `%TEMP%\secm-lhm-sidecar.log` 失败」当作可重试错误并**在 `Command::spawn` 之前**返回，等于把排障辅助文件变成数据链路的单点。现改为尽力而为：打开失败退回 `Stdio::null()` 并记录警告，sidecar 照常启动
+- **修复内容（降级起点缺失）**：`degraded` 为真但冷却起点缺失时按「刚进入降级」补上起点，而不是当作冷却已满立刻触发真实探测——避免一次状态异常把查询变成进程启动
+
+### 修复（提权失败不可诊断）
+- **症状**：点击「授权并启用」后界面只显示「提权请求失败，可稍后重试；若持续失败请查看上方日志路径。」，看不到任何具体原因（src/pages/Dashboard.tsx、src-tauri/src/lhm.rs、sidecar-lhm/Elevation/Tier2Task.cs）
+- **根因结论**：前端 `requestElevation` 只把后端错误消息写入 `logger.warn`，`Tier2PrivilegeCard` 在 `phase === "error"` 时渲染固定文案，后端回传的真实原因被丢弃；后端在 sidecar 不可用时把 `LhmStartError::Retryable(msg)` 原样返回；sidecar 侧 `Tier2Task` 失败原因只取 `stdout+stderr` 的第一行，而实测第一条是无害的 `警告: 因为 /ST 早于当前的时间…`，真正失败信息在其后
+- **关键日志证据**：`src/pages/Dashboard.tsx` 的 `requestElevation` 仅 `logger.warn`；`src-tauri/src/lhm.rs` 的 `Retryable(msg)` 原样 `Err` 返回；`%TEMP%\secm-lhm-sidecar.log` 记录 `持久授权注册失败（回退按需 runas，功能不劣化）：计划任务注册失败（exit=1）：警告: 因为 /ST 早于当前的时间，任务可能无法运行。`
+- **修复内容**：`requestElevation` 改为返回 `{ outcome, reason }`，`Tier2PrivilegeCard` 在失败时展示后端原始原因；`request_elevation` 在 sidecar 不可用时给出可操作前缀 `sidecar 未就绪，无法发起提权：<原因>`；`Tier2Task` 的失败原因改为紧凑拼接全部非空输出（保留警告与真实失败信息）
+- **验证结果**：
+  - `npm run build` 通过（`tsc -b` 严格类型检查 + vite build）
+  - `cd src-tauri && cargo check --lib --tests` 通过且零警告
+  - `bash scripts/test-lib.sh`：235 通过、0 失败、6 忽略（较 v1.21.1 新增 3 例：冷却边界、恢复分支、显式重试状态迁移）
+  - 新增集成测试 `src-tauri/tests/lhm_selfheal.rs`：杀进程后 10302ms 恢复服务（修复前为整场会话不恢复）
+  - 全部 16 个集成测试文件逐个执行：`datasource_native` 的 `power_scheme_roundtrip_idempotent` 因当前会话无权调用 `PowerSetActiveScheme`（错误码 5）失败，属既有环境限制、与本次改动路径无关；其余全部通过
+  - `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release`：258 通过、0 失败（较 v1.21.1 新增 1 例：注册失败原因同时保留警告与真实失败文本）
+  - 托盘登记校验：High 完整性目录下记录 `托盘登记校验通过`；低完整性目录下记录 `托盘图标未登记进通知区域` 与 `Tray creation failed`，证明该判定按真实登记结果生效
+  - explorer 重启后图标自动补登记（`Shell_NotifyIconGetRect` 命中 1 次），主窗口 `WM_CLOSE` 后进程存活且图标仍在
+- **版本号** → `1.21.2`（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.lock` / `README.md` 徽章）
+
+## [v1.21.1] - 2026-09-23
+### 修复（启动失败静默残留导致「打开就闪退」）
+- **症状**：双击 `sysenv-console-manager.exe` 无界面出现；再次双击仍然无反应，进程以退出码 0 在二十余毫秒内结束，用户感知为「闪退」（src-tauri/src/lib.rs、新增 src-tauri/src/startup_guard.rs）
+- **根因结论**：Tauri 在 `RuntimeRunEvent::Ready` 分支中先按 `tauri.conf.json` 创建窗口、再调用用户 `setup` 钩子（tauri-2.11.5/src/app.rs:2524-2532），窗口创建失败只写日志、不返回错误。主窗口未能创建时 `setup` 钩子仍会执行完，进程以无界面状态继续运行并持有单实例互斥体 `com.secm.app-sim`；用户再次双击时 `tauri-plugin-single-instance` 发送 `WM_COPYDATA` 后调用 `std::process::exit(0)`（tauri-plugin-single-instance-2.4.3/src/platform_impl/windows.rs:72-95），而原单实例回调在取不到 `main` 窗口时静默返回，因此第二次点击表现为瞬时静默退出
+- **关键日志证据**：同机实测失败态顶层窗口只有隐藏窗口 `com.secm.app-siw`（单实例插件消息窗口）与托盘窗口，没有 `Tauri Window` 类主窗口，msedgewebview2.exe 子进程数 0；正常态主窗口存在（1400×800）且 WebView2 子进程数为 1。WebView2 环境创建失败的原始错误为 `WindowsError(HRESULT(0x800700AA))`，即 ERROR_BUSY「请求的资源在使用中」。连续启动三次的实测结果：首个实例存活但无主窗口；第二次启动 23 毫秒退出、退出码 0；第三次启动 22 毫秒退出、退出码 0
+- **修复内容**：新增 `src-tauri/src/startup_guard.rs`。启动看门狗在 25 秒启动窗口期内轮询本进程是否存在 `msedgewebview2.exe` 直接子进程（与实测判别条件一致，且不读取 Tauri 运行时期窗口状态，避免经消息通道同步等待造成阻塞）；始终未观察到时写入 `debug_error!`、弹出中文排查提示，随后以退出码 1 结束进程，释放单实例互斥体，使用户重试能够真正启动
+- **修复内容（单实例回调）**：`focus_or_report_missing_main` 在已有实例没有注册主窗口时不再静默返回，改为写入 `debug_error!` 并弹出中文提示，告知用户结束残留进程后重试
+- **修复内容（关闭到托盘）**：`setup` 中注册关闭到托盘原先使用 `.expect("main window not found")`，主窗口缺失时会 panic 并中断事件循环、跳过启动守卫的提示与退出流程；现改为条件注册，主窗口缺失时交由启动看门狗统一处置
+- **验证结果**：`npm run build` 通过；`cd src-tauri && cargo check --lib --tests` 零警告通过；正常启动路径回归实测主窗口标题为 `SysEnv Console Manager` 且 WebView2 子进程数为 1，与修复前正常态一致
+- **版本号** → `1.21.1`（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.lock` / `README.md` 徽章）
+
+## [v1.21.0] - 2026-09-22
+### 变更（网络诊断 · 网站测试统一为 HTTP 延迟测试）
+- **「网站测试」统一为「HTTP 延迟测试」，全站只保留一个耗时口径**：卡片标题、描述、日志与 tooltip 全部改为 HTTP 延迟语义，展示值只取后端的 `ms`（应用层 HTTP 往返：DNS + TCP + TLS 握手 + 请求/响应）。此前同一卡片并列两个口径——裸 HTTP `ms` 与「隐藏 WebView2 真实加载页面的耗时」`page_ms`——同一站点在不同时刻给出两套数字，用户无法判断哪个是"延迟"（src/pages/Network.tsx）
+- **移除隐藏 WebView2 页面测速（`src-tauri/src/page_probe.rs` 整文件删除）**：根因是开销与调用频率不匹配——卡片支持自动检测，默认每 5s 对全部站点轮询，而浏览器测速要为**每个站点**开一次隐藏 WebView2 引擎并下载全套子资源；且读数随子资源/脚本执行波动，不适合做可反复对比的延迟指标。随之删除 `probe_url` 的 `measure_page` 参数与 `page_ms` 返回字段、`network.rs` 的 `PAGE_PROBE_BUDGET_MS`、以及 `lib.rs` 中的 `SECM_PAGE_PROBE_SELFTEST` 自检入口（src-tauri/src/commands.rs、src-tauri/src/network.rs、src-tauri/src/lib.rs）
+- **顺带移除一处计时口径缺陷**：`network::probe_url` 原先对 HEAD→GET 兜底路径按"进入函数到返回"统一计时，站点拒绝 HEAD（405/501）走 GET 兜底时，自报延迟会把两次尝试的时间累加而虚高约一倍。现改为**只计成功那一次尝试**，不可达时仍如实给出总消耗（src-tauri/src/network.rs）
+- **`probe_url` 签名收敛为两参数**（`url` + `timeout_ms`），「HTTP 延迟测试」与「端口检测」共用同一实现（端口检测不再需要 `measurePage=false`）
+
+### 测试
+- 重写 `src-tauri/tests/network_probe_contract.rs` 的口径守卫（5 例全通过）：断言 `UrlProbeResult` 只有 `ms` 一个耗时口径、`page_probe.rs` 与自检入口不得复活、前端展示 `status.ms` 且文案含「HTTP 延迟」、两处调用都以两参数形式调 `probeReachable`；原有「禁止 ICMP 数值冒充延迟」与「CSP `connect-src` 保持收紧」断言保留
+- `src-tauri/tests/probe_url_live.rs` 把已失效的 `http_probe_never_fabricates_page_ms` 替换为 `http_latency_measures_the_successful_attempt_only`（断言自报延迟不超过整体墙钟，属可达路径），实测 4 例全通过（真实网络：apple 545ms / github 600ms / google 445ms / youtube 813ms，均 HTTP 200；`192.0.2.1:9` 判不可达且 2015ms 内超时返回）
+- 验证命令与结果：`npm run build` 通过（tsc -b + vite build）；`cargo check --lib --tests` 通过；`cargo test --test network_probe_contract` 5/5；`cargo test --test probe_url_live` 4/4
+- 版本号 → `1.21.0`（`package.json` / `Cargo.toml` / `tauri.conf.json` / `Cargo.lock` / `README.md` 徽章），`AGENTS.md` 同步为 26 个 `pub mod` 并删除 `page_probe` 相关条目
+
+## [v1.20.0] - 2026-09-22
+### 新增（网络诊断 · iperf3 完整补全：客户端全参数 + 本机服务端 + 随包二进制）
+- **iperf3 由「半成品」补全为完整工具**：此前 `commands.rs::iperf3_stream` 是内联实现，写死 `iperf3 -c <host> -p <port> -t <duration> -f m` 五个参数，只读 stdout，**成功时把 stderr 当结果返回**（实测几乎总是空串）→ UI 只能显示"完成"，拿不到任何吞吐数字。现改为完整实现，参数覆盖官方手册 `src/iperf3.1` 中**在 Windows 上有意义**的全部客户端选项（`-p -u -R --bidir -t/-n/-k -l -P -O -b -i -f -w -M -N -4/-6 -S --dscp -Z -V -T --get-server-output --connect-timeout -A -B --cport --repeating-payload --dont-fragment --udp-counters-64bit --rcv-timeout --snd-timeout --extra-data -F`），共 28 项（src-tauri/src/iperf.rs 由声明收敛为完整实现）
+- **结果结构化（实时区间 + 方向分列）**：改用 `--json-stream` 逐行解析，每区间产出「起止时间/方向/吞吐/重传或抖动丢包」行实时展示；结束时给出结构化摘要（正向与双向反向**分列**，UDP 突出抖动·丢包，TCP 突出重传），并附 iperf3 自报版本与 CPU 占用（接近单核 100% 即可判定为 CPU 瓶颈）。**关键实测发现**：`--json-stream` 的外层包装键是 `{"event":...,"data":...}`，**不是**顶层 `start`/`intervals`/`end`（后者是纯 `-J` 的形状）；按后者写解析器会一行都取不到值。该事实先用真实二进制（iperf 3.21）抓取后才落码，并固化为测试断言
+- **踩坑修复（错误路径的两个陷阱）**：① `error` 事件的 `data` 是**字符串**而非对象，与 `start`/`interval`/`end` 的对象分支必须分开解析；② 连接失败时 iperf3 仍会打印 `{"event":"end","data":{}}`（**空对象**），若据此判定"有结果"就会把失败当成功——解析器现要求 `sum_sent`/`sum_received` 真实存在才算成功
+- **修复 stderr 管道死锁隐患**：原实现只读 stdout 且用 `wait_with_output` 收尾。iperf3 往 stderr 写满管道缓冲区时会阻塞子进程，父进程却在等 stdout → 测试永不结束。现为 stderr 起**独立排空线程**并 join
+- **修复取消被误报为失败**：原实现取消后走 `Err` 分支，UI 标红报错、日志记「失败」，与"我按了停止"完全相悖。现取消返回 `Ok(cancelled=true)`，UI 显示「已取消（非失败）」，右侧栏记 WARN
+- **新增本机服务端模式（`-s`）**：iperf3 的另一半功能——只做客户端只能测"出去"的方向。提供启动/停止/状态查询（含 PID、运行时长、输出滚动区）与端口占用预检；服务端为长驻子进程，**应用退出时由 `RunEvent::Exit` 强杀**（lib.rs），避免留下孤儿进程占端口。输出排空用**代际号**校验，防止重启后旧线程污染新会话
+- **新增防火墙放行辅助**：服务端可被外部访问的前提。默认只给**可复制的 `netsh` 命令**；「一键添加」需二次确认（需管理员权限，规则名固定前缀 `SECM iperf3 <port> <PROTO>` 以便成对移除）。全程 `Command::args` 数组传参，不经 shell
+- **随包内置 iperf3 二进制（用户无需自装）**：新增 `scripts/stage-iperf3.mjs`，把 `third_party/iperf3/` 的 `iperf3.exe` + `cygwin1.dll` + 四份许可文本 stage 到 `src-tauri/resources/iperf3/`，并接入 `tauri:build` 前置链、`tauri.conf.json` 的 `bundle.resources` 与 `package-portable.mjs`（便携布局）。**校验和门禁**：比对 `SHA256SUMS.txt`，不符即中止构建，绝不静默打包来源不明的二进制。exe 解析顺序为「显式覆盖(仅 debug) → `SECM_IPERF3_DIR`(仅 debug) → `resource_dir()/iperf3` → exe 同级 `resources/iperf3` → 开发布局 → 系统 PATH」，**随包优先于 PATH**，且**不接受前端传入路径**（否则本命令会退化为任意程序执行器）
+- **版本能力门控（保守）**：解析 `--version` 得版本号并按能力降级——`--json-stream` 需 ≥3.17（低于则自动退回 `-J` 并补 `--forceflush`）、`--bidir` 需 ≥3.7、`--dscp` 需 ≥3.2；版本解析失败时按「未知」处理，**一律按不支持**（宁可少给参数，也不给旧版传它不认识的选项）
+- **平台不支持项显式拒绝并说明原因**（不生成无效参数、不静默忽略）：`-C` 拥塞控制（仅 Linux/FreeBSD，Windows 构建的 argv 不含该选项）、`--fq-rate`、SCTP 系列、`-L` 流标签、MPTCP、`--gsro`、`--bind-dev`；认证类（`--username`/`--rsa-public-key-path`）需 OpenSSL 构建与交互式口令输入，GUI 无法安全提供。高级参数面板内以固定文案列出这些项及原因
+- **输入校验（后端为唯一裁决者）**：`validate_host` 拒绝以 `-` 开头（选项注入，如 `-F /etc/passwd`）、空白与控制字符、超长；端口 0 拒绝；`-t/-n/-k` 由**枚举**从类型上保证三选一互斥；`-R` 与 `--bidir` 互斥；`-F` 与 `-u` 互斥且路径必须是存在的普通文件；码率/字节/窗口规格走白名单（支持 `100M`、`10M/1000` burst）；TOS 支持十进制/八进制/十六进制；DSCP 限 0-63 或符号名；CPU 亲和性限 `n` 或 `n,m`。数值范围全部收敛（时长 ≤86400s、并行流 ≤128、MSS ≤32768 等）
+- **UI 分层避免参数淹没**：基础区（协议/方向/结束条件/并行流/码率/间隔/单位）+ 可折叠「高级选项」（预热/缓冲/MSS/TOS·DSCP/绑定/超时/文件等 17 项），并按版本与协议**置灰不可用项并给出原因**；UDP 未填码率时提示「默认仅 1 Mbps」（避免用户误读为"测不出来"）
+- **不伪造数值**：缺失/NaN/负数一律显示 `—`，不填 0（对齐项目「绝不伪造 0」的中心契约）
+- 实测（release 路径、真实 iperf 3.21 Cygwin 构建、本机 loopback，`cargo test --test iperf3_live`）：TCP 正向 4346 Mbps / 544 MB / 1 区间；TCP 反向接收侧 4404 Mbps；UDP 10 Mbps / 抖动 0.0063 ms / 丢包 0.0% / 849 包；双向 正向 3345 Mbps + 反向 2633 Mbps；并行 4 流正确报告 `streams=4`；连接拒绝返回可读原因；取消正确标记 `cancelled=true`
+- 新增测试：`src-tauri/src/iperf_tests.rs`（69 例，经 `#[path]` 引入，含真实捕获的 `--json-stream` 片段）；`src-tauri/tests/iperf3_contract.rs`（47 例，行为 + 源码文本双通道，含"stderr 必须并发排空""取消必须返回取消语义""退出必须清理服务端""禁止 shell 拼接""随包产物必须接入打包""Cygwin DLL 必须成对分发"等静态守卫）；`src-tauri/tests/iperf3_live.rs`（10 例真实端到端，无二进制时优雅跳过）
+- 许可合规：iperf3 本体系 **BSD-3-Clause**；Windows 版为 **Cygwin 链接**构建，`cygwin1.dll` 按 Cygwin 官方条款为 **LGPL-3.0-or-later（含链接例外）**。四份许可文本（iperf3 BSD-3-Clause、LGPL-3.0、GPL-3.0、THIRD-PARTY-NOTICES）随包分发；`cygwin1.dll` 原样（未修改）随包且 SECM 不链接它，属聚合分发，本体 MIT 不受影响。来源、版本、SHA256 与合规结论记录于 `third_party/iperf3/README.md`
+
+### 变更
+- `commands.rs`：`iperf3_stream` 参数由 `(host, port, duration)` 改为结构化 `Iperf3ClientOptions`，返回类型由 `String` 改为 `Result<Iperf3Result, String>`；新增 `iperf3_tool_info`、`iperf3_server_start`、`iperf3_server_stop`、`iperf3_server_status`、`iperf3_firewall_rule` 五条命令（`generate_handler!` 同步注册）
+- `log.rs`：`scope_for_command` 登记新增命令（`iperf3_server_start`/`stop`/`firewall_rule` 属 `network`）；`iperf3_tool_info`/`iperf3_server_status` 为轮询型纯查询命令，走 `cmd_pure!` 不产生日志（避免灌满 200 条环形缓冲挤掉用户操作日志），但在 `REGISTERED_ONLY_COMMAND_SCOPES` 预登记，防止将来补日志时落到 `system`
+- 前端新增 `src/lib/iperf3.ts`（契约类型 + 参数映射 + 展示格式化）、`src/hooks/useIperf3.ts`（客户端控制器 / 工具信息 / 服务端控制器）、`src/components/iperf3/`（参数面板、结果卡、服务端卡）、`src/lib/util-line.ts`（`oneLine` 提取为共享工具，供钩子复用）；`Network.tsx` 的 iperf3 接入点由 `useStreamingTool` 换成 `useIperf3Client`，控制器仍满足既有 `ToolController` 契约，故开始/停止按钮、共享输入禁用、右侧栏「每次运行恰好 2 条日志」等行为全部不变
+- `.gitignore`：新增 `src-tauri/resources/iperf3/`（stage 生成产物不入库，权威源为 `third_party/iperf3/`）
+- 版本号 → `1.20.0`（`package.json` / `Cargo.toml` / `tauri.conf.json` / `Cargo.lock` / README 徽章）
+
+## [v1.19.2] - 2026-09-22
+### 修复（网站测试耗时改为**真实浏览器打开速度**）
+- **改用隐藏 WebView2（与 Edge 同引擎）真实加载页面计时**：以 `PageLoadEvent::Finished`（Windows 上即 WebView2 `NavigationCompleted`，文档 onload 完成）为终点。这才是「打开这个网页需要多久」的权威口径，含 DNS/TCP/TLS/HTML/子资源/渲染（src-tauri/src/page_probe.rs 新增）
+- **纠正此前两次口径错误**：同一个 `github.com` 在本机实测三个口径互不相等——ICMP RTT ~106ms（只是网络往返，与页面打开无关）、裸 HTTP 客户端 ~950ms（不含子资源与渲染）、**真实浏览器 ~170–350ms**。前两者都曾被当作"延迟/耗时"展示，均不等于用户所问；本次删除 ICMP 口径（`icmp_rtt_ms`/`rtt_ms`），`UrlProbeResult` 改为 `ms`（HTTP 层，仅诊断）+ `page_ms`（浏览器实测，UI 展示用）
+- **踩坑修复（关键，症状极具误导性）**：测速窗口最初漏继承主窗口的 `additionalBrowserArgs`（`tauri.conf.json` 的 `--disable-gpu --proxy-bypass-list=...`）。WebView2 对同一用户数据目录只创建一个 environment，参数不一致使 `CreateCoreWebView2EnvironmentWithOptions` 失败（`HRESULT 0x8007139F`）；表现为**窗口建出来了、但 webview 从未初始化**——消息往返全部 `FailedToReceiveMessage`、`on_page_load` 零事件（连 about:blank 都不触发），GUI 上只看到"耗时永远为空"。现已继承同一份 BrowserArgs，并经实测验证事件正常触发
+- 测速窗口经 `run_on_main_thread` 惰性创建（事件循环运行后），`visible(false)`+`focused(false)`+`skip_taskbar`（不闪现、不抢焦点），`BackgroundThrottlingPolicy::Disabled`（否则隐藏窗口被 Suspend，测到的是"被暂停"）；`about:blank` 先承担引擎冷启动开销，只计时"导航→onload"
+- 串行化 + **有界等待**（5s 拿不到锁则放弃本次页面测速返回空）：前端「全部检测」与自动检测定时器会并发发起测量，无界排队会无限堆积等待者；代际号过滤超时后迟到的 onload，避免污染下一次测量
+- 端口检测传 `measure_page=false`：为"端口开不开"开浏览器窗口加载页面毫无意义且开销巨大
+- 目标不可达/测速失败时 UI 退回显示 `HTTP <ms>ms` 并加 tooltip 说明，绝不让裸 HTTP 值冒充页面打开耗时；可达性判定仍以 HTTP 响应为准
+- 实测（release 版、生产代码路径、真实 WebView2）：github.com 冷 700ms / 暖 174ms（裸 HTTP 364ms）；apple.com 暖 203ms；google.com 暖 349ms（裸 HTTP 8344ms）；youtube.com 暖 757ms——与 Playwright/Chromium 实测（github 242–342ms、google 521ms、youtube 779ms）同量级，确认为真实浏览器速度
+- 保留 `SECM_PAGE_PROBE_SELFTEST` 自检入口：本机 `cargo test --lib` 与 `cargo run --example` 存在**预存在**的 `STATUS_ENTRYPOINT_NOT_FOUND` 加载失败（全量重建亦复现、早于本次改动），只有主程序 exe 能加载 WebView2，故真实浏览器测速的验证必须走主程序本体；该自检当场发现了上述 0x8007139F 缺陷
+- 新增静态契约守卫 `network_probe_contract.rs`（5 例，含"必须继承 BrowserArgs""必须走 run_on_main_thread""串行锁必须有界""不得再引入 ICMP 冒充页面耗时"）；`probe_url_live.rs`（4 例）新增"纯 HTTP 原语不得自行填充 page_ms"
+## [v1.19.1] - 2026-09-21
+### 修复（DHCP 检测误报「遗留」服务器）
+- 修复跨网段 DHCP 误报根因：网卡被拔出/卸载后，`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{guid}` 仍保留该网卡的 DHCP 分配记录（`DhcpServer`/`DhcpIPAddress`/租约时间等 14 项），而 `read_network_config` 只按 `EnableDHCP=1` 判定「DHCP 接口」、不校验网卡是否仍存在，于是把幽灵服务器并入基线报出。本机实测：已移除的 USB/RNDIS 网卡「以太网 3」残留 `DhcpServer=192.168.11.1`，检测结果误报 `servers=["192.168.3.254","192.168.160.1","192.168.11.1"]`（`192.168.11.1` 实为该残留基线，非当前生效服务器）
+### 新增（DHCP 残留清理）
+- 新增 `dhcp_residue.rs` + 命令 `scan_dhcp_residue`（只读）/ `clean_dhcp_residue`（需管理员）：网络诊断页「DHCP 服务器检测」卡片「检测」按钮右侧新增「清理残留」按钮，点击后先扫描并弹出确认框展示**将删除的完整清单**（残留网卡名/GUID/DHCP 服务器/值名），确认后清理并**自动重新检测**本地 DHCP 服务器
+- 清理安全性：判定依据为 `Connection\PnpInstanceID` + cfgmgr32 `CM_Locate_DevNodeW(CM_LOCATE_DEVNODE_NORMAL)`，**仅 `CR_NO_SUCH_DEVINST`**（设备实例真的不存在）才清理；设备被禁用/报错（本机 TAP-Windows `Problem=22`）、无 PnP 实例 ID（Hyper-V Default Switch）、查询异常一律保留；只删 DHCP 分配/租约值，**不删** `IPAddress`/`SubnetMask`/`DefaultGateway`/`NameServer`/`EnableDHCP`，也不删接口子键；删除前必须成功写出备份（失败即中止），备份为含原始字节的可还原 JSON（`%APPDATA%\SECM\diag\dhcp-residue-<时间戳>.json`）
+- 端到端实测：清理前 `servers=["192.168.3.254","192.168.160.1","192.168.11.1"]`（baseline `192.168.11.1`，healthy=false）→ 清理 14 项 → 再次检测 `servers=["192.168.3.254","192.168.160.1"]`（baseline=None）；幽灵接口子键保留、在线 Realtek 的静态 IP/网关/DNS 未受影响
+- 新增集成测试 `dhcp_residue_contract.rs`（8 例）：可删白名单排除静态配置、只删值不删子键、备份失败即中止（先后顺序不变量）、清理不接受前端传入目标、仅有 `CR_NO_SUCH_DEVINST` 可判已移除、真实扫描绝不在线网卡列为残留、未知 GUID 保守不清理、结果契约字段完整
 ## [v1.19.0] - 2026-09-05
 ### 变更（开源整理：移除自研内核驱动 + 安全修复）
 - 移除自研内核驱动 hwmon-driver：删除 `hwmon.rs`（`#[path]` 外部 ioctl.rs 使源码树无法独立编译）、驱动 stage/签名脚本中的 hwmon 产物、`resources/driver` 的 hwmon 文件、证书与自研安装器、`hwmon_integration.rs` 测试；温度/功耗降级链收敛为 `lhm → winring0 → acpi → none`（`driver_install` 精简 L0 通道，WinRing0/PawnIO/ACPI 保留）

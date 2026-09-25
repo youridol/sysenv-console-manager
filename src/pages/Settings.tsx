@@ -2,10 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../lib/utils";
 import { Button } from "../components/ui/button";
-import {
-  Card,
-  CardContent,
-} from "../components/ui/card";
+import { Card, CardContent } from "../components/ui/card";
 import { Switch } from "../components/ui/switch";
 import {
   Select,
@@ -41,6 +38,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { PageHeader } from "../components/PageHeader";
+import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
 import { SectionTitle } from "../components/SectionTitle";
 import { logger } from "../lib/logger";
 
@@ -104,10 +102,14 @@ function SettingRow({
   title: string;
   adminRequired?: boolean;
   description?: string;
-  checked: boolean;
+  /** 当前开关值；`null` 表示状态未知（读取失败），不得当作 false 渲染。 */
+  checked: boolean | null;
   onToggle: (v: boolean) => void;
   loading?: boolean;
 }) {
+  // 状态未知（读取失败）：显式呈现，避免把 null 当 false 显示成「全部关闭」，
+  // 那会让用户误以为真实设置已关闭并据此做出反向操作（ADR-0001 D9）。
+  const unknown = checked === null;
   return (
     <div className="flex items-center justify-between gap-4 py-3 px-4 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
       <div className="flex items-center gap-3 min-w-0">
@@ -126,15 +128,26 @@ function SettingRow({
           </div>
           {description !== undefined && (
             <p
-              className="text-xs text-muted-foreground truncate"
-              title={loading ? undefined : description}
+              className={cn(
+                "text-xs truncate",
+                unknown ? "text-destructive" : "text-muted-foreground",
+              )}
+              title={loading || unknown ? undefined : description}
             >
-              {loading ? "读取中..." : description}
+              {loading
+                ? "读取中..."
+                : unknown
+                  ? "读取失败：请检查权限或传感器服务，点击开关可重试"
+                  : description}
             </p>
           )}
         </div>
       </div>
-      <Switch checked={checked} onCheckedChange={onToggle} disabled={loading} />
+      <Switch
+        checked={checked === true}
+        onCheckedChange={onToggle}
+        disabled={loading || unknown}
+      />
     </div>
   );
 }
@@ -159,6 +172,8 @@ export default function Settings() {
     leaving: boolean;
   } | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 首次加载设置失败的原因；非空时页面顶部显示可重试的横幅。 */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const pushToast = useCallback((text: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -197,8 +212,15 @@ export default function Settings() {
       setHpt(hptState);
       setPlans(p);
       setHetero(hp);
+      setLoadError(null);
     } catch (e: unknown) {
-      if (import.meta.env.DEV) logger.error("Settings", "Settings load error:", e);
+      // 读取失败必须给用户可见反馈（ADR-0001 D9）：原实现只在 DEV 记日志，
+      // 生产环境静默，且各开关保持 null → 渲染成「全部关闭」，
+      // 用户会误以为真实设置已关闭并据此执行反向操作。
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.error("Settings", "Settings load error:", msg);
+      setLoadError(msg);
+      pushToast(`[失败] 读取设置失败: ${msg}`);
     }
     // NVIDIA 电源管理模式：独立加载（无 NVIDIA 显卡时置错误态，不阻塞其他设置）
     invoke<NvidiaPmMode>("get_nvidia_power_mode")
@@ -317,7 +339,8 @@ export default function Settings() {
       const p = await invoke<PowerPlan[]>("get_power_plans");
       setPlans(p);
     } catch (e: unknown) {
-      if (import.meta.env.DEV) logger.warn("Settings", "refreshPowerPlans failed:", e);
+      if (import.meta.env.DEV)
+        logger.warn("Settings", "refreshPowerPlans failed:", e);
     }
   };
 
@@ -330,7 +353,9 @@ export default function Settings() {
       setPlans(p);
       pushToast(`[成功] 已切换电源计划`);
     } catch (e: unknown) {
-      pushToast(`[失败] 电源计划切换: ${e instanceof Error ? e.message : String(e)}`);
+      pushToast(
+        `[失败] 电源计划切换: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setPowSwitching(null);
     }
@@ -352,7 +377,9 @@ export default function Settings() {
       setPlans(p);
       pushToast(`[成功] 已删除电源计划`);
     } catch (e: unknown) {
-      pushToast(`[失败] 电源计划删除: ${e instanceof Error ? e.message : String(e)}`);
+      pushToast(
+        `[失败] 电源计划删除: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setPowDeleting(null);
     }
@@ -368,11 +395,15 @@ export default function Settings() {
       await invoke("set_hetero_policy", { kind, value });
       const h = await invoke<HeteroPolicies>("get_hetero_policies");
       setHetero(h);
-      pushToast(`[成功] 已设置${kind === "thread" ? "异类线程调度策略" : "异类短运行线程调度策略"}`);
+      pushToast(
+        `[成功] 已设置${kind === "thread" ? "异类线程调度策略" : "异类短运行线程调度策略"}`,
+      );
     } catch (e: unknown) {
-      pushToast(`[失败] 设置${kind === "thread" ? "异类线程调度策略" : "异类短运行线程调度策略"}: ${
-        e instanceof Error ? e.message : String(e)
-      }`);
+      pushToast(
+        `[失败] 设置${kind === "thread" ? "异类线程调度策略" : "异类短运行线程调度策略"}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
     } finally {
       setHeteroSaving(null);
     }
@@ -395,8 +426,7 @@ export default function Settings() {
                   : "border-red-500/30 bg-red-500/10",
               )}
               style={{
-                transition:
-                  "opacity 0.45s ease, transform 0.45s ease",
+                transition: "opacity 0.45s ease, transform 0.45s ease",
                 opacity: toastMsg.leaving ? 0 : 1,
                 transform: toastMsg.leaving ? "translateY(-6px)" : "none",
               }}
@@ -422,8 +452,35 @@ export default function Settings() {
         }
       />
 
+      {/* 加载失败横幅（ADR-0001 D9）：读取任一设置失败时可见，并可一键重试。
+          没有它时页面只会呈现一排「关闭」的开关，把基础设施故障伪装成正常状态。 */}
+      {loadError && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTitle>设置读取失败</AlertTitle>
+          <AlertDescription className="flex items-center justify-between gap-3">
+            <span className="min-w-0 break-all">
+              {loadError}
+              <span className="block text-xs opacity-80">
+                下方开关处于「读取失败」状态，不代表真实设置值。
+              </span>
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => {
+                setLoadError(null);
+                void loadSettings();
+              }}
+            >
+              重试
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* ══════════ 第一行：系统优化开关 / 电源计划（两列并排） ══════════ */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch">
+      <div className="grid grid-cols-1 @2xl/main:grid-cols-2 gap-6 items-stretch">
         {/* 左卡：系统优化开关 */}
         <Card className="animate-scale-in stagger-1 h-full">
           <CardContent className="px-6 py-6">
@@ -446,95 +503,95 @@ export default function Settings() {
                 iconColor="text-blue-400"
                 iconBg="bg-blue-500/10"
                 title="GPU 硬件加速调度"
-              adminRequired={hags?.admin_required}
-              description="使用 GPU 调度器管理显存，降低渲染延迟"
-              checked={hags?.enabled || false}
-              loading={loadingToggle === "hags"}
-              onToggle={(v) =>
-                toggleSetting("hags", v, "get_hags_state", "set_hags_state")
-              }
-            />
-            <SettingRow
-              icon={Joystick}
-              iconColor="text-orange-400"
-              iconBg="bg-orange-500/10"
-              title="游戏模式"
-              description="通过在后台关闭内容来优化电脑玩游戏"
-              checked={gameMode?.enabled ?? false}
-              loading={loadingToggle === "gameMode"}
-              onToggle={(v) =>
-                toggleSetting(
-                  "gameMode",
-                  v,
-                  "get_game_mode_state",
-                  "set_game_mode_state",
-                )
-              }
-            />
+                adminRequired={hags?.admin_required}
+                description="使用 GPU 调度器管理显存，降低渲染延迟"
+                checked={hags ? hags.enabled : null}
+                loading={loadingToggle === "hags"}
+                onToggle={(v) =>
+                  toggleSetting("hags", v, "get_hags_state", "set_hags_state")
+                }
+              />
+              <SettingRow
+                icon={Joystick}
+                iconColor="text-orange-400"
+                iconBg="bg-orange-500/10"
+                title="游戏模式"
+                description="通过在后台关闭内容来优化电脑玩游戏"
+                checked={gameMode ? gameMode.enabled : null}
+                loading={loadingToggle === "gameMode"}
+                onToggle={(v) =>
+                  toggleSetting(
+                    "gameMode",
+                    v,
+                    "get_game_mode_state",
+                    "set_game_mode_state",
+                  )
+                }
+              />
               <SettingRow
                 icon={Gamepad2}
                 iconColor="text-green-400"
                 iconBg="bg-green-500/10"
                 title="窗口化游戏优化"
-              description="提升窗口化 / 无边框游戏流畅度"
-              checked={gameOpt?.enabled || false}
-              loading={loadingToggle === "gameOpt"}
-              onToggle={(v) =>
-                toggleSetting(
-                  "gameOpt",
-                  v,
-                  "get_game_optimization_state",
-                  "set_game_optimization",
-                )
-              }
-            />
-            <SettingRow
-              icon={Mouse}
-              iconColor="text-purple-400"
-              iconBg="bg-purple-500/10"
-              title="鼠标精准度"
-              description="提高指针精确度（鼠标加速），FPS 玩家通常关闭"
-              checked={mousePrec?.enabled || false}
-              loading={loadingToggle === "mousePrec"}
-              onToggle={(v) =>
-                toggleSetting(
-                  "mousePrec",
-                  v,
-                  "get_mouse_precision_state",
-                  "set_mouse_precision",
-                )
-              }
-            />
-            <SettingRow
-              icon={MonitorPlay}
-              iconColor="text-cyan-400"
-              iconBg="bg-cyan-500/10"
-              title="可变刷新率"
-              adminRequired={vrr?.admin_required}
-              description="显示器动态刷新率，消除画面撕裂"
-              checked={vrr?.enabled || false}
-              loading={loadingToggle === "vrr"}
-              onToggle={(v) =>
-                toggleSetting("vrr", v, "get_vrr_state", "set_vrr_state")
-              }
-            />
+                description="提升窗口化 / 无边框游戏流畅度"
+                checked={gameOpt ? gameOpt.enabled : null}
+                loading={loadingToggle === "gameOpt"}
+                onToggle={(v) =>
+                  toggleSetting(
+                    "gameOpt",
+                    v,
+                    "get_game_optimization_state",
+                    "set_game_optimization",
+                  )
+                }
+              />
+              <SettingRow
+                icon={Mouse}
+                iconColor="text-purple-400"
+                iconBg="bg-purple-500/10"
+                title="鼠标精准度"
+                description="提高指针精确度（鼠标加速），FPS 玩家通常关闭"
+                checked={mousePrec ? mousePrec.enabled : null}
+                loading={loadingToggle === "mousePrec"}
+                onToggle={(v) =>
+                  toggleSetting(
+                    "mousePrec",
+                    v,
+                    "get_mouse_precision_state",
+                    "set_mouse_precision",
+                  )
+                }
+              />
+              <SettingRow
+                icon={MonitorPlay}
+                iconColor="text-cyan-400"
+                iconBg="bg-cyan-500/10"
+                title="可变刷新率"
+                adminRequired={vrr?.admin_required}
+                description="显示器动态刷新率，消除画面撕裂"
+                checked={vrr ? vrr.enabled : null}
+                loading={loadingToggle === "vrr"}
+                onToggle={(v) =>
+                  toggleSetting("vrr", v, "get_vrr_state", "set_vrr_state")
+                }
+              />
               {/* 系统类子分组（1 项）：border-t 分隔 + 小标题 */}
               <div className="pt-3 mt-2 border-t border-border">
                 <SectionTitle icon={Timer} title="系统类" />
               </div>
-            <SettingRow
-              icon={Timer}
-              iconColor="text-red-400"
-              iconBg="bg-red-500/10"
-              title="关闭高精度计时器"
-              adminRequired={hpt?.admin_required}
-              description="降低计时器中断频率，减少 CPU 占用（需重启生效）"
-              checked={hpt?.enabled || false}
-              loading={loadingToggle === "hpt"}
-              onToggle={(v) =>
-                toggleSetting("hpt", v, "get_hpt_state", "set_hpt_state")
-              }
-            />
+              <SettingRow
+                icon={Timer}
+                iconColor="text-red-400"
+                iconBg="bg-red-500/10"
+                title="关闭高精度计时器"
+                adminRequired={hpt?.admin_required}
+                description="降低计时器中断频率，减少 CPU 占用（需重启生效）"
+                checked={hpt ? hpt.enabled : null}
+                loading={loadingToggle === "hpt"}
+                onToggle={(v) =>
+                  toggleSetting("hpt", v, "get_hpt_state", "set_hpt_state")
+                }
+              />
             </div>
           </CardContent>
         </Card>
@@ -554,220 +611,220 @@ export default function Settings() {
                   </p>
                 </div>
               </div>
-            {/* ══════════ 电源计划列表 ══════════ */}
-            <div className="space-y-2">
-              {plans
-                .filter((p) => !p.name.toLowerCase().includes("overlay"))
-                .map((plan) => (
-                  <div
-                    key={plan.guid}
-                    className={cn(
-                      "flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5 transition-colors",
-                      plan.is_active
-                        ? "border-yellow-500/50 bg-yellow-500/10"
-                        : "border-border bg-muted/30 hover:bg-muted/50",
-                    )}
-                  >
-                    <span
+              {/* ══════════ 电源计划列表 ══════════ */}
+              <div className="space-y-2">
+                {plans
+                  .filter((p) => !p.name.toLowerCase().includes("overlay"))
+                  .map((plan) => (
+                    <div
+                      key={plan.guid}
                       className={cn(
-                        "text-sm font-medium truncate",
-                        plan.is_active && "text-yellow-400",
+                        "flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5 transition-colors",
+                        plan.is_active
+                          ? "border-yellow-500/50 bg-yellow-500/10"
+                          : "border-border bg-muted/30 hover:bg-muted/50",
                       )}
-                      title={plan.name}
                     >
-                      {plan.name}
-                    </span>
-                    {/* 右侧：删除（非激活计划）+ 激活开关 */}
-                    <div className="flex items-center gap-1 shrink-0">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7 text-muted-foreground hover:text-red-400 hover:bg-red-500/10"
-                        disabled={plan.is_active || powDeleting !== null}
-                        title={
-                          plan.is_active
-                            ? "当前激活中的计划不可删除，请先切换其他计划"
-                            : "删除该电源计划"
-                        }
-                        onClick={() => setConfirmDeletePlan(plan)}
-                      >
-                        {powDeleting === plan.guid ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Trash2 className="w-3.5 h-3.5" />
+                      <span
+                        className={cn(
+                          "text-sm font-medium truncate",
+                          plan.is_active && "text-yellow-400",
                         )}
-                      </Button>
-                      {/* 滑动开关切换电源计划 */}
-                      <Switch
-                        checked={plan.is_active}
-                        onCheckedChange={() => {
-                          if (!plan.is_active) handlePowerPlan(plan.guid);
+                        title={plan.name}
+                      >
+                        {plan.name}
+                      </span>
+                      {/* 右侧：删除（非激活计划）+ 激活开关 */}
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-muted-foreground hover:text-red-400 hover:bg-red-500/10"
+                          disabled={plan.is_active || powDeleting !== null}
+                          title={
+                            plan.is_active
+                              ? "当前激活中的计划不可删除，请先切换其他计划"
+                              : "删除该电源计划"
+                          }
+                          onClick={() => setConfirmDeletePlan(plan)}
+                        >
+                          {powDeleting === plan.guid ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Trash2 className="w-3.5 h-3.5" />
+                          )}
+                        </Button>
+                        {/* 滑动开关切换电源计划 */}
+                        <Switch
+                          checked={plan.is_active}
+                          onCheckedChange={() => {
+                            if (!plan.is_active) handlePowerPlan(plan.guid);
+                          }}
+                          disabled={powSwitching !== null}
+                        />
+                      </div>
+                    </div>
+                  ))}
+
+                {/* 删除电源计划二次确认（防误删；激活计划由后端 API 兜底拒绝） */}
+                <AlertDialog
+                  open={confirmDeletePlan !== null}
+                  onOpenChange={(open) => {
+                    if (!open) setConfirmDeletePlan(null);
+                  }}
+                >
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>删除电源计划</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        确定要删除电源计划「{confirmDeletePlan?.name}」吗？
+                        此操作不可恢复（需重新创建）。
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel disabled={powDeleting !== null}>
+                        取消
+                      </AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-red-600 hover:bg-red-700 text-white"
+                        disabled={powDeleting !== null}
+                        onClick={() => {
+                          if (confirmDeletePlan) {
+                            void handleDeletePowerPlan(confirmDeletePlan.guid);
+                          }
                         }}
-                        disabled={powSwitching !== null}
-                      />
-                    </div>
-                  </div>
-                ))}
-
-              {/* 删除电源计划二次确认（防误删；激活计划由后端 API 兜底拒绝） */}
-              <AlertDialog
-                open={confirmDeletePlan !== null}
-                onOpenChange={(open) => {
-                  if (!open) setConfirmDeletePlan(null);
-                }}
-              >
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>删除电源计划</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      确定要删除电源计划「{confirmDeletePlan?.name}」吗？
-                      此操作不可恢复（需重新创建）。
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel disabled={powDeleting !== null}>
-                      取消
-                    </AlertDialogCancel>
-                    <AlertDialogAction
-                      className="bg-red-600 hover:bg-red-700 text-white"
-                      disabled={powDeleting !== null}
-                      onClick={() => {
-                        if (confirmDeletePlan) {
-                          void handleDeletePowerPlan(confirmDeletePlan.guid);
-                        }
-                      }}
-                    >
-                      删除
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-
-              {/* 异类线程调度策略（大小核 CPU） */}
-              <div className="border-t border-border pt-3 mt-2 space-y-3">
-                {/* 标题样式与 NVIDIA 显卡电源管理模式统一（图标容器 + 图标大小 + 字体） */}
-                <div className="flex items-center gap-2">
-                  <div className="p-1.5 rounded-md bg-yellow-500/10 shrink-0">
-                    <Cpu className="w-5 h-5 text-yellow-400" />
-                  </div>
-                  <h3 className="text-sm font-semibold">
-                    核心策略（Amd/Intel 适用）
-                  </h3>
-                </div>
-                {!hetero ? (
-                  <p className="text-xs text-muted-foreground/70">读取中...</p>
-                ) : !hetero.supported ? (
-                  <p className="text-xs text-muted-foreground/70">
-                    当前设备不支持（非混合架构 CPU）
-                  </p>
-                ) : (
-                  <>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-muted-foreground shrink-0">
-                        异类线程调度策略
-                      </span>
-                      <Select
-                        value={String(hetero.thread_ac ?? HETERO_AC_DEFAULT)}
-                        onValueChange={(v) =>
-                          handleHeteroChange("thread", Number(v))
-                        }
-                        disabled={heteroSaving !== null}
                       >
-                        <SelectTrigger className="h-8 w-[170px] text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {HETERO_OPTIONS.map((opt) => (
-                            <SelectItem
-                              key={opt.value}
-                              value={String(opt.value)}
-                            >
-                              {opt.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-muted-foreground shrink-0">
-                        异类短运行线程调度策略
-                      </span>
-                      <Select
-                        value={String(hetero.short_ac ?? HETERO_AC_DEFAULT)}
-                        onValueChange={(v) =>
-                          handleHeteroChange("short", Number(v))
-                        }
-                        disabled={heteroSaving !== null}
-                      >
-                        <SelectTrigger className="h-8 w-[170px] text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {HETERO_OPTIONS.map((opt) => (
-                            <SelectItem
-                              key={opt.value}
-                              value={String(opt.value)}
-                            >
-                              {opt.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
+                        删除
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
 
-            {/* ══════════ NVIDIA 显卡电源管理模式（并入电源计划卡片） ══════════ */}
-            <div className="space-y-2 border-t border-border pt-3 mt-2">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2 min-w-0">
-                  <div className="p-1.5 rounded-md bg-green-500/10 shrink-0">
-                    <MonitorPlay className="w-5 h-5 text-green-400" />
-                  </div>
-                  <div className="min-w-0">
+                {/* 异类线程调度策略（大小核 CPU） */}
+                <div className="border-t border-border pt-3 mt-2 space-y-3">
+                  {/* 标题样式与 NVIDIA 显卡电源管理模式统一（图标容器 + 图标大小 + 字体） */}
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 rounded-md bg-yellow-500/10 shrink-0">
+                      <Cpu className="w-5 h-5 text-yellow-400" />
+                    </div>
                     <h3 className="text-sm font-semibold">
-                      NVIDIA 电源模式
+                      核心策略（Amd/Intel 适用）
                     </h3>
-                    <p
-                      className={cn(
-                        "text-xs truncate",
-                        nvidiaPmError
-                          ? "text-red-400/80"
-                          : "text-muted-foreground",
-                      )}
-                      title={nvidiaPmError ?? undefined}
-                    >
-                      {nvidiaPmError ??
-                        (nvidiaPm
-                          ? NVIDIA_PM_OPTIONS.find(
-                              (o) => o.value === nvidiaPm,
-                            )?.label ?? "—"
-                          : "读取中…")}
-                    </p>
                   </div>
+                  {!hetero ? (
+                    <p className="text-xs text-muted-foreground/70">
+                      读取中...
+                    </p>
+                  ) : !hetero.supported ? (
+                    <p className="text-xs text-muted-foreground/70">
+                      当前设备不支持（非混合架构 CPU）
+                    </p>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs text-muted-foreground shrink-0">
+                          异类线程调度策略
+                        </span>
+                        <Select
+                          value={String(hetero.thread_ac ?? HETERO_AC_DEFAULT)}
+                          onValueChange={(v) =>
+                            handleHeteroChange("thread", Number(v))
+                          }
+                          disabled={heteroSaving !== null}
+                        >
+                          <SelectTrigger className="h-8 w-[170px] text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {HETERO_OPTIONS.map((opt) => (
+                              <SelectItem
+                                key={opt.value}
+                                value={String(opt.value)}
+                              >
+                                {opt.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs text-muted-foreground shrink-0">
+                          异类短运行线程调度策略
+                        </span>
+                        <Select
+                          value={String(hetero.short_ac ?? HETERO_AC_DEFAULT)}
+                          onValueChange={(v) =>
+                            handleHeteroChange("short", Number(v))
+                          }
+                          disabled={heteroSaving !== null}
+                        >
+                          <SelectTrigger className="h-8 w-[170px] text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {HETERO_OPTIONS.map((opt) => (
+                              <SelectItem
+                                key={opt.value}
+                                value={String(opt.value)}
+                              >
+                                {opt.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </>
+                  )}
                 </div>
-                {!nvidiaPmError && (
-                  <Select
-                    value={nvidiaPm ?? undefined}
-                    onValueChange={handleNvidiaPmChange}
-                    disabled={nvidiaPmSaving}
-                  >
-                    <SelectTrigger className="h-8 w-[170px] text-xs">
-                      <SelectValue placeholder="读取中…" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {NVIDIA_PM_OPTIONS.map((opt) => (
-                        <SelectItem key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
               </div>
-            </div>
+
+              {/* ══════════ NVIDIA 显卡电源管理模式（并入电源计划卡片） ══════════ */}
+              <div className="space-y-2 border-t border-border pt-3 mt-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="p-1.5 rounded-md bg-green-500/10 shrink-0">
+                      <MonitorPlay className="w-5 h-5 text-green-400" />
+                    </div>
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold">NVIDIA 电源模式</h3>
+                      <p
+                        className={cn(
+                          "text-xs truncate",
+                          nvidiaPmError
+                            ? "text-red-400/80"
+                            : "text-muted-foreground",
+                        )}
+                        title={nvidiaPmError ?? undefined}
+                      >
+                        {nvidiaPmError ??
+                          (nvidiaPm
+                            ? (NVIDIA_PM_OPTIONS.find(
+                                (o) => o.value === nvidiaPm,
+                              )?.label ?? "—")
+                            : "读取中…")}
+                      </p>
+                    </div>
+                  </div>
+                  {!nvidiaPmError && (
+                    <Select
+                      value={nvidiaPm ?? undefined}
+                      onValueChange={handleNvidiaPmChange}
+                      disabled={nvidiaPmSaving}
+                    >
+                      <SelectTrigger className="h-8 w-[170px] text-xs">
+                        <SelectValue placeholder="读取中…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {NVIDIA_PM_OPTIONS.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </div>
+              </div>
             </div>
           </CardContent>
         </Card>

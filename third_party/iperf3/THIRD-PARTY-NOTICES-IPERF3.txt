@@ -1,0 +1,87 @@
+THIRD-PARTY NOTICES — iperf3（随包二进制）
+=========================================
+
+本产品（SysEnv Console Manager / SECM）随包分发以下第三方二进制：
+
+  iperf3.exe    iperf 3.21        BSD-3-Clause
+  cygwin1.dll   Cygwin 3.6.7-1    LGPL-3.0-or-later（含链接例外）
+
+来源：
+  https://github.com/ar51an/iperf3-win-builds/releases/download/3.21/iperf-3.21-win64.zip
+  zip sha256: 9b73b7e0e0326347b5f4ac4f6a1fc34fe60a5966e5fd172c7bfcd0e1cc93e709
+
+分发文件 sha256：
+  08d35a41132930b3f2657b99cb81ae651ebbc9ac42e387084bb8d76547dbb389  iperf3.exe
+  0ab76b4724499df54b75b7fa701788f1e77425ce65c8bca0a9f2120598bb8a70  cygwin1.dll
+
+
+1) iperf3（BSD-3-Clause）
+------------------------
+
+  iperf, Copyright (c) 2014-2026, The Regents of the University of California,
+  through Lawrence Berkeley National Laboratory (subject to receipt of any
+  required approvals from the U.S. Dept. of Energy).  All rights reserved.
+
+  以源代码和二进制形式重新分发和使用，无论是否经过修改，均被允许，前提是
+  满足以下条件：
+  (1) 源代码分发必须保留上述版权声明、条件列表与免责声明；
+  (2) 二进制形式分发必须在随附文档和/或其他材料中复现上述版权声明、
+      条件列表与免责声明；
+  (3) 未经事先书面许可，不得使用 University of California、Lawrence Berkeley
+      National Laboratory、U.S. Dept. of Energy 或贡献者的名称为本软件的
+      衍生产品背书或推广。
+
+  本软件按「原样」提供，不附带任何明示或暗示的担保。
+
+  许可全文见：LICENSE-IPERF3-BSD-3-Clause.txt
+  上游源码：https://github.com/esnet/iperf
+
+  ── 上游 LICENSE 另行列明的内嵌第三方条款（原件同见许可全文）──
+   * src/cjson.{c,h}         Copyright (c) 2009-2017 Dave Gamble and cJSON
+                             contributors — MIT
+   * src/net.{c,h}           Copyright (c) 2005-2007 Russ Cox, MIT — MIT
+                             （含 Lucent Technologies / Rob Pike / Sape
+                              Mullender / Russ Cox 的早期库部分）
+   * src/net.c               Copyright (c) 2001 Eric Jackson — BSD-3-Clause
+   * src/queue.h             Copyright (c) 1991, 1993 The Regents of the
+                             University of California — BSD-3-Clause
+   * src/units.{c,h}         Copyright (c) 1999-2003 The Board of Trustees of
+                             the University of Illinois — UIUC/NCSA 许可
+   * src/portable_endian.h   Mathias Panzenböck — Public Domain
+
+
+2) Cygwin 运行时（LGPL-3.0-or-later + 链接例外）
+----------------------------------------------
+
+  cygwin1.dll 按 Cygwin 官方许可条款分发。
+  「winsup」子目录中的 Cygwin API 库适用 GNU Lesser General Public License
+  version 3 or later（LGPL-3.0-or-later）。
+
+  许可全文见：
+    LICENSE-LGPL-3.0.txt   GNU Lesser General Public License v3
+    LICENSE-GPL-3.0.txt    GNU General Public License v3
+                           （LGPLv3 是对 GPLv3 的附加许可，二者需同时提供）
+
+  ── Cygwin 链接例外（原文）──────────────────────────────────────────────
+  As a special exception, the copyright holders of the Cygwin library grant
+  you additional permission to link libcygwin.a, crt0.o, and gcrt0.o with
+  independent modules to produce an executable, and to convey the resulting
+  executable under terms of your choice, without any need to comply with the
+  conditions of LGPLv3 section 4. An independent module is a module which is
+  not itself based on the Cygwin library.
+
+  ── 本产品的使用方式与合规说明 ─────────────────────────────────────────
+   * iperf3.exe 是 Cygwin 链接产物，受上述链接例外保护，按 BSD-3-Clause 分发。
+   * cygwin1.dll 由本产品**原样（未修改）**随包提供；SECM 自身不链接它，
+     属于聚合分发，SECM 的 MIT 许可不受影响。
+   * 未修改 cygwin1.dll，故无需履行「修改须声明」义务。
+   * Cygwin 源码可获取：https://cygwin.com/git.html
+
+  许可参考：https://cygwin.com/licensing.html
+
+
+3) 说明
+-------
+
+本文件与上述许可全文（LICENSE-IPERF3-BSD-3-Clause.txt、LICENSE-LGPL-3.0.txt、
+LICENSE-GPL-3.0.txt）随安装包一并分发，位于安装目录的 resources/iperf3/ 下。

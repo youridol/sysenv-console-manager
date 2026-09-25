@@ -1,7 +1,9 @@
 //! 纯 Rust HTTP 客户端（ureq 薄封装 + 固定 URL 白名单）— P5
 //!
 //! 替换 `Invoke-RestMethod`（PowerShell）+ `curl` 外部命令链路。
-//! 安全约束（R4）：**禁止拼接任意 URL** — 所有请求必须先通过白名单前缀校验。
+//! 安全约束（R4）：**禁止拼接任意 URL** — 所有请求必须先通过白名单校验。
+//! 校验按 `(scheme, host, port)` 全等比较（原实现为字符串前缀匹配，可被主机后缀、
+//! userinfo、端口等形式绕过；见 ADR-0001 D4 与 `validate_url` 注释）。
 //!
 //! 线程模型：ureq 为同步阻塞模型，天然适配 `spawn_blocking`（S8）；
 //! 超时 5s（与现状一致），网络失败降级占位由上层处理。
@@ -11,14 +13,100 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+/// 白名单项的结构化形式：`(scheme, host, port)` + 路径前缀约束。
+///
+/// 原实现用 `url.starts_with(allowed)` 做字符串前缀比对，只要以白名单字符串开头
+/// 即通过。实测以下四种输入全部绕过校验并会被实际发起请求（ADR-0001 D4）：
+///
+/// - `http://api64.ipify.org.evil.com/`     主机后缀伪装
+/// - `https://myip.ipip.net.evil.com/x`     主机后缀伪装
+/// - `http://api64.ipify.org:8080@evil.com/` userinfo 伪装
+/// - `http://ip-api.com/json/../evil`       路径穿越
+///
+/// 现改为解析 URL 后按 scheme/host/port 全等比较；`path_prefix` 保留原白名单的
+/// 路径层级约束（`ip-api.com` 仍只允许 `/json/` 之下），并额外拒绝路径穿越。
+#[derive(Debug, Clone, Copy)]
+pub struct AllowlistEntry {
+    /// 协议（大小写不敏感）。
+    pub scheme: &'static str,
+    /// 主机名（大小写不敏感，全等）。
+    pub host: &'static str,
+    /// 端口；白名单项与请求 URL 都按 scheme 默认端口展开后比较。
+    pub port: u16,
+    /// 路径前缀约束（空串表示不限制路径）。
+    pub path_prefix: &'static str,
+}
+
 /// 固定 URL 白名单（R4 安全：禁止拼接任意 URL）
 ///
 /// 新增外部接口须先在此登记，否则请求被拒。
-pub const HTTP_ALLOWLIST: &[&str] = &[
-    "http://ip-api.com/json/",
-    "http://api64.ipify.org",
-    "https://myip.ipip.net",
+pub const HTTP_ALLOWLIST: &[AllowlistEntry] = &[
+    AllowlistEntry {
+        scheme: "http",
+        host: "ip-api.com",
+        port: 80,
+        path_prefix: "/json/",
+    },
+    AllowlistEntry {
+        scheme: "http",
+        host: "api64.ipify.org",
+        port: 80,
+        path_prefix: "",
+    },
+    AllowlistEntry {
+        scheme: "https",
+        host: "myip.ipip.net",
+        port: 443,
+        path_prefix: "",
+    },
 ];
+
+/// scheme 的默认端口；未登记的 scheme 返回 `None`（其 URL 一律被拒）。
+fn default_port(scheme: &str) -> Option<u16> {
+    if scheme.eq_ignore_ascii_case("http") {
+        Some(80)
+    } else if scheme.eq_ignore_ascii_case("https") {
+        Some(443)
+    } else {
+        None
+    }
+}
+
+/// 把 URL 切成 `(scheme, host, port, path)`；任何不合规形态返回 `None`。
+///
+/// 拒绝：无 `://`、scheme 为空或未登记、authority 为空、含 userinfo（`@`）、
+/// 端口非数字或越界、路径含 `..`。
+fn split_url(url: &str) -> Option<(&str, &str, u16, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    // authority 到第一个 `/`、`?` 或 `#` 结束
+    let end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let path = &rest[end..];
+    if authority.is_empty() {
+        return None;
+    }
+    // userinfo（`user:pass@host`）一律拒绝：白名单只登记裸主机名
+    if authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (authority, default_port(scheme)?),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // 路径穿越：任何 `..` 段都拒绝（合法调用点不会使用）
+    if path.contains("..") {
+        return None;
+    }
+    Some((scheme, host, port, path))
+}
 
 /// 默认超时（秒，与现状 PowerShell Invoke-RestMethod -TimeoutSec 5 一致）
 pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -44,13 +132,21 @@ fn filter_by_family(addrs: Vec<SocketAddr>, family: IpFamily) -> Vec<SocketAddr>
         .collect()
 }
 
-/// 校验 URL 是否在白名单内（前缀匹配）
+/// 校验 URL 是否在白名单内（`(scheme, host, port)` 全等 + 路径前缀）
 ///
-/// 语义约定：合法 → `Ok(())`；非法 → `Err(CollectError::Parse)`
+/// 语义约定：合法 → `Ok(())`；非法 → `Err(CollectError::Parse)`。
+///
+/// 与旧前缀匹配的差别：`http://api64.ipify.org.evil.com/` 之类不再通过。
 pub fn validate_url(url: &str) -> Result<(), CollectError> {
-    let ok = HTTP_ALLOWLIST
-        .iter()
-        .any(|allowed| url.starts_with(allowed));
+    let ok = match split_url(url) {
+        Some((scheme, host, port, path)) => HTTP_ALLOWLIST.iter().any(|entry| {
+            scheme.eq_ignore_ascii_case(entry.scheme)
+                && host.eq_ignore_ascii_case(entry.host)
+                && port == entry.port
+                && path.starts_with(entry.path_prefix)
+        }),
+        None => false,
+    };
     if ok {
         Ok(())
     } else {
@@ -137,10 +233,61 @@ mod tests {
         assert!(validate_url("http://ip-api.com/json/?fields=query").is_ok());
         assert!(validate_url("http://api64.ipify.org").is_ok());
         assert!(validate_url("https://myip.ipip.net").is_ok());
-        // 前缀匹配边界：白名单 URL 自身也是合法目标
+        // 白名单 URL 自身也是合法目标（路径前缀允许更深的子路径）
         assert!(validate_url("http://ip-api.com/json/").is_ok());
+        // 主机大小写不敏感（DNS 语义）
+        assert!(validate_url("http://IP-API.COM/json/").is_ok());
     }
 
+    /// 前缀匹配时代的四类绕过输入：全部必须被拒（ADR-0001 D4）。
+    ///
+    /// 修复前的 `url.starts_with(allowed)` 对这四个输入返回 `true`，
+    /// 并会真正发起请求（实测）。本用例固化修复后的行为。
+    #[test]
+    fn test_validate_url_rejects_prefix_bypasses() {
+        // 1) 主机后缀伪装：白名单主机名 + 额外域名后缀
+        assert!(validate_url("http://api64.ipify.org.evil.com/").is_err());
+        assert!(validate_url("https://myip.ipip.net.evil.com/x").is_err());
+        assert!(validate_url("http://ip-api.com.evil.com/json/").is_err());
+        // 2) userinfo 伪装：把白名单主机塞进 userinfo，真正连的是 evil.com
+        assert!(validate_url("http://api64.ipify.org:8080@evil.com/").is_err());
+        assert!(validate_url("http://user@api64.ipify.org/").is_err());
+        // 3) 端口伪装：前缀命中但端口不是白名单端口
+        assert!(validate_url("http://ip-api.com:8080/json/").is_err());
+        assert!(validate_url("https://myip.ipip.net:8443/").is_err());
+        // 4) 路径穿越：前缀命中但路径越出约束范围
+        assert!(validate_url("http://ip-api.com/json/../evil").is_err());
+        assert!(validate_url("http://api64.ipify.org/../evil").is_err());
+    }
+
+    /// 结构化比较的边界：路径前缀必须按段匹配，不做子串匹配。
+    #[test]
+    fn test_validate_url_path_prefix_is_structural() {
+        // `ip-api.com` 只允许 `/json/` 之下；`/jsonx/` 不满足前缀
+        assert!(validate_url("http://ip-api.com/jsonx/").is_err());
+        assert!(validate_url("http://ip-api.com/").is_err());
+        // 不带路径的主机允许（白名单 path_prefix 为空）
+        assert!(validate_url("http://api64.ipify.org/?x=1").is_ok());
+    }
+
+    /// `split_url` 的拒绝面：无协议 / 空 authority / 非数字端口 / 未登记协议。
+    #[test]
+    fn test_split_url_rejects_malformed() {
+        assert!(split_url("ip-api.com/json/").is_none());
+        assert!(split_url("http://").is_none());
+        assert!(split_url("http://:8080/").is_none());
+        assert!(split_url("http://ip-api.com:abc/json/").is_none());
+        assert!(split_url("ftp://ip-api.com/json/").is_none());
+        // 合法样本的解析结果
+        assert_eq!(
+            split_url("http://ip-api.com/json/?a=1"),
+            Some(("http", "ip-api.com", 80, "/json/?a=1"))
+        );
+        assert_eq!(
+            split_url("https://myip.ipip.net"),
+            Some(("https", "myip.ipip.net", 443, ""))
+        );
+    }
     #[test]
     fn test_validate_url_reject() {
         // 白名单外 → Err（R4：禁止任意 URL）

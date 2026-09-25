@@ -21,11 +21,38 @@
     <PublishSingleFile>false</PublishSingleFile>
     <!-- 关闭不必要的分析器/代码分析开销，保持 Release 构建快速稳定 -->
     <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <!--
+      CA1822：FanMapper.ScanAndMapFans 保持**实例**方法 —— 与上游 LiteMonitor
+      FanMapper.cs:16 的实例类结构一一对应，便于逐条对照 review（移植目标要求保持上游结构）。
+
+      CA1051：上游移植层（SensorMap.CpuCoreSensors.Clock/Load、SnapshotBuilder.Tier1/Tier2
+      读数字段等）刻意使用**公开可变字段**而不是属性 —— 与上游 LiteMonitor
+      SensorMap.cs:22-26 / HardwareValueProvider 的数据载体写法一致，保证端口可逐行对照，
+      并且这些 DTO 只是采集循环内的私有数据结构，不经 HTTP 契约暴露。
+
+      CA2249：MetricUtils 中的 name.IndexOf(..., StringComparison.OrdinalIgnoreCase) >= 0
+      是从上游 MetricUtils.cs 逐条移植的写法，改成 Contains 会偏离可对照性。
+
+      CA1854：SensorMap.cs:175 的 ContainsKey + 索引器与上游 SensorMap.cs:179-181 的
+      if (!newMap.ContainsKey(key)) ... else newMap[key] 结构一致，保持原样以便对照。
+    -->
+    <NoWarn>$(NoWarn);CA1822;CA1051;CA2249;CA1854</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- MPL-2.0 库：仅在此 sidecar 内使用；源码随 SECM 发行包附送（resources/lhm/source/） -->
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+    <!--
+      tier-1 PDH 性能计数器（LiteMonitor PerformanceCounterManager 的移植依赖）。
+      .NET 8 起 PerformanceCounter 不在基础框架内，需显式引用该包（Windows-only）。
+    -->
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 单元测试工程独立在 sidecar-lhm/tests/ 下；主工程不编译它 -->
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
   </ItemGroup>
 
 </Project>

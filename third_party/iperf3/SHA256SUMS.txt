@@ -1,0 +1,12 @@
+# iperf3 随包二进制校验和（sha256，格式：<hash>  <filename>）
+#
+# 来源（唯一权威下载地址）：
+#   https://github.com/ar51an/iperf3-win-builds/releases/download/3.21/iperf-3.21-win64.zip
+# 上游发布页公布的 zip 摘要（sha256）：
+#   9b73b7e0e0326347b5f4ac4f6a1fc34fe60a5966e5fd172c7bfcd0e1cc93e709
+#
+# 说明：Windows 版 iperf3 为 Cygwin 链接构建，iperf3.exe 与 cygwin1.dll 必须成对分发。
+# scripts/stage-iperf3.mjs 会在构建前逐项校验以下摘要，不符即中止构建。
+
+08d35a41132930b3f2657b99cb81ae651ebbc9ac42e387084bb8d76547dbb389  iperf3.exe
+0ab76b4724499df54b75b7fa701788f1e77425ce65c8bca0a9f2120598bb8a70  cygwin1.dll

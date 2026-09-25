@@ -1,6 +1,6 @@
 [package]
 name = "sysenv-console-manager"
-version = "1.19.0"
+version = "2.1.0"
 description = "Windows 10/11 System Environment Management Tool"
 authors = ["SECM Team"]
 edition = "2021"
@@ -19,9 +19,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
-tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,7 +37,6 @@ encoding_rs = "0.8"
 socket2 = "0.6"
 # 纯 Rust 驱动采集模块（P1-P13 底层采集；独立 crate，可单独 cargo build/test）
 secm-datasource = { path = "../datasource" }
-tiny_http = "0.12.0"
 # LHM sidecar HTTP 客户端（同步阻塞，在 sensor 查询链的 spawn_blocking 上下文内使用）
 ureq = "2"
 # log facade 桥接（datasource crate 的 log::* 转发到 SECM debug 体系）

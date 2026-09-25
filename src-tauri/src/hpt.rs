@@ -107,8 +107,7 @@ fn read_current() -> (Option<bool>, Option<bool>, Option<bool>) {
 /// 读取高精度计时器关闭状态（enabled = 已关闭）
 pub fn get_hpt_state() -> SettingState {
     let (clock, tick, dyn_tick) = read_current();
-    let enabled =
-        clock == Some(false) && tick == Some(false) && dyn_tick == Some(true);
+    let enabled = clock == Some(false) && tick == Some(false) && dyn_tick == Some(true);
     SettingState {
         name: "hpt".into(),
         enabled,
@@ -137,17 +136,41 @@ mod tests {
 
     #[test]
     fn 布尔值解析兼容中英文词表() {
-        assert_eq!(parse_bcd_bool("useplatformclock          No", "useplatformclock"), Some(false));
-        assert_eq!(parse_bcd_bool("useplatformclock        否", "useplatformclock"), Some(false));
-        assert_eq!(parse_bcd_bool("useplatformclock         Yes", "useplatformclock"), Some(true));
-        assert_eq!(parse_bcd_bool("useplatformclock        是", "useplatformclock"), Some(true));
-        assert_eq!(parse_bcd_bool("useplatformtick          false", "useplatformtick"), Some(false));
-        assert_eq!(parse_bcd_bool("disabledynamictick       true", "disabledynamictick"), Some(true));
+        assert_eq!(
+            parse_bcd_bool("useplatformclock          No", "useplatformclock"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_bcd_bool("useplatformclock        否", "useplatformclock"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_bcd_bool("useplatformclock         Yes", "useplatformclock"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_bcd_bool("useplatformclock        是", "useplatformclock"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_bcd_bool("useplatformtick          false", "useplatformtick"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_bcd_bool("disabledynamictick       true", "disabledynamictick"),
+            Some(true)
+        );
         // 不相关行/不完整行返回 None
-        assert_eq!(parse_bcd_bool("path                    partition=C:", "useplatformclock"), None);
+        assert_eq!(
+            parse_bcd_bool("path                    partition=C:", "useplatformclock"),
+            None
+        );
         assert_eq!(parse_bcd_bool("useplatformclock", "useplatformclock"), None);
         // 前缀不误匹配（如其他条目名）
-        assert_eq!(parse_bcd_bool("useplatformclockx         Yes", "useplatformclock"), None);
+        assert_eq!(
+            parse_bcd_bool("useplatformclockx         Yes", "useplatformclock"),
+            None
+        );
     }
 
     #[test]

@@ -60,13 +60,13 @@
   /* ── shadcn 下拉/弹出层 暗色 ── */
   --color-popover: hsl(0 0% 12%);
   --color-popover-foreground: hsl(210 30% 94%);
-  --sidebar: hsl(240 5.9% 10%);
+  --sidebar: hsl(0 0% 4%); /* = --color-background：左右侧边栏底色统一 */
   --sidebar-foreground: hsl(240 4.8% 95.9%);
   --sidebar-primary: hsl(224.3 76.3% 48%);
   --sidebar-primary-foreground: hsl(0 0% 100%);
   --sidebar-accent: hsl(240 3.7% 15.9%);
   --sidebar-accent-foreground: hsl(240 4.8% 95.9%);
-  --sidebar-border: hsl(240 3.7% 15.9%);
+  --sidebar-border: hsl(0 0% 16%); /* = --color-border：与右侧栏分割线同色 */
   --sidebar-ring: hsl(217.2 91.2% 59.8%);
 }
 
@@ -102,38 +102,43 @@
   background-clip: text;
 }
 
-/* ── Subtle scrollbar ── */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/* ── 全局隐藏滚动条（保留滚动能力）──
+ * 要求：滚动条不可见，但滚轮 / 触控板 / 键盘 / 拖拽滚动区域仍然生效。
+ * 因此**不能**用 `overflow: hidden`（那会真正禁用滚动），只把滚动条本身隐藏。
+ * 1) HTML 元素在 WebView2 中同样走 `::-webkit-scrollbar`；
+ * 2) `display: none` 与 `width/height: 0` 同时给，覆盖不同 WebView2 版本的行为；
+ * 3) `scrollbar-width` / `-ms-overflow-style` 覆盖非 WebKit 内核渲染路径。
+ * 注意：隐藏后仍可通过键盘（PageUp/Down、方向键）与滚轮滚动，视觉上不再占用宽度。
+ */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
-::-webkit-scrollbar-thumb {
-  background: hsl(220 14% 75%);
-  border-radius: 9999px;
-}
-.dark ::-webkit-scrollbar-thumb {
-  background: hsl(220 20% 28%);
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-thumb {
+  display: none;
 }
 
-/* ── 进程列表独立滚动条：常驻可见（比全局 6px 更宽，轨道带底色） ── */
-.proc-scrollbar::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+/* Radix `ScrollArea` 渲染的是**真实 DOM 节点**（data-slot="scroll-area-scrollbar"），
+ * 不是浏览器原生滚动条，因此上面的 `::-webkit-scrollbar` 规则对它无效。
+ * 隐藏该节点即可：Radix 仍保留 wheel / 键盘 / 拖拽滚动（其 thumb 只是视觉件），
+ * 故滚动功能不受影响。
+ */
+[data-slot="scroll-area-scrollbar"] {
+  display: none;
 }
-.proc-scrollbar::-webkit-scrollbar-track {
-  background: hsl(220 20% 12% / 0.5);
-  border-radius: 9999px;
-}
-.proc-scrollbar::-webkit-scrollbar-thumb {
-  background: hsl(220 20% 32%);
-  border-radius: 9999px;
-}
-.proc-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: hsl(220 20% 42%);
-}
+
+/* ── 进程列表滚动条 ──
+ * 历史上此处将滚动条做成"常驻可见 + 带底色轨道"（8px）。现按全局要求统一隐藏，
+ * 故本块不再声明可见样式。若将来需要恢复该列表的常驻滚动条，请在此显式覆盖为
+ * `display: block; width: 8px;` 并相应调整 thumb 颜色（全局规则的权重更低，
+ * 类选择器可覆盖 `*` 选择器）。
+ */
 
 /* ── 悬浮卡片阴影：亮色柔和投影 / 暗色加重投影，营造漂浮立体感 ── */
 .shadow-card {
@@ -372,13 +377,13 @@
 }
 
 :root {
-  --sidebar: hsl(0 0% 98%);
+  --sidebar: hsl(220 20% 98%); /* = --color-background：左右侧边栏底色统一 */
   --sidebar-foreground: hsl(240 5.3% 26.1%);
   --sidebar-primary: hsl(240 5.9% 10%);
   --sidebar-primary-foreground: hsl(0 0% 98%);
   --sidebar-accent: hsl(240 4.8% 95.9%);
   --sidebar-accent-foreground: hsl(240 5.9% 10%);
-  --sidebar-border: hsl(220 13% 91%);
+  --sidebar-border: hsl(220 14% 90%); /* = --color-border：与右侧栏分割线同色 */
   --sidebar-ring: hsl(217.2 91.2% 59.8%);
 }
 
