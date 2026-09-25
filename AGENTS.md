@@ -111,7 +111,7 @@ npm run package:portable    # 便携 zip + 发行归档（末尾自动跑 fix:in
 | src-tauri 单元测试 | `bash scripts/test-lib.sh` | 源码含 249 处 `#[test]`/`#[tokio::test]`；脚本编译后用 SDK 的 `mt.exe` 注入 comctl32 v6 manifest，并把 `TEMP`/`TMP`/`APPDATA`/`SECM_RUNTIME_DIR` 固定到 `build/tmp/`。**必须用本脚本**：直接 `cargo test` 会重编译并抹掉注入的 manifest，测试二进制以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 崩溃 |
 | 单个集成测试 | `cd src-tauri && cargo test --test <名>` | `src-tauri/tests/` 下 19 个测试目标；夹具根目录由 `tests/common/mod.rs` 固定为 `build/tmp/fixtures` |
 | 采集 crate | `cd datasource && cargo test && cargo check --all-targets` | 源码含 48 处 `#[test]`，其中 1 个 `#[ignore]` 真机项；`check` 要求零警告 |
-| LHM sidecar | `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release` | xUnit（264 用例），覆盖映射规则、契约、提权、tier-2 快照并发与合并语义 |
+| LHM sidecar | `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release` | xUnit（274 用例），覆盖映射规则、契约、提权、tier-2 快照并发与合并语义 |
 | 前端 | 无测试框架 | 仓库内无 vitest/jest 与 `*.test.tsx`；前端改动以 `npm run build`（tsc）与 `npm run lint` 为门禁 |
 
 - 干净环境或缺 Windows SDK 时用 `REQUIRE_MANIFEST=1 bash scripts/test-lib.sh`：缺 `mt.exe` 时脚本明确失败而非静默降级。缺 manifest 的测试二进制会以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 崩溃，此时测试结论不可信。

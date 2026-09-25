@@ -985,6 +985,10 @@ static class Program
                         // 选定动作需要 IComputer，故由 LhmCollector 在内部完成。
                         _lhm.SelectNetworkHardware(tier1.Network);
                         Log($"[LhmSidecar] LHM hardware tree opened (cpu=\"{_lhm.CpuName}\" gpus={_lhm.GpuHardware().Count} network={networkHardwares.Count} tier2={includeTier2})");
+
+                        // 内存型号补齐：内存节点固定要 ~2.3s（逐条读 SPD），故不在主树开启，
+                        // 而由独立线程并行打开。幂等；探针未完成时 memory.name 为空（契约允许）。
+                        _lhm.StartMemoryProbe();
                     }
                     catch (Exception ex)
                     {

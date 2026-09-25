@@ -195,7 +195,28 @@ pub fn run() {
 
 
 
+
+            // LHM sidecar 资源定位（非阻塞：仅解析并缓存 exe 路径；进程 lazy 启动）
+
+            crate::lhm::init(Some(app.handle()));
+
+            // LHM sidecar 预热（后台线程，非阻塞 setup）：把 .NET 冷启动 +
+            // 健康检查握手 + LHM 开树的等待从「首个 get_sensor_data 请求路径」
+            // 移到应用启动阶段。生产日志实测首个请求因此阻塞 4073ms 且返回
+            // available:false 空占位快照（硬件信息页长时间停在骨架屏）。
+            // 复用与请求路径完全相同的 lhm_snapshot()，不改变契约与降级语义，
+            // 不弹 UAC（sidecar 仍以普通权限启动，tier-2 需用户显式提权）。
+            crate::lhm::warm_up();
+
             // Initialize system tray (non-fatal: window still opens without tray)
+            //
+            // 放在 `warm_up()` **之后**：托盘登记校验失败时最多重试
+            // `VERIFY_ATTEMPTS × VERIFY_INTERVAL` = 10 × 200ms = 2.0 秒（实测发布版
+            // `SECM application started` → `System tray initialized` 恰好 2.01 秒）。
+            // 该校验**必须在主线程**执行：`TrayIcon::rect()` 内部走 `run_item_main_thread!`，
+            // 从后台线程调用会连续取不到图标矩形（已实测 10 次全失败），
+            // 故不能挪到后台线程，只能让 sidecar 预热先跑起来，使其 2 秒与
+            // 「.NET CLR 启动 + LHM 开树」重叠，不再串行叠加在首份数据之前。
 
             match tray::create_tray(app.handle()) {
 
@@ -218,20 +239,6 @@ pub fn run() {
                 }
 
             }
-
-
-
-            // LHM sidecar 资源定位（非阻塞：仅解析并缓存 exe 路径；进程 lazy 启动）
-
-            crate::lhm::init(Some(app.handle()));
-
-            // LHM sidecar 预热（后台线程，非阻塞 setup）：把 .NET 冷启动 +
-            // 健康检查握手 + LHM 开树的等待从「首个 get_sensor_data 请求路径」
-            // 移到应用启动阶段。生产日志实测首个请求因此阻塞 4073ms 且返回
-            // available:false 空占位快照（硬件信息页长时间停在骨架屏）。
-            // 复用与请求路径完全相同的 lhm_snapshot()，不改变契约与降级语义，
-            // 不弹 UAC（sidecar 仍以普通权限启动，tier-2 需用户显式提权）。
-            crate::lhm::warm_up();
 
             // PawnIO 驱动资源目录定位（缓存供 lhm.rs / 自愈线程无 AppHandle 时使用）
 

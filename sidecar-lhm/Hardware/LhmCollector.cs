@@ -57,6 +57,36 @@ public sealed class LhmCollector : IDisposable
     // 用后绑定包装，避免把 Computer 传进构造函数。
     private ComponentProcessor? _processor;
 
+    /// <summary>内存专用硬件树（只含 Memory 节点）。null = 尚未打开或打开失败。</summary>
+    /// <remarks>
+    /// 独立于主树的原因见 [`CreateComputer`] 注释：LHM 内存节点要逐条读 SPD，
+    /// 实测 <c>Open()</c> 固定耗时 2.3–2.6s。放在主树里会把这 2.3s 加到每次开树上，
+    /// 从而推迟首轮 tier-1/GPU/tier-2 出数；而它只提供 best-effort 的内存型号名。
+    /// 实测两棵树并行打开时总耗时 ≈ max(主树, 内存树)，故单列一棵树后台打开。
+    /// </remarks>
+    private Computer? _memComputer;
+
+    /// <summary>内存探针是否已启动（保证幂等，不重复开树）。</summary>
+    private bool _memProbeStarted;
+
+    /// <summary>内存探针代次：<see cref="Close"/> 自增，用于丢弃"关闭后才打开完成"的过期树。</summary>
+    /// <remarks>
+    /// 竞态：探针线程正在 <c>Open()</c> 时主线程调用 <see cref="Close"/>，探针随后把
+    /// 已无人持有的 Computer 赋给 <c>_memComputer</c>，句柄就此泄漏。探针在发布前
+    /// 比对代次，过期则自行关闭那棵树。
+    /// </remarks>
+    private int _memProbeGen;
+
+    /// <summary>保护 <see cref="_memComputer"/> 与 <see cref="_memProbeStarted"/>。</summary>
+    private readonly object _memLock = new();
+
+    /// <summary>
+    /// 测试接缝：内存树的创建工厂。默认（null）走真实 `new Computer { IsMemoryEnabled = true }`；
+    /// 单测注入假对象以验证幂等与代次守卫，避免真的打开 LHM 树（与 `Program` / `Tier2Task` 的
+    /// `*ForTesting` 接缝同一范式）。
+    /// </summary>
+    internal Func<Computer>? MemoryComputerFactoryForTesting;
+
     /// <summary>
     /// 创建 LHM Computer。
     ///
@@ -76,7 +106,11 @@ public sealed class LhmCollector : IDisposable
             IsCpuEnabled = true,
 
             IsGpuEnabled = true,          // GPU 温度/功耗/显存：厂商用户态通道（tier-1）
-            IsMemoryEnabled = true,       // 内存节点（tier-1 补充）
+            // Memory 节点**不在主树开启**：实测 LHM 内存节点的 Open() 固定耗时 2.3–2.6s
+            // （SPD 逐条读取），使主树开树从 ~516ms 涨到 ~2859ms，而它只提供 best-effort 的内存型号
+            // 名与推算值（权威值来自 GlobalMemoryStatusEx，见 CONTRACT-v3.md §3 memory 注释）。
+            // 改由独立后台线程 StartMemoryProbe() 并行补齐，见该方法的说明。
+            IsMemoryEnabled = false,
             IsNetworkEnabled = true,      // NetworkManager 的 LHM 吞吐兜底（上游 :73）
             IsBatteryEnabled = true,      // 电池（tier-1）
 
@@ -90,6 +124,79 @@ public sealed class LhmCollector : IDisposable
 
             IsPsuEnabled = false          // 上游 :85
         };
+    }
+
+    /// <summary>
+    /// 后台打开「内存专用树」以补齐内存型号名（幂等、非阻塞、失败静默）。
+    ///
+    /// 为什么要有这棵树：LHM 的 Memory 节点要逐条读取 SPD 才能拿到型号
+    /// （实测 <c>IsMemoryEnabled = true</c> 使 <c>Open()</c> 从 ~516ms 涨到 ~2859ms）。
+    /// 而内存的**权威**数值来自 `GlobalMemoryStatusEx`（见 CONTRACT-v3.md §3），
+    /// 契约把 LHM 内存型号明确标注为 best-effort。把 2.3s 放进主树等于让首屏
+    /// 的 CPU 频率/GPU/温度一起等它，代价与收益严重不匹配。
+    ///
+    /// 实测：两棵树并行打开时总耗时 ≈ max(主树 364ms, 内存树 2352ms)，
+    /// 故内存树独立成线程后，主树路径不再受其影响。
+    /// </summary>
+    public void StartMemoryProbe()
+    {
+        // gen 必须在锁外可见（探针闭包要捕获它），故在临界区内取出后再启动线程。
+        int gen;
+        lock (_memLock)
+        {
+            if (_memProbeStarted) return;
+            _memProbeStarted = true;
+            gen = _memProbeGen;
+        }
+
+        var probe = new Thread(() =>
+        {
+            Computer? mem = null;
+            try
+            {
+                var factory = MemoryComputerFactoryForTesting;
+                mem = factory != null ? factory() : new Computer { IsMemoryEnabled = true };
+                mem.Open();
+            }
+            catch
+            {
+                // best-effort：失败则内存型号留空（契约允许 null），不影响任何 tier-1 指标
+                try { mem?.Close(); } catch { }
+                return;
+            }
+
+            bool stale;
+            lock (_memLock)
+            {
+                // Close() 已自增代次 → 这棵树属于上一个生命周期，不得发布（否则句柄泄漏）
+                stale = gen != _memProbeGen;
+                if (!stale) _memComputer = mem;
+            }
+            if (stale) { try { mem.Close(); } catch { } }
+        })
+        {
+            IsBackground = true,
+            Name = "lhm-memory-probe"
+        };
+        probe.Start();
+    }
+
+    /// <summary>内存专用树（仅测试可见）。</summary>
+    internal Computer? MemoryProbeComputer
+    {
+        get { lock (_memLock) return _memComputer; }
+    }
+
+    /// <summary>内存探针是否已启动（仅测试可见）。</summary>
+    internal bool MemoryProbeStarted
+    {
+        get { lock (_memLock) return _memProbeStarted; }
+    }
+
+    /// <summary>内存探针代次（仅测试可见）。</summary>
+    internal int MemoryProbeGeneration
+    {
+        get { lock (_memLock) return _memProbeGen; }
     }
 
     /// <summary>
@@ -450,20 +557,46 @@ public sealed class LhmCollector : IDisposable
     }
 
     /// <summary>
+    /// 从内存节点列表中选出「代表型号节点」（纯函数，便于单测锁定规则）。
+    ///
+    /// 实测内存树有 4 个节点（2026-09-25，A-DATA DDR5）：
+    ///   - `Virtual Memory`：虚拟内存，排除；
+    ///   - `Total Memory`：仅 3 个总量传感器（Memory Used/Available/Load），**无型号信息**；
+    ///   - `A-DATA Technology - AX5U6400C3216G (#1/#3)`：SPD 型号节点，21 个传感器。
+    /// 契约 §3 `memory.name` 语义为"LHM 内存节点名 / SPD 型号"，前端 `model_name` 注释
+    /// 亦写明"内存型号（LHM SPD 补充）"，故必须优先取 SPD 节点而非 "Total Memory" 泛称。
+    ///
+    /// 判据：排除虚拟内存后取**传感器数最多**者（SPD 节点 21 个 ≫ Total Memory 的 3 个），
+    /// 全部被排除时退化取传感器最多的节点，永不抛异常。
+    /// </summary>
+    internal static IHardware? SelectMemoryModelNode(IEnumerable<IHardware> nodes)
+    {
+        var list = nodes.ToList();
+        if (list.Count == 0) return null;
+
+        var physical = list.Where(n => !SensorMap.Has(n.Name, "virtual")).ToList();
+        var pool = physical.Count > 0 ? physical : list;
+        return pool.OrderByDescending(n => n.Sensors.Length).First();
+    }
+
+    /// <summary>
     /// LHM 内存节点名（best-effort，契约 §3 memory.name）。
     /// 优先取非 Virtual 的物理内存节点（上游 SensorMatcher 用 hw.Name 含 "virtual" 排除虚拟内存，
     /// 见 SensorMatcher.cs:116）。
     /// </summary>
     public string? ReadMemoryName()
     {
-        var computer = _computer;
+        // 走**内存专用树**：主树已不再包含 Memory 节点（见 StartMemoryProbe 注释）。
+        // 探针尚未完成时返回 null，前端显示空由契约允许（best-effort）。
+        var computer = MemoryProbeComputer;
         if (computer == null) return null;
 
         var nodes = computer.Hardware.Where(h => h.HardwareType == HardwareType.Memory).ToList();
         if (nodes.Count == 0) return null;
 
-        var physical = nodes.FirstOrDefault(n => !SensorMap.Has(n.Name, "virtual")) ?? nodes[0];
-        return physical.Name;
+        // 选择规则见 SelectMemoryModelNode（优先 SPD 型号节点，而非 "Total Memory" 泛称）
+        var model = SelectMemoryModelNode(nodes);
+        return model?.Name;
     }
 
     /// <summary>
@@ -472,7 +605,8 @@ public sealed class LhmCollector : IDisposable
     /// </summary>
     public (long? Total, long? Used) ReadMemoryFromLhm()
     {
-        var computer = _computer;
+        // 与 ReadMemoryName 同源：内存节点只在专用树里（主树不开 Memory，见 StartMemoryProbe）。
+        var computer = MemoryProbeComputer;
         if (computer == null) return (null, null);
 
         var node = computer.Hardware
@@ -521,6 +655,14 @@ public sealed class LhmCollector : IDisposable
             CpuName = string.Empty;
             ReloadRequested = false;
             _tickCounter = 0;
+        }
+        // 内存专用树独立于主树，需一并释放（否则每次 Reload 会遗留一个驱动句柄）
+        lock (_memLock)
+        {
+            try { _memComputer?.Close(); } catch { }
+            _memComputer = null;
+            _memProbeGen++;   // 使在途探针结果作废
+            _memProbeStarted = false;
         }
         _sensorMap.Clear();
         _diskManager.ClearCache();

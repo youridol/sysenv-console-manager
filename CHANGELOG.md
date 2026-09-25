@@ -32,6 +32,44 @@
 并逐一断言 `runAsLaunches == 0`）；`npm run build`、`npm run lint` 退出 0；
 `bash scripts/test-lib.sh` → **249 passed; 0 failed**。
 
+### 修复（内存节点拖慢 LHM 开树约 2.5 秒，推迟 CPU 频率/GPU/温度首帧）
+
+**问题定位**：用户在硬件信息页看到 CPU 频率、GPU、温度要等约 8 秒。逐子系统实测
+`LibreHardwareMonitor` 的 `Computer.Open()`：只开 Memory 节点 **2641 ms**，
+而 CPU/GPU/主板/网络/存储/控制器各仅 13–187 ms、全关仅 16 ms —— 这 2.5 秒几乎
+全部来自 `IsMemoryEnabled = true`（逐条读 SPD）。它与 GPU、温度、提权均无关。
+
+**关键日志证据**（发布版 v2.1.0，外置观测 sidecar 日志行首次出现时刻）：
+`PDH counters initialized` 3041 ms → `LHM hardware tree opened` 6006 ms →
+首份数据 6146 ms；而同机 A/B 交错对照为 开树 3067 ms → 首份完整数据 5996 ms。
+
+**解决方案设计**：内存节点只提供 best-effort 的内存型号名（契约 §3 明确标注，
+权威数值来自 `GlobalMemoryStatusEx`），因此移出主树，改由独立后台线程
+`StartMemoryProbe()` 并行打开；主树 `IsMemoryEnabled = false`。
+另加代次守卫（`_memProbeGen`/`_memProbeStarted`）防止 `Close()` 与在途探针竞态
+导致句柄泄漏，并在 `Close()` 中一并释放内存树。
+
+**验证结果**：A/B 交错对照（同机同 exe，仅换 sidecar 二进制）——
+开树 **3067 → 452 ms**，首份 CPU 频率+GPU+温度 **5996 → 3509 ms**（节省约 2.5 秒）；
+正式产物端到端复核首帧 **1337–1689 ms**。内存型号在 4935 ms 补齐，不阻塞首帧。
+sidecar 单测 274 passed（新增 7 个），4 项变异测试全部被捕获。
+
+### 修复（托盘登记校验串行占用启动关键路径 2.0 秒）
+
+**问题定位**：`tray::create_tray` 的登记校验失败时重试
+`VERIFY_ATTEMPTS × VERIFY_INTERVAL` = 10 × 200ms = 2.0 秒（实测
+`SECM application started` → `System tray initialized` 恰好 2.01 秒），
+且它排在 `lhm::warm_up()` **之前**，把 sidecar 拉起整体推迟同等时长。
+
+**解决方案设计**：把 `warm_up()` 提到托盘创建之前，使 sidecar 预热与托盘校验的
+2 秒重叠。**不改动托盘校验的线程**：`TrayIcon::rect()` 内部走
+`run_item_main_thread!`，实测从后台线程调用会连续 10 次取不到图标矩形，
+故必须留在主线程——仅调整顺序，不改变其行为。
+
+**验证结果**：`started` → `tray initialized` 由 2.01 秒缩至 **9 ms**；
+首帧数据 5996 → **1628 ms**。托盘登记成功/失败结果与原版**逐字一致**
+（同机对照均为未登记，属该会话 explorer 未登记的既有环境现象，非本次回归）。
+
 ### 修复（首个采样请求被 sidecar 启动握手阻塞）
 
 **问题定位**：`lhm_snapshot()` 用阻塞 `state().lock()`。预热线程 `warm_up()`
