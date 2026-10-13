@@ -1,7 +1,7 @@
 {
   "name": "sysenv-console-manager",
   "private": true,
-  "version": "2.1.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "dev": "node scripts/run-with-project-tmp.mjs vite",

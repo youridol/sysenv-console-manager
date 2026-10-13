@@ -1,20 +1,11 @@
-//! 数据源接入层工具 — 旧数据源（PowerShell/外部命令）与新驱动（secm-datasource）切换
+//! 数据源接入层工具 — `secm-datasource` 采集错误的用户可见化
 //!
-//! - 过渡期保留 `legacy-data-source` feature：启用后 P1-P13 回退旧 PowerShell/外部命令实现
 //! - 错误显式化：新采集器返回 `Result<T, CollectError>`，本模块负责映射为
 //!   用户可见中文消息（`"中文操作描述: 技术细节"`）并打 R8 日志（含 API 名/操作名/详情）
 //!
 //! 依赖方向：本模块只依赖 datasource crate（叶子），业务模块依赖本模块；禁止反向依赖。
 
 use secm_datasource::CollectError;
-
-/// 是否启用旧数据源（编译期 feature，运行时不可变）
-///
-/// 迁移完成后（M6）删除本函数与全部 `legacy` 分支。
-#[inline]
-pub fn use_legacy() -> bool {
-    cfg!(feature = "legacy-data-source")
-}
 
 /// 将 CollectError 映射为用户可见消息（格式：`中文操作描述: 技术细节`）
 ///

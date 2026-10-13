@@ -268,30 +268,6 @@ public static class MetricUtils
         };
     }
 
-    /// <summary>设置页示例值。上游 MetricUtils.cs:256-270。</summary>
-    public static string GetSampleValueStr(string key)
-    {
-        var type = GetType(key);
-        return type switch
-        {
-            MetricType.Frequency => "9.9",  // GHz
-            MetricType.RPM => "9999",       // RPM
-            MetricType.DataSpeed => "9.9.", // MB
-            MetricType.DataSize => "9.9.",  // MB
-            _ => "99.9"
-        };
-    }
-
-    /// <summary>用户格式套用。上游 MetricUtils.cs:272-282。</summary>
-    public static string GetDisplayUnit(string key, string calculatedUnit, string? userFormat)
-    {
-        if (string.IsNullOrEmpty(userFormat))
-        {
-            return calculatedUnit;
-        }
-        return userFormat.Contains("{u}") ? userFormat.Replace("{u}", calculatedUnit) : userFormat;
-    }
-
     /// <summary>
     /// 字节数 → (数值字符串, 单位)。上游 MetricUtils.cs:288-307。
     /// 注意：换级阈值是 1000（不是 1024），避免 "1023 KB" 这类长串。

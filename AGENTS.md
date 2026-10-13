@@ -67,7 +67,7 @@ npm run package:portable    # 便携 zip + 发行归档（末尾自动跑 fix:in
 
 ## 发布版本
 
-- **版本三处同步**（不一致视为构建失败）：`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`。当前 `2.1.0`。
+- **版本三处同步**（不一致视为构建失败）：`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`。当前 `3.0.0`。
 - **版本类型判定**：PATCH=修复 / 格式 / 依赖 / 回退；MINOR=新功能 / 命令 / 组件；MAJOR=破坏性变更 / 重构。
 - **CHANGELOG**：`CHANGELOG.md` 顶部新增 `## [vX.Y.Z] - YYYY-MM-DD`，中文记录修复、新增、变更。既有条目普遍采用「问题定位 / 关键日志证据 / 解决方案设计 / 验证结果」四段式，新条目沿用。
 - **产物**：`dist_releases/v<版本>/` 是唯一权威交付位置（安装版 setup.exe、便携版 exe、便携 zip、`resources/driver`、`resources/lhm`、`SHA256SUMS.txt`）。`src-tauri/target/` 是中间产物，可随时清理重建。
@@ -108,10 +108,10 @@ npm run package:portable    # 便携 zip + 发行归档（末尾自动跑 fix:in
 
 | 范围 | 命令 | 说明 |
 | --- | --- | --- |
-| src-tauri 单元测试 | `bash scripts/test-lib.sh` | 源码含 249 处 `#[test]`/`#[tokio::test]`；脚本编译后用 SDK 的 `mt.exe` 注入 comctl32 v6 manifest，并把 `TEMP`/`TMP`/`APPDATA`/`SECM_RUNTIME_DIR` 固定到 `build/tmp/`。**必须用本脚本**：直接 `cargo test` 会重编译并抹掉注入的 manifest，测试二进制以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 崩溃 |
+| src-tauri 单元测试 | `bash scripts/test-lib.sh` | 源码含 264 处 `#[test]`/`#[tokio::test]`（`--lib` 实际执行 258 项、6 项 `#[ignore]` 真机项）；脚本编译后用 SDK 的 `mt.exe` 注入 comctl32 v6 manifest，并把 `TEMP`/`TMP`/`APPDATA`/`SECM_RUNTIME_DIR` 固定到 `build/tmp/`。**必须用本脚本**：直接 `cargo test` 会重编译并抹掉注入的 manifest，测试二进制以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 崩溃。脚本调用 `cargo`，需其位于 `PATH` |
 | 单个集成测试 | `cd src-tauri && cargo test --test <名>` | `src-tauri/tests/` 下 19 个测试目标；夹具根目录由 `tests/common/mod.rs` 固定为 `build/tmp/fixtures` |
-| 采集 crate | `cd datasource && cargo test && cargo check --all-targets` | 源码含 48 处 `#[test]`，其中 1 个 `#[ignore]` 真机项；`check` 要求零警告 |
-| LHM sidecar | `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release` | xUnit（274 用例），覆盖映射规则、契约、提权、tier-2 快照并发与合并语义 |
+| 采集 crate | `cd datasource && cargo test && cargo check --all-targets` | 源码含 51 处 `#[test]`（50 项通过 + 1 项 `#[ignore]` 真机项）；`check` 要求零警告 |
+| LHM sidecar | `cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release` | xUnit（141 个 `[Fact]` + 133 行 `[InlineData]`，共 274 用例），覆盖映射规则、契约、提权、tier-2 快照并发与合并语义 |
 | 前端 | 无测试框架 | 仓库内无 vitest/jest 与 `*.test.tsx`；前端改动以 `npm run build`（tsc）与 `npm run lint` 为门禁 |
 
 - 干净环境或缺 Windows SDK 时用 `REQUIRE_MANIFEST=1 bash scripts/test-lib.sh`：缺 `mt.exe` 时脚本明确失败而非静默降级。缺 manifest 的测试二进制会以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 崩溃，此时测试结论不可信。
@@ -137,14 +137,14 @@ npm run package:portable    # 便携 zip + 发行归档（末尾自动跑 fix:in
 | `scripts/` | stage、签名与许可审计、打包、测试运行器、临时目录包装脚本 |
 | `dist_releases/` | 发行归档，不入库，仅本地保留 |
 | `build/` `tmp/` | 构建产物与临时产物；`build/runtime/` 为开发期运行数据 |
-| `CHANGE-CONTRACT.md` `CHANGE-CONTRACT-v2.md` `CHANGE-CONTRACT-v3.md` | 冻结的跨工作流改动契约（三栏布局与日志 scope / 数据源切换 / 硬件页加载流程） |
+| `CHANGE-CONTRACT.md` `CHANGE-CONTRACT-v2.md` `CHANGE-CONTRACT-v3.md` | 冻结的跨工作流改动契约（三栏布局与日志 scope / 日志栏宽度与授权持久化 / 硬件页加载流程） |
 | `docs/adr/` | 架构决策记录（ADR，MADR 精简形式）；索引见 `docs/adr/README.md`。只写决策与理由，证据留在审查报告与 CHANGELOG |
 | `docs/plans/` | 与 ADR 配套的任务分解与验收判据 |
 
 ## 参考文档（按需下钻）
 
 - `README.md` —— 功能矩阵（9 页面 / 78 命令）、完整架构图、故障排查表、数据与日志存储、第三方许可清单。
-- `CHANGELOG.md` —— 逐版本的根因与实测证据（当前 `v2.1.0`）。
+- `CHANGELOG.md` —— 逐版本的根因与实测证据（当前 `v3.0.0`）。
 - `sidecar-lhm/CONTRACT-v3.md` —— Rust ⇄ C# 冻结接口契约与两级权限模型。
 - `src-tauri/src/startup_guard.rs` —— 主窗口（WebView2）创建失败时的看门狗与用户提示设计。
 - `eslint.config.js` —— 前端检查面的有意取舍（未启用 React Compiler 规则的原因写在注释里，改规则前先读）。
@@ -155,7 +155,7 @@ npm run package:portable    # 便携 zip + 发行归档（末尾自动跑 fix:in
 
 - **新增 Tauri 命令**：`commands.rs` 实现（优先复用命令宏）→ `lib.rs::invoke_handler` 注册 → `log::scope_for_command` 登记标签 → 前端 `invoke` 调用 → 补测试。
 - **新增页面**：`src/pages/` 建页面 → `App.tsx` 加路由 → `src/components/AppSidebar.tsx` 加导航项 → 与 scope 取值集合保持一致。
-- **改造数据源**：`datasource/` 实现 → `ds_util.rs` 接错误映射 → 维护 `--features legacy-data-source` 回滚开关语义 → 补契约测试。
+- **改造数据源**：`datasource/` 实现 → `ds_util.rs` 接错误映射（`log_err` + 中文消息）→ 补契约测试。采集层已无 PowerShell/外部命令回退链路，旧 `legacy-data-source` feature 与全部 `*_legacy` 实现均已删除，不存在运行期回退开关。
 - **升级依赖**：注意 `wmi` 与 tauri 的 `windows-core` 版本漂移；冲突时 `cd src-tauri && cargo update --precise 0.61.2` 对齐后重建。
 - **发版**：三处版本同步 → `CHANGELOG.md` 加条目 → `npm run tauri:build` → `npm run package:portable` → 核对 `dist_releases/v<版本>/` 与 `SHA256SUMS.txt` → `git status` 确认无产物入库。
 - **排障**：先看运行目录下 `diag/debug.log`（模块级，含 API 名与操作名）与 `logs/<日期>.log`；sidecar 输出在 `logs/secm-lhm-sidecar.log`。

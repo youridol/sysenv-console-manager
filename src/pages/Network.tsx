@@ -1775,8 +1775,8 @@ export default function NetworkPage() {
         description="选择工具 → 配置参数 → 开始诊断，输出实时流式展示"
       />
 
-      {/* DHCP 服务器检测 / HTTP 延迟测试：左右两列并排（工具类诊断区） */}
-      <div className="grid grid-cols-1 @3xl/main:grid-cols-2 gap-4 items-start">
+      {/* DHCP 服务器检测 / HTTP 延迟测试：上下各占整行（宽屏也不再并排两列） */}
+      <div className="flex flex-col gap-4">
         {/* ── DHCP 服务器检测（本地 DHCP 冲突检测）── */}
         <Card className="animate-fade-in-up stagger-2">
           <CardHeader className="pb-2">

@@ -106,9 +106,6 @@ export const LOG_SCOPE_MODE_KEY = "secm:log-scope-mode";
 /** 路由 pathname → scope（"/" → dashboard；未知 → system） */
 export function scopeForPath(pathname: string): LogScope;
 
-/** 前端 logger 的 module 名 → scope（"Dashboard" → dashboard；未知 → system） */
-export function scopeForModule(module: string): LogScope;
-
 export interface LogEntry {
   timestamp: string;
   level: string;
@@ -117,6 +114,11 @@ export interface LogEntry {
   scope?: string;
 }
 ```
+
+> **实施期修正**：原契约还冻结了 `scopeForModule(module)`。实际实现中前端从不解析 scope
+> （`logger` 只把 module 字符串发给后端，由 `log.rs::scope_for_module` 解析），该函数与
+> 其 `MODULE_TO_SCOPE` / `normalizeModule` 辅助**从未被调用**，构成必然漂移的第二真源。
+> ADR-0001 D10 已将其删除，故本节接口不再包含 `scopeForModule`。
 
 `LogsCard` 内过滤逻辑：
 

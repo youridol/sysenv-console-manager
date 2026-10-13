@@ -10,7 +10,10 @@
 ///
 /// 安全（R4）：
 /// - 所有参数一律经 `Command::args` 传递，不经 shell，无命令注入面；
-/// - netsh 的 `name="..."` 引号由本模块显式构造，接口名内嵌引号被剔除；
+/// - netsh 的接口名定位参数拼成单个 argv 元素 `name=<接口名>` / `interface=<接口名>`，
+///   **不在值内部写双引号**（含空格时由 Windows 参数层负责加引号）——早期实现写成
+///   `name="接口名"`，引号被参数层转义并在空格处截断，导致网络配置整体失败；
+///   接口名内嵌引号仍被剔除，防解析逃逸；
 /// - MAC 写入前备份原值，修改注册表路径固定（网卡 Class 键），无路径穿越。
 ///
 /// 参考：`netsh interface ip` / `interface ipv6` 命令参考（Windows 文档）。
@@ -37,15 +40,13 @@ const REG_DRIVER_DESC: &str = "DriverDesc";
 // 请求 / 结果契约（Tauri 命令返回结构，前端直接渲染）
 // ============================================================================
 
-/// 单个 IPv4 地址条目（支持同一网卡多个 IPv4 跨网段）
+/// 单个 IPv4 地址条目（支持同一网卡多个 IPv4 跨网段；掩码逐条独立）
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ipv4Entry {
     /// IPv4 地址（如 192.168.1.100）
     pub ip: String,
     /// IPv4 子网掩码（如 255.255.255.0）
     pub mask: String,
-    /// 默认网关（可选，空则本条目不设网关）
-    pub gateway: Option<String>,
 }
 
 /// 网络配置应用请求（一次提交一个接口的全部变更；未提供的字段保持原样）
@@ -57,6 +58,9 @@ pub struct NetworkConfigRequest {
     pub mode_v4: String,
     /// IPv4 地址列表（static 模式至少 1 条；支持跨网段多地址）
     pub ipv4s: Vec<Ipv4Entry>,
+    /// IPv4 默认网关列表（可 0 个、可多个；与地址不一一对应，附加地址不要求网关）
+    #[serde(default)]
+    pub ipv4_gateways: Vec<String>,
     /// IPv4 DNS 模式：dhcp | static
     pub mode_dns4: String,
     /// IPv4 DNS 服务器列表（static 模式至少 1 个）
@@ -130,14 +134,75 @@ pub struct DohEntryInput {
 // netsh 执行
 // ============================================================================
 
-/// 构造 netsh 的 `name="接口名"` 参数（接口名含空格必须引号；剔除内嵌引号防解析逃逸）
-fn netsh_quoted(name: &str) -> String {
-    format!("name=\"{}\"", name.replace('"', ""))
+/// 构造 netsh 的 `name=<接口名>` 定位参数（整段作为**单个** argv 元素传给 netsh）。
+///
+/// 关键：引号由 Windows 参数层添加，绝不能写进参数值内部。
+/// 旧实现拼成 `name="接口名"`，双引号嵌在同一个 argv 元素里，Windows 会转义为
+/// `name=\"接口名\"`，netsh 收到的值因此带字面引号并在第一个空格处截断
+/// （实测 `vEthernet (External network)` → `vEthernet`），于是报
+/// `Invalid source parameter (vEthernet)` / `Invalid address parameter (vEthernet)`。
+/// 现在只传一个 `name=<接口名>` 元素，含空格时由系统负责加引号，netsh 正确解析。
+fn netsh_name(name: &str) -> String {
+    format!("name={}", name.replace('"', ""))
+}
+
+/// 同 `netsh_name`，用于以 `interface=` 定位接口的子命令
+/// （`interface ipv6 set/add address`、`interface ipv6 add/delete route`、
+/// `interface ipv6 set interface`）——这些子命令不认 `name=`，实测传 `name=`
+/// 会返回退出码 0 并在输出里报 `'name' is not a valid argument`。
+fn netsh_interface(name: &str) -> String {
+    format!("interface={}", name.replace('"', ""))
+}
+
+/// netsh 输出中表示「命令并未执行」的失败标记（英文源 + 本地化中文措辞）。
+///
+/// 存在的理由：netsh 对部分语法错误**返回退出码 0**（实测
+/// `interface ipv6 set address ... name=` → 退出码 0，输出
+/// `'name' is not a valid argument for this command`），只看退出码会把失败
+/// 当成功上报（前端显示绿色对勾但配置并未生效）。因此成功路径还需扫输出。
+///
+/// 注意：「The configured DNS server is incorrect or does not exist.」**不是**失败标记：
+/// 该提示出现时 DNS 已实际写入（实测注册表 NameServer 已更新），故不列入。
+const NETSH_FAILURE_MARKERS: &[&str] = &[
+    "not a valid argument for this command",
+    "The syntax supplied for this command is not valid",
+    "Invalid source parameter",
+    "Invalid address parameter",
+    "Invalid mask parameter",
+    "Invalid gateway parameter",
+    "Invalid nexthop parameter",
+    "Invalid interface parameter",
+    "is not an acceptable value for",
+    "The parameter is incorrect",
+    "Element not found",
+    "The filename, directory name, or volume label syntax is incorrect",
+    "No more data is available",
+    // 本地化中文措辞（中文 Windows 无英文语言包时 netsh 输出中文）
+    "不是此命令的有效参数",
+    "命令语法不正确",
+    "无效的源参数",
+    "无效的地址参数",
+    "无效的掩码参数",
+    "无效的网关参数",
+    "参数错误",
+    "找不到元素",
+    "卷标语法不正确",
+];
+
+/// 判定 netsh 输出是否命中失败标记；命中则返回该标记（纯函数，便于单测）
+fn netsh_failure_marker(out: &str) -> Option<&'static str> {
+    NETSH_FAILURE_MARKERS
+        .iter()
+        .find(|m| out.contains(**m))
+        .copied()
 }
 
 /// 执行 netsh 并返回 stdout 文本；失败返回 Err(netsh 错误消息解码)
 ///
 /// CREATE_NO_WINDOW（0x08000000）防止 GUI 应用弹出控制台黑窗（与 proc_util 一致）。
+///
+/// 双重判据：既看退出码，也扫输出。netsh 存在「退出码 0 但命令未执行」的情况
+/// （语法错误在部分子命令上返回 0），只判退出码会把失败误报为成功。
 fn run_netsh(args: &[&str]) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     let out = Command::new("netsh")
@@ -145,20 +210,28 @@ fn run_netsh(args: &[&str]) -> Result<String, String> {
         .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("netsh 启动失败: {}", e))?;
+    let stdout = decode_ansi(&out.stdout);
     if out.status.success() {
-        Ok(decode_ansi(&out.stdout))
-    } else {
-        // 错误消息优先取 stderr，其次 stdout（netsh 版本间输出位置有差异）
-        let err = decode_ansi(&out.stderr);
-        let out2 = decode_ansi(&out.stdout);
-        let msg = if err.trim().is_empty() { out2 } else { err };
-        let trimmed = msg.trim().to_string();
-        Err(if trimmed.is_empty() {
-            format!("netsh 退出码 {}", out.status.code().unwrap_or(-1))
-        } else {
-            trimmed
-        })
+        // 退出码 0 仍需扫输出：命中失败标记说明命令没生效，如实返回失败
+        if let Some(marker) = netsh_failure_marker(&stdout) {
+            let trimmed = stdout.trim();
+            return Err(if trimmed.is_empty() {
+                format!("netsh 未执行命令（输出含失败标记: {}）", marker)
+            } else {
+                trimmed.to_string()
+            });
+        }
+        return Ok(stdout);
     }
+    // 错误消息优先取 stderr，其次 stdout（netsh 版本间输出位置有差异）
+    let err = decode_ansi(&out.stderr);
+    let msg = if err.trim().is_empty() { stdout } else { err };
+    let trimmed = msg.trim().to_string();
+    Err(if trimmed.is_empty() {
+        format!("netsh 退出码 {}", out.status.code().unwrap_or(-1))
+    } else {
+        trimmed
+    })
 }
 
 /// 解码 netsh 输出：复用 `proc_util::decode_ps`（ADR-0001 D14 合并同构实现）。
@@ -182,6 +255,118 @@ fn run_step(name: &str, f: impl FnOnce() -> Result<String, String>) -> ApplyStep
     }
 }
 
+/// IPv4 静态配置的执行计划（纯函数产物：步骤名 + 完整 netsh 参数向量）
+///
+/// 拆成纯函数的原因：参数构造是本 bug 的根因所在，必须能直接对
+/// 「发给 netsh 的 argv」断言，而不是靠启动真实 netsh 间接观测——后者既慢，
+/// 又会在跑测试的机器上改写真实网卡配置。
+#[derive(Debug, PartialEq, Eq)]
+struct NetshStep {
+    /// 前端展示的步骤名
+    step: String,
+    /// 传给 netsh 的完整参数（第 1 个元素是子命令域，不含 "netsh" 本身）
+    args: Vec<String>,
+}
+
+/// 多余网关（网关数超过地址数）的度量值：刻意取大，保证不与主网关争抢默认路由
+const EXTRA_GW_METRIC: u32 = 9000;
+
+/// 规划 IPv4 静态配置的 netsh 步骤（不做任何 IO）
+///
+/// 规则（对齐 netsh 真实语法，均已实测）：
+/// - 地址/掩码逐条必填且合法；网关可 0 个、可多个，填了必须合法；
+/// - 主地址用 `set address source=static address= mask= [gateway=]`，会**覆盖**旧地址与旧网关；
+/// - 其余地址用 `add address address= mask= [gateway=]` 逐条追加，**不要求网关**；
+/// - netsh 的默认网关必须附着在地址上：`add address gateway=IP` 单独出现（不带
+///   `gwmetric`）实测是**语法错误**（`The syntax supplied for this command is not
+///   valid`），只有带 `gwmetric` 才被接受。因此第 i 个网关优先随第 i 个地址一起下发；
+///   仅当网关数超过地址数时，剩余网关才用 `gateway= gwmetric=` 形式单独追加，
+///   并取 `EXTRA_GW_METRIC`（大值）避免抢主网关。
+fn plan_ipv4_static(name: &str, ipv4s: &[Ipv4Entry], gateways: &[String]) -> Result<Vec<NetshStep>, String> {
+    // 过滤全空行（地址与掩码都空）；保留顺序，主地址取第 1 条
+    let entries: Vec<(&str, &str)> = ipv4s
+        .iter()
+        .map(|e| (e.ip.trim(), e.mask.trim()))
+        .filter(|(ip, mask)| !ip.is_empty() || !mask.is_empty())
+        .collect();
+    // 网关：去空、去重（保序）
+    let mut gws: Vec<&str> = Vec::new();
+    for g in gateways {
+        let g = g.trim();
+        if !g.is_empty() && !gws.contains(&g) {
+            gws.push(g);
+        }
+    }
+    if entries.is_empty() {
+        return Err("至少需要一个 IPv4 地址".to_string());
+    }
+    // 前置校验：任一地址/掩码/网关非法即整体拒绝，不产生半成品
+    for (ip, mask) in &entries {
+        validate_ipv4_opt(ip, "IPv4 地址")?;
+        validate_ipv4_opt(mask, "IPv4 子网掩码")?;
+    }
+    for g in &gws {
+        validate_ipv4_opt(g, "IPv4 默认网关")?;
+    }
+
+    let mut plan = Vec::new();
+    let (first_ip, first_mask) = entries[0];
+    // 主地址：覆盖式设置（清除旧地址与旧默认网关），可带首个网关
+    let mut args = vec![
+        "interface".to_string(),
+        "ip".to_string(),
+        "set".to_string(),
+        "address".to_string(),
+        name.to_string(),
+        "source=static".to_string(),
+        format!("address={}", first_ip),
+        format!("mask={}", first_mask),
+    ];
+    if let Some(gw) = gws.first() {
+        args.push(format!("gateway={}", gw));
+    }
+    plan.push(NetshStep {
+        step: "IPv4 静态配置（主地址）".to_string(),
+        args,
+    });
+    // 附加地址（跨网段）：逐条追加；第 i 个网关随第 i 个地址下发（第 i 个可缺省）
+    for (i, (ip, mask)) in entries.iter().enumerate().skip(1) {
+        let mut args = vec![
+            "interface".to_string(),
+            "ip".to_string(),
+            "add".to_string(),
+            "address".to_string(),
+            name.to_string(),
+            format!("address={}", ip),
+            format!("mask={}", mask),
+        ];
+        if let Some(gw) = gws.get(i) {
+            args.push(format!("gateway={}", gw));
+        }
+        plan.push(NetshStep {
+            step: format!("IPv4 附加地址 #{}", i),
+            args,
+        });
+    }
+    // 网关数超过地址数：剩余网关用 gateway= + gwmetric= 单独追加（实测这是唯一被接受的
+    // 「仅网关」形式；不带 gwmetric 会报语法错误）
+    for (i, gw) in gws.iter().enumerate().skip(entries.len()) {
+        plan.push(NetshStep {
+            step: format!("IPv4 附加网关 #{}", i),
+            args: vec![
+                "interface".to_string(),
+                "ip".to_string(),
+                "add".to_string(),
+                "address".to_string(),
+                name.to_string(),
+                format!("gateway={}", gw),
+                format!("gwmetric={}", EXTRA_GW_METRIC),
+            ],
+        });
+    }
+    Ok(plan)
+}
+
 // ============================================================================
 // 主入口：应用网络配置
 // ============================================================================
@@ -203,121 +388,29 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
             all_ok: false,
         };
     }
-    let quoted = netsh_quoted(&ifname);
+    let name = netsh_name(&ifname);
+    let iface = netsh_interface(&ifname);
 
     // ── 1. IPv4 地址 / 掩码 / 网关 ──
     match req.mode_v4.as_str() {
         "dhcp" => {
             steps.push(run_step("IPv4 自动获取 (DHCP)", || {
-                run_netsh(&["interface", "ip", "set", "address", &quoted, "dhcp"])
+                run_netsh(&["interface", "ip", "set", "address", &name, "source=dhcp"])
             }));
         }
         "static" => {
-            // 过滤空白行后逐条处理（支持同一网卡多个 IPv4 跨网段地址）
-            let entries: Vec<&Ipv4Entry> = req
-                .ipv4s
-                .iter()
-                .filter(|e| !e.ip.trim().is_empty() || !e.mask.trim().is_empty())
-                .collect();
-            if entries.is_empty() {
-                steps.push(ApplyStep {
-                    name: "IPv4 静态配置".into(),
-                    ok: false,
-                    message: "至少需要一个 IPv4 地址".into(),
-                });
-            } else {
-                // 前置校验：所有行地址/掩码必填且格式合法，网关可选合法
-                let mut invalid: Option<String> = None;
-                for e in &entries {
-                    if let Err(err) = validate_ipv4_opt(&e.ip.trim(), "IPv4 地址") {
-                        invalid = Some(err);
-                        break;
-                    }
-                    if let Err(err) = validate_ipv4_opt(&e.mask.trim(), "IPv4 子网掩码") {
-                        invalid = Some(err);
-                        break;
-                    }
-                    if let Some(g) = e.gateway.as_deref() {
-                        let g = g.trim();
-                        if !g.is_empty() {
-                            if let Err(err) = validate_ipv4_opt(g, "IPv4 默认网关") {
-                                invalid = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = invalid {
+            match plan_ipv4_static(&name, &req.ipv4s, &req.ipv4_gateways) {
+                Err(err) => {
                     steps.push(ApplyStep {
                         name: "IPv4 静态配置".into(),
                         ok: false,
                         message: err,
                     });
-                } else {
-                    // 主地址：set address（覆盖式设置，可带网关）
-                    let first = &entries[0];
-                    // 审查修复：校验用 trim 值但执行传未 trim 值会导致 netsh 解析失败——
-                    // 统一以 trim 后的值执行
-                    let first_ip = first.ip.trim();
-                    let first_mask = first.mask.trim();
-                    let first_gw = first.gateway.as_deref().unwrap_or("").trim().to_string();
-                    steps.push(run_step("IPv4 静态配置（主地址）", || {
-                        if first_gw.is_empty() {
-                            run_netsh(&[
-                                "interface",
-                                "ip",
-                                "set",
-                                "address",
-                                &quoted,
-                                "static",
-                                &first_ip,
-                                &first_mask,
-                            ])
-                        } else {
-                            run_netsh(&[
-                                "interface",
-                                "ip",
-                                "set",
-                                "address",
-                                &quoted,
-                                "static",
-                                &first_ip,
-                                &first_mask,
-                                &first_gw,
-                            ])
-                        }
-                    }));
-                    // 附加地址（跨网段）：add address 逐条追加，每条约可带独立网关
-                    for (i, e) in entries.iter().enumerate().skip(1) {
-                        let g = e.gateway.as_deref().unwrap_or("").trim().to_string();
-                        // 审查修复：与主地址一致，执行用 trim 值
-                        let e_ip = e.ip.trim();
-                        let e_mask = e.mask.trim();
-                        let name = format!("IPv4 附加地址 #{}", i);
-                        steps.push(run_step(&name, || {
-                            if g.is_empty() {
-                                run_netsh(&[
-                                    "interface",
-                                    "ip",
-                                    "add",
-                                    "address",
-                                    &quoted,
-                                    &e_ip,
-                                    &e_mask,
-                                ])
-                            } else {
-                                run_netsh(&[
-                                    "interface",
-                                    "ip",
-                                    "add",
-                                    "address",
-                                    &quoted,
-                                    &e_ip,
-                                    &e_mask,
-                                    &g,
-                                ])
-                            }
-                        }));
+                }
+                Ok(plan) => {
+                    for NetshStep { step, args } in plan {
+                        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                        steps.push(run_step(&step, || run_netsh(&argv)));
                     }
                 }
             }
@@ -332,19 +425,25 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
     }
 
     // ── 2. IPv4 DNS（共享 apply_dns4_steps，与 set_dns 命令共用，行为零回归）──
-    apply_dns4_steps(&req.mode_dns4, &req.dns4, &mut steps, &quoted);
+    apply_dns4_steps(&req.mode_dns4, &req.dns4, &mut steps, &name);
 
     // ── 3. IPv6 地址 ──
     match req.mode_v6.as_str() {
         "dhcp" => {
+            // 自动获取 = 打开路由器发现 + 托管地址 + 其他有状态配置。
+            // 旧实现用 `set address source=dhcp`，但 `interface ipv6 set address` 没有
+            // source 参数（实测退出码 0 + `'source' is not a valid argument`），
+            // 前端显示成功而实际什么都没做。
             steps.push(run_step("IPv6 自动获取 (DHCP)", || {
                 run_netsh(&[
                     "interface",
                     "ipv6",
                     "set",
-                    "address",
-                    &quoted,
-                    "source=dhcp",
+                    "interface",
+                    &iface,
+                    "routerdiscovery=enabled",
+                    "managedaddress=enabled",
+                    "otherstateful=enabled",
                 ])
             }));
         }
@@ -364,7 +463,7 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                         "ipv6",
                         "add",
                         "address",
-                        &quoted,
+                        &iface,
                         &format!("address={}", ipv6),
                     ]);
                     match r1 {
@@ -379,7 +478,7 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                                 "ipv6",
                                 "set",
                                 "address",
-                                &quoted,
+                                &iface,
                                 &format!("address={}", ipv6),
                             ]);
                             match r2 {
@@ -414,7 +513,7 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                         message: e,
                     });
                 } else {
-                    let _ = run_netsh(&["interface", "ipv6", "delete", "route", "::/0", &quoted]);
+                    let _ = run_netsh(&["interface", "ipv6", "delete", "route", "::/0", &iface]);
                     steps.push(run_step("IPv6 默认网关", || {
                         run_netsh(&[
                             "interface",
@@ -422,7 +521,7 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
                             "add",
                             "route",
                             "::/0",
-                            &quoted,
+                            &iface,
                             &format!("nexthop={}", gw6),
                         ])
                     }));
@@ -439,7 +538,7 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
     }
 
     // ── 4. IPv6 DNS（共享 apply_dns6_steps，与 set_dns 命令共用，行为零回归）──
-    apply_dns6_steps(&req.mode_dns6, &req.dns6, &mut steps, &quoted);
+    apply_dns6_steps(&req.mode_dns6, &req.dns6, &mut steps, &name);
 
     let all_ok = steps.iter().all(|s| s.ok);
     NetworkConfigApplyResult { steps, all_ok }
@@ -449,83 +548,63 @@ pub fn apply_network_config(req: &NetworkConfigRequest) -> NetworkConfigApplyRes
 // DNS 独立应用（set_dns 命令）— 只动 DNS，不动 IP 地址
 // ============================================================================
 
-/// IPv4 DNS 步骤（dhcp：set dns dhcp；static：set dns static 主地址 + add dns 逐条追加）
-///
-/// 从 apply_network_config 第 2 步抽取，供 apply_network_config 与 set_dns 共用；
-/// 步骤名与原实现完全一致，保证前端分步渲染零回归。
-fn apply_dns4_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quoted: &str) {
-    match mode {
-        "dhcp" => {
-            steps.push(run_step("IPv4 DNS 自动获取 (DHCP)", || {
-                run_netsh(&["interface", "ip", "set", "dns", quoted, "dhcp"])
-            }));
-        }
-        "static" => {
-            let dns_list: Vec<String> = dns
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if dns_list.is_empty() {
-                steps.push(ApplyStep {
-                    name: "IPv4 DNS 静态配置".into(),
-                    ok: false,
-                    message: "未提供 DNS 服务器地址".into(),
-                });
-            } else if let Some(bad) = dns_list
-                .iter()
-                .find(|s| s.parse::<std::net::Ipv4Addr>().is_err())
-            {
-                steps.push(ApplyStep {
-                    name: "IPv4 DNS 静态配置".into(),
-                    ok: false,
-                    message: format!("无效的 DNS 服务器地址: {}", bad),
-                });
-            } else {
-                // 主 DNS：set dns（覆盖现有）
-                let primary = &dns_list[0];
-                steps.push(run_step("IPv4 DNS 静态配置", || {
-                    run_netsh(&["interface", "ip", "set", "dns", quoted, "static", primary])
-                }));
-                // 附加 DNS：add dns（index 递增，跳过失败不阻断——部分环境仅需主 DNS）
-                for (i, d) in dns_list.iter().enumerate().skip(1) {
-                    let idx = (i + 1).to_string();
-                    let name = format!("IPv4 附加 DNS #{}", i + 1);
-                    steps.push(run_step(&name, || {
-                        run_netsh(&[
-                            "interface",
-                            "ip",
-                            "add",
-                            "dns",
-                            quoted,
-                            d,
-                            &format!("index={}", idx),
-                        ])
-                    }));
-                }
-            }
-        }
-        other => {
-            steps.push(ApplyStep {
-                name: "IPv4 DNS".into(),
-                ok: false,
-                message: format!("未知的 IPv4 DNS 模式: {}（应为 dhcp 或 static）", other),
-            });
-        }
-    }
+/// DNS 地址族参数：IPv4 与 IPv6 的 DNS 步骤结构完全同构，仅 netsh 子命令、
+/// 地址解析与文案前缀不同，故集中为一处实现，避免两份 76 行的平行维护。
+struct DnsFamily {
+    /// netsh 子命令族：`"ip"`（IPv4）/ `"ipv6"`
+    netsh_family: &'static str,
+    /// 步骤名与错误文案的族前缀：`"IPv4"` / `"IPv6"`
+    label: &'static str,
+    /// 无效地址文案的族前缀：IPv4 为空（历史文案为「无效的 DNS 服务器地址」），IPv6 为 `"IPv6 "`
+    invalid_prefix: &'static str,
+    /// 地址是否合法（IPv4 / IPv6 解析）
+    parse_ok: fn(&str) -> bool,
 }
 
-/// IPv6 DNS 步骤（dhcp：set dnsservers dhcp；static：set dnsservers static 主地址 + add dnsservers 逐条追加）
+const DNS_V4: DnsFamily = DnsFamily {
+    netsh_family: "ip",
+    label: "IPv4",
+    invalid_prefix: "",
+    parse_ok: |s| s.parse::<std::net::Ipv4Addr>().is_ok(),
+};
+
+const DNS_V6: DnsFamily = DnsFamily {
+    netsh_family: "ipv6",
+    label: "IPv6",
+    invalid_prefix: "IPv6 ",
+    parse_ok: |s| s.parse::<std::net::Ipv6Addr>().is_ok(),
+};
+
+/// DNS 步骤（dhcp：set dnsservers source=dhcp；static：source=static + address= 逐条追加）
 ///
-/// 从 apply_network_config 第 4 步抽取，供 apply_network_config 与 set_dns 共用。
-fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quoted: &str) {
+/// 供 apply_network_config 与 set_dns 共用；步骤名与原实现完全一致，保证前端分步渲染零回归。
+///
+/// `locator` 必须是 `netsh_name()` / `netsh_interface()` 产出的单一 argv 元素。
+fn apply_dns_steps_for(
+    family: &DnsFamily,
+    mode: &str,
+    dns: &[String],
+    steps: &mut Vec<ApplyStep>,
+    locator: &str,
+) {
+    let fam = family.netsh_family;
+    let label = family.label;
     match mode {
         "dhcp" => {
-            steps.push(run_step("IPv6 DNS 自动获取 (DHCP)", || {
-                run_netsh(&["interface", "ipv6", "set", "dnsservers", quoted, "dhcp"])
+            let step_name = format!("{} DNS 自动获取 (DHCP)", label);
+            steps.push(run_step(&step_name, || {
+                run_netsh(&[
+                    "interface",
+                    fam,
+                    "set",
+                    "dnsservers",
+                    locator,
+                    "source=dhcp",
+                ])
             }));
         }
         "static" => {
+            let static_step = format!("{} DNS 静态配置", label);
             let dns_list: Vec<String> = dns
                 .iter()
                 .map(|s| s.trim().to_string())
@@ -533,45 +612,42 @@ fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quot
                 .collect();
             if dns_list.is_empty() {
                 steps.push(ApplyStep {
-                    name: "IPv6 DNS 静态配置".into(),
+                    name: static_step,
                     ok: false,
                     message: "未提供 DNS 服务器地址".into(),
                 });
-            } else if let Some(bad) = dns_list
-                .iter()
-                .find(|s| s.parse::<std::net::Ipv6Addr>().is_err())
-            {
+            } else if let Some(bad) = dns_list.iter().find(|s| !(family.parse_ok)(s)) {
                 steps.push(ApplyStep {
-                    name: "IPv6 DNS 静态配置".into(),
+                    name: static_step,
                     ok: false,
-                    message: format!("无效的 IPv6 DNS 服务器地址: {}", bad),
+                    message: format!("无效的 {}DNS 服务器地址: {}", family.invalid_prefix, bad),
                 });
             } else {
                 // 主 DNS：set dnsservers（覆盖现有）
                 let primary = &dns_list[0];
-                steps.push(run_step("IPv6 DNS 静态配置", || {
+                steps.push(run_step(&static_step, || {
                     run_netsh(&[
                         "interface",
-                        "ipv6",
+                        fam,
                         "set",
                         "dnsservers",
-                        quoted,
-                        "static",
-                        primary,
+                        locator,
+                        "source=static",
+                        &format!("address={}", primary),
                     ])
                 }));
-                // 附加 DNS：add dnsservers（index 递增）
+                // 附加 DNS：add dnsservers（index 递增；失败不阻断——部分环境仅需主 DNS）
                 for (i, d) in dns_list.iter().enumerate().skip(1) {
                     let idx = (i + 1).to_string();
-                    let name = format!("IPv6 附加 DNS #{}", i + 1);
-                    steps.push(run_step(&name, || {
+                    let step_name = format!("{} 附加 DNS #{}", label, i + 1);
+                    steps.push(run_step(&step_name, || {
                         run_netsh(&[
                             "interface",
-                            "ipv6",
+                            fam,
                             "add",
                             "dnsservers",
-                            quoted,
-                            d,
+                            locator,
+                            &format!("address={}", d),
                             &format!("index={}", idx),
                         ])
                     }));
@@ -580,18 +656,33 @@ fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, quot
         }
         other => {
             steps.push(ApplyStep {
-                name: "IPv6 DNS".into(),
+                name: format!("{} DNS", label),
                 ok: false,
-                message: format!("未知的 IPv6 DNS 模式: {}（应为 dhcp 或 static）", other),
+                message: format!(
+                    "未知的 {} DNS 模式: {}（应为 dhcp 或 static）",
+                    label, other
+                ),
             });
         }
     }
 }
 
+/// IPv4 DNS 步骤。`locator` 必须是 `netsh_name()` 产出的 `name=<接口名>` 单一 argv 元素。
+fn apply_dns4_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, locator: &str) {
+    apply_dns_steps_for(&DNS_V4, mode, dns, steps, locator);
+}
+
+/// IPv6 DNS 步骤。`locator` 必须是 `netsh_interface()` 产出的 `interface=<接口名>` 单一 argv 元素。
+fn apply_dns6_steps(mode: &str, dns: &[String], steps: &mut Vec<ApplyStep>, locator: &str) {
+    apply_dns_steps_for(&DNS_V6, mode, dns, steps, locator);
+}
+
 /// DNS 步骤共享入口（set_dns 命令契约）：IPv4 DNS + IPv6 DNS 一次执行
-pub fn apply_dns_steps(req: &DnsConfigRequest, steps: &mut Vec<ApplyStep>, quoted: &str) {
-    apply_dns4_steps(&req.mode_dns4, &req.dns4, steps, quoted);
-    apply_dns6_steps(&req.mode_dns6, &req.dns6, steps, quoted);
+///
+/// `locator` 必须是 `netsh_name()` 产出的 `name=<接口名>` 单一 argv 元素。
+pub fn apply_dns_steps(req: &DnsConfigRequest, steps: &mut Vec<ApplyStep>, locator: &str) {
+    apply_dns4_steps(&req.mode_dns4, &req.dns4, steps, locator);
+    apply_dns6_steps(&req.mode_dns6, &req.dns6, steps, locator);
 }
 
 /// set_dns 命令后端入口：接口名校验 + 仅执行 DNS 步骤（不动 IP 地址）
@@ -608,8 +699,8 @@ pub fn apply_dns_config(req: &DnsConfigRequest) -> NetworkConfigApplyResult {
             all_ok: false,
         };
     }
-    let quoted = netsh_quoted(&ifname);
-    apply_dns_steps(req, &mut steps, &quoted);
+    let locator = netsh_name(&ifname);
+    apply_dns_steps(req, &mut steps, &locator);
     let all_ok = steps.iter().all(|s| s.ok);
     NetworkConfigApplyResult { steps, all_ok }
 }
@@ -920,8 +1011,8 @@ pub fn set_network_mac(ifname: &str, mac: &str, guid: Option<&str>) -> Result<St
         Some(b) => format!("原物理地址 {}（请重新应用该值以恢复）", b),
         None => "该网卡此前未覆盖 MAC，可在网卡高级属性中清空「网络地址」恢复".to_string(),
     };
-    let quoted = netsh_quoted(ifname);
-    run_netsh(&["interface", "set", "interface", &quoted, "admin=disable"]).map_err(|e| {
+    let locator = netsh_name(ifname);
+    run_netsh(&["interface", "set", "interface", &locator, "admin=disable"]).map_err(|e| {
         format!(
             "禁用网卡失败：{}。注册表已写入新值（{}），{}。",
             e,
@@ -929,7 +1020,7 @@ pub fn set_network_mac(ifname: &str, mac: &str, guid: Option<&str>) -> Result<St
             rollback
         )
     })?;
-    run_netsh(&["interface", "set", "interface", &quoted, "admin=enable"])
+    run_netsh(&["interface", "set", "interface", &locator, "admin=enable"])
         .map_err(|e| {
             format!(
                 "启用网卡失败：{}。**该网卡当前处于禁用状态，网络会中断**，请先在「网络连接」中手动启用。注册表已写入新值（{}），{}。",
@@ -1055,11 +1146,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_netsh_quoted() {
-        assert_eq!(netsh_quoted("以太网"), "name=\"以太网\"");
-        assert_eq!(netsh_quoted("以太网 2"), "name=\"以太网 2\"");
+    fn test_netsh_name_不含内嵌引号() {
+        // 定位参数必须是单一 argv 元素：引号由系统添加，绝不能写进值内部
+        assert_eq!(netsh_name("以太网"), "name=以太网");
+        assert_eq!(netsh_name("以太网 2"), "name=以太网 2");
+        assert_eq!(
+            netsh_name("vEthernet (External network)"),
+            "name=vEthernet (External network)"
+        );
         // 内嵌引号被剔除（防 netsh 解析逃逸）
-        assert_eq!(netsh_quoted("a\"b"), "name=\"ab\"");
+        assert_eq!(netsh_name("a\"b"), "name=ab");
+        // 关键回归：不含字面双引号（旧实现 name="X Y" 正是 bug 根因）
+        assert!(!netsh_name("vEthernet (External network)").contains('"'));
+    }
+
+    #[test]
+    fn test_netsh_interface_标签() {
+        assert_eq!(netsh_interface("以太网"), "interface=以太网");
+        assert_eq!(
+            netsh_interface("vEthernet (External network)"),
+            "interface=vEthernet (External network)"
+        );
+        assert_eq!(netsh_interface("a\"b"), "interface=ab");
+        assert!(!netsh_interface("vEthernet (External network)").contains('"'));
+    }
+
+    #[test]
+    fn test_netsh_failure_marker_识别退出码0的假成功() {
+        // 旧实现只判退出码，这类输出会被当成成功
+        assert!(netsh_failure_marker(
+            "'name' is not a valid argument for this command.\nThe syntax supplied for this command is not valid."
+        )
+        .is_some());
+        assert!(netsh_failure_marker("Invalid source parameter (vEthernet).").is_some());
+        assert!(netsh_failure_marker("The parameter is incorrect.").is_some());
+        assert!(netsh_failure_marker("Element not found.").is_some());
+        // DNS 校验提示不算失败：该提示出现时配置已实际写入
+        assert!(netsh_failure_marker("The configured DNS server is incorrect or does not exist.").is_none());
+        // 正常成功输出不误判
+        assert!(netsh_failure_marker("").is_none());
+        assert!(netsh_failure_marker("Ok.").is_none());
     }
 
     #[test]
@@ -1171,7 +1297,7 @@ mod tests {
             mode_dns6: "bogus".into(),
             dns6: vec![],
         };
-        apply_dns_steps(&req, &mut steps, &netsh_quoted("以太网"));
+        apply_dns_steps(&req, &mut steps, &netsh_name("以太网"));
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].name, "IPv4 DNS");
         assert_eq!(steps[1].name, "IPv6 DNS");
@@ -1235,11 +1361,183 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_ipv4_static_多地址与多网关的参数向量() {
+        // 这是本 bug 的核心回归：断言真正发给 netsh 的 argv。
+        // 关键点：①接口名是单一 argv 元素且不含字面引号；
+        //        ②附加地址用 address=/mask= 标签且**不**带网关；
+        //        ③第 2 个网关单独一条 add address gateway=。
+        let entries = vec![
+            Ipv4Entry {
+                ip: "192.168.3.238".into(),
+                mask: "255.255.255.0".into(),
+            },
+            Ipv4Entry {
+                ip: "192.168.1.238".into(),
+                mask: "255.255.255.0".into(),
+            },
+        ];
+        let gateways = vec!["192.168.3.254".to_string(), "192.168.1.1".to_string()];
+        let plan = plan_ipv4_static(
+            &netsh_name("vEthernet (External network)"),
+            &entries,
+            &gateways,
+        )
+        .expect("合法输入应产出计划");
+
+        assert_eq!(plan.len(), 2, "主地址 + 附加地址（附加网关随附加地址下发）: {:?}", plan);
+        // 主地址：含首个网关
+        assert_eq!(plan[0].step, "IPv4 静态配置（主地址）");
+        assert_eq!(
+            plan[0].args,
+            vec![
+                "interface",
+                "ip",
+                "set",
+                "address",
+                "name=vEthernet (External network)",
+                "source=static",
+                "address=192.168.3.238",
+                "mask=255.255.255.0",
+                "gateway=192.168.3.254",
+            ]
+        );
+        // 附加地址：第 2 个网关附着在该地址上（netsh 要求网关必须挂在地址上）
+        assert_eq!(plan[1].step, "IPv4 附加地址 #1");
+        assert_eq!(
+            plan[1].args,
+            vec![
+                "interface",
+                "ip",
+                "add",
+                "address",
+                "name=vEthernet (External network)",
+                "address=192.168.1.238",
+                "mask=255.255.255.0",
+                "gateway=192.168.1.1",
+            ]
+        );
+        // 全局约束：任何参数都不得内嵌字面双引号（旧实现 bug 根因）
+        for s in &plan {
+            for a in &s.args {
+                assert!(!a.contains('"'), "参数不得含字面引号: {}", a);
+            }
+        }
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_网关数超过地址数() {
+        // 网关比地址多时，剩余网关必须带 gwmetric 单独下发：
+        // 实测 `add address gateway=IP` 不带 gwmetric 是语法错误。
+        let entries = vec![Ipv4Entry {
+            ip: "192.168.3.238".into(),
+            mask: "255.255.255.0".into(),
+        }];
+        let gateways = vec!["192.168.3.254".to_string(), "10.0.0.1".to_string()];
+        let plan = plan_ipv4_static(&netsh_name("以太网"), &entries, &gateways).expect("应产出计划");
+        assert_eq!(plan.len(), 2, "主地址 + 1 条额外网关: {:?}", plan);
+        // 额外网关必须同时带 gateway= 与 gwmetric=
+        let extra = &plan[1];
+        assert_eq!(extra.step, "IPv4 附加网关 #1");
+        assert!(extra.args.iter().any(|a| a == "gateway=10.0.0.1"));
+        assert!(
+            extra.args.iter().any(|a| a.starts_with("gwmetric=")),
+            "额外网关必须带 gwmetric=: {:?}",
+            extra.args
+        );
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_无网关() {
+        // 网关可 0 个：主地址不带 gateway=，且不产生任何网关步骤
+        let entries = vec![Ipv4Entry {
+            ip: "192.168.3.238".into(),
+            mask: "255.255.255.0".into(),
+        }];
+        let plan = plan_ipv4_static(
+            &netsh_name("以太网"),
+            &entries,
+            &["".to_string(), "   ".to_string()],
+        )
+        .expect("空网关应被过滤而非报错");
+        assert_eq!(plan.len(), 1, "仅主地址: {:?}", plan);
+        assert!(!plan[0].args.iter().any(|a| a.starts_with("gateway=")));
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_附加地址不需网关() {
+        // 用户诉求：额外配置多个 IP 不需要配置网关
+        let entries = vec![
+            Ipv4Entry {
+                ip: "192.168.3.238".into(),
+                mask: "255.255.255.0".into(),
+            },
+            Ipv4Entry {
+                ip: "10.0.0.5".into(),
+                mask: "255.255.255.0".into(),
+            },
+            Ipv4Entry {
+                ip: "10.0.1.5".into(),
+                mask: "255.255.255.0".into(),
+            },
+        ];
+        let plan = plan_ipv4_static(&netsh_name("以太网"), &entries, &[]).expect("应产出计划");
+        assert_eq!(plan.len(), 3, "主地址 + 2 个附加地址，无网关步骤: {:?}", plan);
+        for s in plan.iter().skip(1) {
+            assert!(!s.args.iter().any(|a| a.starts_with("gateway=")));
+        }
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_网关非法整体拒绝() {
+        // 任一网关非法即整体拒绝：不产生任何步骤，避免半成品状态
+        let entries = vec![Ipv4Entry {
+            ip: "192.168.3.238".into(),
+            mask: "255.255.255.0".into(),
+        }];
+        let err = plan_ipv4_static(
+            &netsh_name("以太网"),
+            &entries,
+            &["192.168.3.254".to_string(), "bad-gw".to_string()],
+        )
+        .expect_err("非法网关必须拒绝");
+        assert!(err.contains("IPv4 默认网关"), "错误应指出网关: {}", err);
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_空地址列表() {
+        let err = plan_ipv4_static(&netsh_name("以太网"), &[], &[])
+            .expect_err("无地址必须拒绝");
+        assert!(err.contains("至少需要一个 IPv4 地址"), "{}", err);
+    }
+
+    #[test]
+    fn test_plan_ipv4_static_网关去重保序() {
+        let entries = vec![Ipv4Entry {
+            ip: "192.168.3.238".into(),
+            mask: "255.255.255.0".into(),
+        }];
+        let plan = plan_ipv4_static(
+            &netsh_name("以太网"),
+            &entries,
+            &[
+                "192.168.3.254".to_string(),
+                "192.168.3.254".to_string(),
+                "10.0.0.1".to_string(),
+            ],
+        )
+        .expect("应产出计划");
+        // 重复网关被去掉：主地址带首个，剩余 1 个走「额外网关」分支
+        assert_eq!(plan.len(), 2, "重复网关应去重: {:?}", plan);
+        assert!(plan[1].args.iter().any(|a| a == "gateway=10.0.0.1"));
+    }
+
+    #[test]
     fn test_apply_request_empty_ifname() {
         let req = NetworkConfigRequest {
             ifname: "  ".to_string(),
             mode_v4: "dhcp".into(),
             ipv4s: vec![],
+            ipv4_gateways: vec![],
             mode_dns4: "dhcp".into(),
             dns4: vec![],
             mode_v6: "dhcp".into(),
@@ -1256,21 +1554,23 @@ mod tests {
 
     #[test]
     fn test_apply_request_invalid_ipv4() {
-        // 静态模式 + 非法 IP：步骤失败但结构完整、无 panic（不实际执行 netsh）
+        // 静态模式 + 非法 IP：前置校验失败。
+        // 本用例必须完全无副作用：接口名用**确定不存在**的名字，DNS/IPv6 模式给非法值，
+        // 使整条链路只走校验分支、不启动任何 netsh（提权跑测试时也不会改写真实网卡）。
         let req = NetworkConfigRequest {
-            ifname: "以太网".to_string(),
+            ifname: "SECM 单测不存在的网卡".to_string(),
             mode_v4: "static".into(),
             ipv4s: vec![Ipv4Entry {
                 ip: "not-an-ip".into(),
                 mask: "255.255.255.0".into(),
-                gateway: None,
             }],
-            mode_dns4: "dhcp".into(),
+            ipv4_gateways: vec![],
+            mode_dns4: "bogus".into(),
             dns4: vec![],
-            mode_v6: "dhcp".into(),
+            mode_v6: "bogus".into(),
             ipv6: None,
             ipv6_gateway: None,
-            mode_dns6: "dhcp".into(),
+            mode_dns6: "bogus".into(),
             dns6: vec![],
         };
         let r = apply_network_config(&req);
@@ -1288,16 +1588,18 @@ mod tests {
     #[test]
     fn test_apply_request_unknown_mode() {
         // 未知模式：返回错误步骤，不 panic
+        // 同上：接口名不存在 + 其余模式非法，确保不启动 netsh
         let req = NetworkConfigRequest {
-            ifname: "以太网".to_string(),
+            ifname: "SECM 单测不存在的网卡".to_string(),
             mode_v4: "bogus".into(),
             ipv4s: vec![],
-            mode_dns4: "dhcp".into(),
+            ipv4_gateways: vec![],
+            mode_dns4: "bogus".into(),
             dns4: vec![],
-            mode_v6: "dhcp".into(),
+            mode_v6: "bogus".into(),
             ipv6: None,
             ipv6_gateway: None,
-            mode_dns6: "dhcp".into(),
+            mode_dns6: "bogus".into(),
             dns6: vec![],
         };
         let r = apply_network_config(&req);

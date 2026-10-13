@@ -2,7 +2,7 @@
 
 > Windows 10/11 系统环境管理桌面工具 — 硬件监控、清理优化、网络诊断、系统设置、环境检测一站式平台
 
-[![Version](https://img.shields.io/badge/version-v2.0.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v3.0.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/tauri-2.x-purple)](https://tauri.app/)
@@ -60,13 +60,13 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  React 19 前端（8 页面，Tauri 命令 + Channel 流式事件）        │
-│  硬件信息 / 清理缓存 / 网络诊断 / 系统设置                    │
-│  环境检测 / 硬件检测 / 调试日志 / 关于                        │
+│  React 19 前端（9 页面，Tauri 命令 + Channel 流式事件）        │
+│  硬件信息 / 清理缓存 / 网络诊断 / 网络配置                    │
+│  系统设置 / 服务管理 / 环境检测 / 硬件检测 / 关于             │
 └──────────────────────┬──────────────────────────────────────┘
                        │ Tauri v2 IPC（invoke / Channel / event）
 ┌──────────────────────▼──────────────────────────────────────┐
-│  Rust 后端（24 个模块 + datasource 独立 crate）               │
+│  Rust 后端（28 个模块 + datasource 独立 crate）               │
 │  sensor / lhm / driver_install /                             │
 │  cleanup / network / net_config / dhcp_probe / dhcp_residue /│
 │  hpt / nvidia_drs / environment / game_env / sysinfo /      │
@@ -129,9 +129,9 @@
 > （`freq_source="pdh"` → “估算” / `"registry"` → “标称” / `"lhm"` → 实测无角标）。
 
 - **错误显式化**：新采集器返回 `Result<T, CollectError>`，由 `ds_util.rs` 映射为用户可见中文消息并打 R8 日志（含 API 名/操作名/详情）
-- **回滚开关**：编译期 feature `legacy-data-source`（`ds_util::use_legacy()`）可一键回退旧 PowerShell/外部命令实现，见下文「数据源切换」
+- **无回退开关**：旧 PowerShell/外部命令链路（`sc` / `powercfg` / `wmic` / `ipconfig` / `curl`）已随迁移完成**全部删除**：编译期 feature `legacy-data-source`、18 个 `*_legacy` 实现与 `proc_util` 的静默执行包装均已移除，不存在运行期或编译期回退通道
 - **保留外部进程**（仅 1 处）：`iperf3` 带宽测试（K1，**随包分发**，见 `third_party/iperf3/` 与 `scripts/stage-iperf3.mjs`；用户无需自装，缺随包文件时回退系统 PATH）
-- 独立构建/测试：`cd datasource && cargo build && cargo test`（47 单测 + 1 真机忽略项）
+- 独立构建/测试：`cd datasource && cargo build && cargo test`（51 单测，其中 1 个真机项 `#[ignore]`）
 
 ### 温度/功耗数据源（`sensor.rs` / `lhm.rs` / `driver_install/`）
 
@@ -225,20 +225,12 @@ node scripts/audit/licenses-npm.mjs --copyleft   # 依赖许可审计（npm）
 node scripts/audit/licenses-cargo.mjs --copyleft # 依赖许可审计（Rust crates）
 ```
 
-### 数据源切换（新驱动 ⇄ legacy 回滚）
+### 数据源
 
-数据源采集层默认使用纯 Rust 驱动（`secm-datasource`）。过渡期保留编译期开关：
+数据源采集层为纯 Rust 驱动（`secm-datasource`），**不存在旧链路回退开关**：
 
-```bash
-# 默认：纯 Rust 驱动采集（P1-P14 全部走 Win32/注册表/HTTP）
-npm run tauri dev
-
-# 回退：启用 legacy-data-source feature，回到旧 PowerShell/外部命令实现
-cd src-tauri && cargo build --features legacy-data-source
-```
-
-- 切换由 `src-tauri/src/ds_util.rs::use_legacy()`（编译期 `cfg!(feature = "legacy-data-source")`）控制，运行时不可变，前端零感知
-- **不建议在发布包中启用 legacy**：该链路依赖 `powershell.exe` / `sc` / `powercfg` / `wmic` / `ipconfig` / `curl`，在 Win11 24H2+ 部分组件已移除
+- 全部采集点（注册表 / SCM / powrprof / iphlpapi / dnsapi / ureq / 存储 IOCTL）均走 `datasource/` 的 Win32 API、注册表与纯 Rust HTTP 实现，前端命令契约零改动
+- 原 PowerShell 调用链与 `sc` / `powercfg` / `wmic` / `ipconfig` / `curl` 外部命令实现已随迁移完成删除（见 `CHANGELOG.md` v3.0.0 条目）。这样可避免在 Win11 24H2+ 上依赖已被移除的组件
 
 ### 测试
 
@@ -250,7 +242,7 @@ bash scripts/test-lib.sh
 cd src-tauri && cargo test --test hardware_contract
 
 # 数据源采集 crate
-cd datasource && cargo test && cargo check --all-targets   # 47 单测；check 要求零警告
+cd datasource && cargo test && cargo check --all-targets   # 51 单测（1 个真机项 #[ignore]）；check 要求零警告
 
 # LHM sidecar（.NET 8）
 cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release
@@ -264,7 +256,7 @@ cd sidecar-lhm/tests/LhmSidecar.Tests && dotnet test -c Release
 
 ```bash
 cd datasource
-cargo test      # 47 个单元测试（注册表/服务/电源/网络/HTTP/激活/磁盘/SMART）
+cargo test      # 51 个单元测试（注册表/服务/电源/网络/HTTP/激活/磁盘/SMART；1 个真机项 #[ignore]）
 cargo check --all-targets   # 零警告门禁
 ```
 
@@ -307,13 +299,13 @@ secm/
 │   │   ├── net_stats.rs          # 网络流量统计（会话基线/速率快照/TCP 连接数/链路速度）
 │   │   ├── ip_info.rs            # IP 信息（本地/公网 IPv4+IPv6/国内 IP 与位置）
 │   │   ├── disk_info.rs          # 磁盘枚举 / SMART 健康
-│   │   ├── ds_util.rs            # 数据源接入层（CollectError → 中文消息 + R8 日志 + use_legacy 开关）
+│   │   ├── ds_util.rs            # 数据源接入层（CollectError → 中文消息 + R8 日志）
 │   │   ├── log.rs                # 用户日志（200 条环形缓冲 + 文件 + Tauri 事件）
 │   │   ├── debug.rs              # 开发者诊断日志（500 条环形缓冲 + 磁盘落盘）
 │   │   ├── temp_data.rs          # 诊断数据磁盘化（轮转/总量/保留策略）
 │   │   ├── cancel.rs             # 命令取消注册表（ping/traceroute/nslookup/NAT/iperf3）
 │   │   ├── iperf.rs              # iperf3 能力（参数编排/JSON 解析/版本门控/客户端/服务端/防火墙）
-│   │   ├── proc_util.rs          # 外部命令执行（powershell 调用的共享封装）
+│   │   ├── proc_util.rs          # PowerShell 命令执行封装（run_ps_result / decode_ps；供 net_config 使用）
 │   │   └── tray.rs               # 系统托盘（右键菜单 / 左键恢复 / 关闭到托盘）
 │   ├── tests/                    # 集成测试（hardware_contract / datasource_native / iperf3_contract /
 │   │                             # iperf3_live / ds_adapter_integration / ds_regression_edge / ...）
@@ -355,7 +347,7 @@ secm/
 | DHCP 检测到多台服务器 / 跨网段 OFFER      | 多 DHCP 冲突 / 中继（ip helper）/ 旁路由 / **已移除网卡的残留记录** | 深度检查输出逐台诊断：同网段非网关=冲突风险，跨网段=OFFER 经中继转发；按建议清单检查路由器/AP/软路由。若某服务器已不存在（如网卡被拔出）仍被检出，点「清理残留」删除其历史 DHCP 记录（清理前自动备份至运行目录 `diag\`） |
 | 温度/风扇/电压无数据（硬件页降级提示）    | tier-2 未授权 / PawnIO 未部署 / 安全软件拦截   | 点击引导卡授权一次（tier-2）；管理员执行一次驱动部署（PawnIO WHQL 自动装）；火绒拦截时按引导放行 PawnIO |
 | 启动后日志目录无文件                       | 运行目录未创建（权限不足 / exe 所在目录只读）  | 确认运行目录可写（位置见「数据与日志存储」）；exe 装在只读位置时会自动回退 `%APPDATA%\SECM\`；诊断目录自动维护（单文件 100MB 轮转 / 目录 1GB 上限 / 7 天清理） |
-| 疑似旧链路残留（进程树出现 powershell 等）| 使用了 `--features legacy-data-source` 构建     | 默认构建即新驱动；legacy 仅在过渡期调试用，见「数据源切换」                                                        |
+| 进程树出现 `powershell` | DoH 查询走 `Get-DnsClientDohServerAddress` 等 cmdlet | 仅「网络配置 → DNS over HTTPS」读写使用 PowerShell（无等价 Win32 替代）；其余采集点均为纯 Rust 驱动，不再调用 `sc`/`powercfg`/`wmic`/`ipconfig`/`curl` |
 | 依赖版本冲突（windows-core 报错）         | wmi crate 与 tauri 的 windows 依赖版本漂移     | `cd src-tauri && cargo update --precise 0.61.2`（windows-core 统一版本），见「开发环境配置 → 编译说明」          |
 | 集成测试失败（hardware_contract 等）      | 环境权限/驱动未装 / 上游重构未落地             | `cargo test --test hardware_contract`、`--test datasource_native`、`--test ds_adapter_integration`、`--test ds_regression_edge`；`hardware_contract` 断言 sidecar 缺失时的降级与"不伪造 0"契约（无需驱动） |
 

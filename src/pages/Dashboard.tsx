@@ -1,6 +1,5 @@
 import { logger } from "../lib/logger";
 import { memo, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   XAxis,
@@ -29,7 +28,8 @@ import {
   SelectValue,
 } from "../components/ui/select";
 import {
-  Cpu,
+  Boxes,
+  Layers,
   Thermometer,
   HardDrive,
   MemoryStick,
@@ -44,7 +44,6 @@ import {
   ShieldAlert,
   Info,
   RefreshCw,
-  Loader2,
   ExternalLink,
   Copy,
   CircuitBoard,
@@ -558,106 +557,380 @@ const NetTrendChart = memo(function NetTrendChart({
   );
 });
 
-/* ── 实时摘要卡片（CPU/GPU/内存/存储共用结构） ── */
+/* ── 实时概览卡（CPU / GPU / 内存 合并为单卡） ── */
 
-/** 卡片内单条统计（可带前置小图标，如温度/频率） */
-interface SummaryStat {
+/**
+ * 概览卡的输入快照：只声明卡片真正读取的字段，便于测试与复用。
+ * 字段名与后端 `SensorData` 完全一致（契约不变）。
+ */
+interface OverviewSnapshot {
+  cpu: {
+    usage: number;
+    core_count: number;
+    clock_mhz: number;
+    temperature: number;
+    power_w: number;
+    power_estimated?: boolean;
+    freq_source?: string;
+  };
+  gpu: SensorData["gpu"];
+  memory: SensorData["memory"];
+}
+
+interface OverviewCardProps {
+  data: OverviewSnapshot;
+  /** false = CPU 占用率为进程内首采样伪值，主数值留空并提示"正在采样…" */
+  cpuSampleReady: boolean;
+  /** 采集管线是否仍在预热（预热期 GPU 列表必为空，此时不能断言"未检测到 GPU"） */
+  warmingUp: boolean;
+  className?: string;
+}
+
+/**
+ * 合并概览卡的内部数据源标识：仅自身使用，不参与对外契约。
+ * 用"文字 + 语义色"而非角标承载口径，因为角标用于表示异常状态。
+ */
+interface SourceTag {
   text: string;
-  icon?: LucideIcon;
-  iconClass?: string;
-  /** 额外布局类（如 ml-auto 使该条靠右对齐） */
-  className?: string;
-  /** 数值后的补充角标（如"估算"/"标称"），可传 Badge 元素 */
-  badge?: ReactNode;
+  className: string;
 }
 
-interface SummaryCardProps {
-  icon: LucideIcon;
-  /** 图标容器背景类（如 bg-blue-500/10） */
-  iconClass: string;
-  /** 图标颜色类（如 text-blue-400） */
-  iconColor: string;
+/** 值 + 单位 + 来源标识的展示项 */
+interface OverviewValue {
+  text: string;
+  suffix?: string;
+  /** 来源/口径标识（如"估算""标称"）；异常时由 tone 覆盖 */
+  source?: SourceTag;
+  /** 语义色覆盖（用于"—"等无效值，弱化呈现、避免被误读为正常值） */
+  tone?: string;
+}
+
+/** 单条进度度量（占用率可量化时渲染进度条，否则退化为同高的占位线保持列对齐） */
+interface OverviewMetric {
   label: string;
-  /** 标题右侧说明（如核数/磁盘数） */
+  icon: LucideIcon;
+  /** 标签行右侧的静态说明（如"32 核"、内存型号）；过长时截断 */
   meta?: string;
-  /** 主数值（不含后缀，统一由组件追加） */
+  /** 图标着色类 */
+  iconColor: string;
+  /** 进度条颜色类（写成 [&>div]:bg-* 覆盖 Progress 指示条） */
+  barClass: string;
+  /** 主数值（含百分号） */
   value: string;
-  /** 主数值后缀（默认 "%"；如存储卡片传 " MB/s"） */
-  valueSuffix?: string;
-  progressValue: number;
-  /** Progress 指示条颜色类（静态字面量） */
-  progressClass: string;
-  stats: SummaryStat[];
-  /** 无数据时的占位内容（如"未检测到 GPU"）；非空时不再渲染主数值区 */
-  fallback?: ReactNode;
-  className?: string;
+  /** 进度值 0~100；null = 无度量（渲染占位线） */
+  progress: number | null;
+  /** 度量说明（如"实时占用率"） */
+  caption: string;
 }
 
-function SummaryCard({
-  icon: Icon,
-  iconClass,
-  iconColor,
-  label,
-  meta,
-  value,
-  valueSuffix = "%",
-  progressValue,
-  progressClass,
-  stats,
-  fallback,
-  className,
-}: SummaryCardProps) {
+/** 指标常态色标：CPU 蓝 / GPU 绿 / 内存黄（与趋势图图例、网络卡片同一套语义色） */
+const OV_METRIC_TONE = {
+  cpu: { iconColor: "text-blue-400", barClass: "[&>div]:bg-blue-500" },
+  gpu: { iconColor: "text-green-400", barClass: "[&>div]:bg-green-500" },
+  memory: { iconColor: "text-yellow-400", barClass: "[&>div]:bg-yellow-500" },
+} as const;
+
+const OV_MUTED = "text-muted-foreground";
+
+/** 功耗为估算值时的口径标识 */
+const OV_POWER_ESTIMATED: SourceTag = {
+  text: "估算",
+  className: "text-muted-foreground",
+};
+
+/** 频率数据源 → 口径标识（"估算"= PDH 实时推算，"标称"= 注册表静态值） */
+const OV_FREQ_SOURCE: Record<string, SourceTag> = {
+  pdh: { text: "估算", className: "text-blue-300/80" },
+  registry: { text: "标称", className: "text-muted-foreground" },
+};
+
+/** 带单位的数值：无效值只给单位占位符，避免出现"— °C"这类读不通的组合 */
+function ovUnit(v: number, digits: number, unit: string): OverviewValue {
+  const ok = Number.isFinite(v) && v > 0;
+  return ok
+    ? { text: v.toFixed(digits), suffix: unit }
+    : { text: "—", tone: OV_MUTED };
+}
+
+/** 温度语义色：<60 绿 / <80 橙 / ≥80 红；无数据时弱化 */
+function ovTempTone(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) return OV_MUTED;
+  if (v >= 80) return "text-red-400";
+  if (v >= 60) return "text-orange-400";
+  return "text-green-400";
+}
+
+/** 内存占用分级色：>90 红 / >70 黄 / 其余蓝；非有限值回落蓝，不产生 NaN 比较 */
+function ovMemBarClass(pct: number): string {
+  if (pct > 90) return "[&>div]:bg-red-500";
+  if (pct > 70) return "[&>div]:bg-yellow-500";
+  return "[&>div]:bg-blue-500";
+}
+
+/**
+ * 设备列头：图标 + 名称 + 静态说明（核数 / 适配器数 / 内存型号）→ 大号占用率
+ * → 进度条 → 口径说明。同一台硬件的全部数据收在同一列内，列头与列内读数由同一
+ * 容器承载，不再拆成上下两条互不对齐的带。
+ */
+function OverviewColumnHead({ metric }: { metric: OverviewMetric }) {
+  const Icon = metric.icon;
   return (
-    <Card className={className}>
-      <CardContent className="p-4">
-        <div className="flex items-center gap-2 mb-2">
-          <div
-            className={cn(
-              "flex size-8 shrink-0 items-center justify-center rounded-md p-1.5",
-              iconClass,
-            )}
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/50">
+          <Icon className={cn("size-3.5", metric.iconColor)} aria-hidden />
+        </span>
+        <span className="shrink-0 text-xs font-medium tracking-wide text-muted-foreground">
+          {metric.label}
+        </span>
+        {metric.meta && (
+          <span
+            className="ml-auto min-w-0 truncate text-[10px] text-muted-foreground"
+            title={metric.meta}
           >
-            <Icon className={cn("size-4 shrink-0", iconColor)} />
-          </div>
-          <span className="text-sm font-medium">{label}</span>
-          {meta && (
-            <span className="text-xs text-muted-foreground ml-auto">
-              {meta}
-            </span>
-          )}
-        </div>
-        {fallback ?? (
-          <>
-            <div className="text-2xl font-bold tabular-nums">
-              {value}
-              <span className="text-sm text-muted-foreground ml-0.5">
-                {valueSuffix}
-              </span>
-            </div>
-            <Progress value={progressValue} className={progressClass} />
-            <div className="flex gap-3 mt-2 text-xs text-muted-foreground">
-              {/* key 必须含索引：`text` 在降级态会重复（tier-2 未授权时 CPU 卡为
-                  「—」「4.4 GHz」「—」，两个 "—" 同 key）。授权后文本变为唯一，
-                  key 集合在同一挂载实例内从"重复"变"唯一"，React 协调会保留部分旧
-                  节点，表现为卡片里多出图标与横线，且只有切换页面重新挂载才复位。*/}
-              {stats.map((s, i) => (
-                <span
-                  key={`${i}-${s.text}`}
-                  className={cn("flex items-center gap-1", s.className)}
-                >
-                  {s.icon && <s.icon className={cn("size-3", s.iconClass)} />}
-                  {s.text}
-                  {s.badge}
-                </span>
-              ))}
-            </div>
-          </>
+            {metric.meta}
+          </span>
         )}
-      </CardContent>
-    </Card>
+      </div>
+      {/* 数字字距收紧：近距数字成组；标签放宽、远距标签成组（排版细节） */}
+      <div className="flex items-baseline gap-1">
+        <span className="text-3xl font-semibold leading-none tracking-tight tabular-nums">
+          {metric.value}
+        </span>
+      </div>
+      {metric.progress === null ? (
+        <div className="h-1 w-full rounded-full bg-muted/60" aria-hidden />
+      ) : (
+        <Progress
+          value={metric.progress}
+          className={cn("h-1", metric.barClass)}
+        />
+      )}
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        {metric.caption}
+      </p>
+    </div>
   );
 }
 
+/** 设备列内的一条读数（温度 / 频率 / 功耗；内存为 已用 / 可用 / 总计） */
+interface OverviewReadingItem {
+  /** 图标可选：内存三项无同类图标可用，省略后仅由文字标签区分 */
+  icon?: LucideIcon;
+  iconClass?: string;
+  label: string;
+  value: OverviewValue;
+}
+
+/** 一台硬件一列：列头（占用率）+ 该硬件自己的读数行 */
+interface OverviewColumn {
+  metric: OverviewMetric;
+  readings: OverviewReadingItem[];
+}
+
+/**
+ * 列内读数行：名称在左、数值在右，同一列内上下堆叠。数值右对齐后
+ * 各列宽度独立，窄容器下也不会互相挤压。
+ */
+function OverviewReadingRow({
+  icon: Icon,
+  iconClass,
+  label,
+  value,
+}: OverviewReadingItem) {
+  return (
+    <div className="flex min-w-0 items-center gap-2 text-xs">
+      {Icon ? (
+        <Icon className={cn("size-3 shrink-0", iconClass)} aria-hidden />
+      ) : (
+        // 无图标时保留等宽占位，使标签左边缘在三列间对齐
+        <span className="size-3 shrink-0" aria-hidden />
+      )}
+      <span className="min-w-0 truncate text-muted-foreground">{label}</span>
+      <span
+        className={cn(
+          "ml-auto flex shrink-0 items-baseline gap-1 font-medium tabular-nums",
+          value.tone,
+        )}
+      >
+        {value.text}
+        {value.suffix && (
+          <span className="text-[10px] font-normal text-muted-foreground">
+            {value.suffix}
+          </span>
+        )}
+        {value.source && (
+          <span
+            className={cn("text-[10px] font-normal", value.source.className)}
+          >
+            {value.source.text}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 实时概览卡：CPU / GPU / 内存 各占一列，同一台硬件的全部数据（占用率与
+ * 温度 / 频率 / 功耗；内存为容量三项）都收在自己那一列内，
+ * 不再拆成「上行占用率、下行读数」两条互不对齐的带。
+ *
+ * 数据缺失一律呈现「—」，绝不补 0（契约 v3：tier-2 未授权时温度/功耗为 null）。
+ * 预热期 GPU 列表必为空，此时给出「正在采集…」，避免断言「未检测到 GPU」的错误结论。
+ * 多显卡时列头与列内读数均取自占用率最高的一张，不混用不同适配器的数据。
+ */
+function OverviewCard({
+  data,
+  cpuSampleReady,
+  warmingUp,
+  className,
+}: OverviewCardProps) {
+  // 多显卡时取占用率最高的一张（与趋势图的 maxGpu 口径一致）；列头与列内读数
+  // 必须取自同一块卡，否则一列里会混入两张适配器的数据。
+  const gpuMain: SensorData["gpu"][number] | null =
+    data.gpu.length === 0
+      ? null
+      : data.gpu.reduce((a, b) => (b.usage > a.usage ? b : a));
+  const gpuAvailable = gpuMain !== null;
+  const memPct = data.memory.usage_percent;
+  const memPctValid = Number.isFinite(memPct);
+  const cpuPowerValid =
+    Number.isFinite(data.cpu.power_w) && data.cpu.power_w > 0;
+
+  const columns: OverviewColumn[] = [
+    {
+      metric: {
+        label: "CPU",
+        icon: Boxes,
+        ...OV_METRIC_TONE.cpu,
+        meta: data.cpu.core_count > 0 ? data.cpu.core_count + " 核" : undefined,
+        value: cpuSampleReady ? data.cpu.usage.toFixed(0) + "%" : "—",
+        progress: cpuSampleReady ? data.cpu.usage : null,
+        caption: cpuSampleReady ? "实时占用率" : "正在采样…",
+      },
+      readings: [
+        {
+          icon: Thermometer,
+          iconClass: ovTempTone(data.cpu.temperature),
+          label: "温度",
+          value: ovUnit(data.cpu.temperature, 0, "°C"),
+        },
+        {
+          icon: TrendingUp,
+          iconClass: "text-blue-300",
+          label: "频率",
+          value: {
+            ...ovUnit(data.cpu.clock_mhz / 1000, 1, "GHz"),
+            source: OV_FREQ_SOURCE[data.cpu.freq_source ?? ""],
+          },
+        },
+        {
+          icon: Zap,
+          iconClass: "text-yellow-400",
+          label: "功耗",
+          value: {
+            // 「≈」前缀与「估算」标识同时出现是刻意的冗余：前者利于扫读、后者说明依据
+            text: cpuPowerValid
+              ? (data.cpu.power_estimated ? "≈" : "") +
+                data.cpu.power_w.toFixed(1)
+              : "—",
+            suffix: cpuPowerValid ? "W" : undefined,
+            tone: cpuPowerValid ? undefined : OV_MUTED,
+            source: data.cpu.power_estimated ? OV_POWER_ESTIMATED : undefined,
+          },
+        },
+      ],
+    },
+    {
+      metric: {
+        label: "GPU",
+        icon: Layers,
+        ...OV_METRIC_TONE.gpu,
+        meta: gpuAvailable ? data.gpu.length + " 个适配器" : undefined,
+        value: gpuMain ? gpuMain.usage.toFixed(0) + "%" : "—",
+        progress: gpuMain ? gpuMain.usage : null,
+        caption: gpuAvailable
+          ? "实时占用率"
+          : warmingUp
+            ? "正在采集…"
+            : "未检测到 GPU",
+      },
+      readings: gpuMain
+        ? [
+            {
+              icon: Thermometer,
+              iconClass: ovTempTone(gpuMain.temperature),
+              label: "温度",
+              value: ovUnit(gpuMain.temperature, 0, "°C"),
+            },
+            {
+              icon: TrendingUp,
+              iconClass: "text-green-300",
+              label: "频率",
+              value: ovUnit(gpuMain.clock_mhz / 1000, 1, "GHz"),
+            },
+            {
+              icon: Zap,
+              iconClass: "text-yellow-400",
+              label: "功耗",
+              value: ovUnit(gpuMain.power_w, 1, "W"),
+            },
+          ]
+        : [],
+    },
+    {
+      metric: {
+        label: "内存",
+        icon: MemoryStick,
+        iconColor: OV_METRIC_TONE.memory.iconColor,
+        barClass: memPctValid ? ovMemBarClass(memPct) : OV_MUTED,
+        meta: data.memory.model_name?.trim() || undefined,
+        value: memPctValid ? memPct.toFixed(0) + "%" : "—",
+        progress: memPctValid ? memPct : null,
+        caption: memPctValid ? "实时占用率" : "内存容量读取失败",
+      },
+      readings: [
+        { label: "已用", value: { text: formatBytes(data.memory.used) } },
+        { label: "可用", value: { text: formatBytes(data.memory.available) } },
+        { label: "总计", value: { text: formatBytes(data.memory.total) } },
+      ],
+    },
+  ];
+
+  return (
+    <Card className={cn("gap-4 p-5", className)}>
+      {/* 卡内区块标题沿用页面既有的 SectionTitle（大写小号 + 图标） */}
+      <div className="flex items-center gap-2">
+        <SectionTitle icon={Gauge} title="实时摘要" />
+        <span className="ml-auto flex items-center gap-1.5 text-[10px] text-muted-foreground">
+          <LiveIndicator className="size-2" color="blue" />
+          实时
+        </span>
+      </div>
+
+      {/* 一台硬件一列：列头是该硬件的占用率，列内是该硬件的读数行。
+          列间竖线用 border-l 而非 divide（divide 会给被隐藏的列也画线）。 */}
+      <div className="grid grid-cols-1 @xl/main:grid-cols-3">
+        {columns.map(({ metric, readings }) => (
+          <div
+            key={metric.label}
+            className="flex min-w-0 flex-col gap-3 border-t border-border/60 pt-3 first:border-t-0 first:pt-0 @xl/main:border-l @xl/main:border-t-0 @xl/main:px-4 @xl/main:first:border-l-0 @xl/main:first:pl-0"
+          >
+            <OverviewColumnHead metric={metric} />
+            {readings.length > 0 && (
+              <div className="flex flex-col gap-1.5 border-t border-border/50 pt-2.5">
+                {readings.map((r) => (
+                  <OverviewReadingRow key={r.label} {...r} />
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
 /* ── 主板传感器卡（LHM SuperIO：温度/风扇/电压分组只读展示；无数据不渲染） ── */
 
 interface MotherboardCardProps {
@@ -1841,11 +2114,7 @@ export default function Dashboard() {
             尺寸/间距对齐真实布局，切换时不产生跳动 */}
         <div>
           <Skeleton className="mb-3 h-5 w-24 rounded-md" />
-          <div className="grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-4">
-            {[1, 2, 3].map((i) => (
-              <Skeleton key={`sum-${i}`} className="h-[148px] rounded-xl" />
-            ))}
-          </div>
+          <Skeleton className="h-[248px] w-full rounded-xl" />
         </div>
         <div className="grid grid-cols-1 @2xl/main:grid-cols-2 @5xl/main:grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
@@ -1936,175 +2205,13 @@ export default function Dashboard() {
         }
       />
 
-      {/* ── 实时摘要（卡内 stagger-1~3，外层不叠加动画） ── */}
-      <div>
-        <SectionTitle icon={Gauge} title="实时摘要" className="mb-3" />
-        <div className="grid grid-cols-1 @md/main:grid-cols-2 @3xl/main:grid-cols-3 gap-4">
-          {/* CPU 融合卡片 */}
-          <SummaryCard
-            className="animate-scale-in stagger-1"
-            icon={Cpu}
-            iconClass="bg-blue-500/10"
-            iconColor="text-blue-400"
-            label="CPU"
-            meta={`${data.cpu.core_count} 核`}
-            value={cpuSampleReady ? data.cpu.usage.toFixed(0) : ""}
-            progressValue={cpuSampleReady ? data.cpu.usage : 0}
-            progressClass="[&>div]:bg-blue-500"
-            stats={[
-              // 首次采样未就绪时给出「采样中」说明，避免主数值区空白被当成卡死
-              ...(cpuSampleReady
-                ? []
-                : [
-                    {
-                      icon: Loader2,
-                      iconClass: "animate-spin text-blue-300",
-                      text: "正在采样…",
-                    },
-                  ]),
-              {
-                icon: Zap,
-                iconClass: "text-red-400",
-                text:
-                  data.cpu.temperature > 0
-                    ? `${data.cpu.temperature.toFixed(0)}°C`
-                    : "—",
-              },
-              {
-                icon: TrendingUp,
-                iconClass: "text-blue-300",
-                text:
-                  data.cpu.clock_mhz > 0
-                    ? `${(data.cpu.clock_mhz / 1000).toFixed(1)} GHz`
-                    : "—",
-                // 频率数据源角标：pdh=实时估算（secondary，同功耗"估算"角标）；
-                // registry=静态标称（outline）；none/缺失/其它不加角标
-                badge:
-                  data.cpu.clock_mhz > 0 &&
-                  (data.cpu.freq_source === "pdh" ||
-                    data.cpu.freq_source === "registry") ? (
-                    <Badge
-                      variant={
-                        data.cpu.freq_source === "pdh" ? "secondary" : "outline"
-                      }
-                      className="h-4 px-1 text-[10px] font-normal"
-                    >
-                      {data.cpu.freq_source === "pdh" ? "估算" : "标称"}
-                    </Badge>
-                  ) : undefined,
-              },
-              {
-                icon: Zap,
-                iconClass: "text-yellow-400",
-                text:
-                  data.cpu.power_w > 0
-                    ? data.cpu.power_estimated
-                      ? `≈${data.cpu.power_w.toFixed(1)}W`
-                      : `${data.cpu.power_w.toFixed(1)}W`
-                    : "—",
-                badge:
-                  data.cpu.power_estimated && data.cpu.power_w > 0 ? (
-                    <Badge
-                      variant="secondary"
-                      className="h-4 px-1 text-[10px] font-normal"
-                    >
-                      估算
-                    </Badge>
-                  ) : undefined,
-              },
-            ]}
-          />
-
-          {/* GPU 融合卡片（无 GPU 时显示占位） */}
-          <SummaryCard
-            className="animate-scale-in stagger-2"
-            icon={Thermometer}
-            iconClass="bg-green-500/10"
-            iconColor="text-green-400"
-            label="GPU"
-            value={data.gpu.length > 0 ? data.gpu[0].usage.toFixed(0) : ""}
-            progressValue={data.gpu.length > 0 ? data.gpu[0].usage : 0}
-            progressClass="[&>div]:bg-green-500"
-            stats={
-              data.gpu.length > 0
-                ? [
-                    {
-                      icon: Zap,
-                      iconClass: "text-orange-400",
-                      text:
-                        data.gpu[0].temperature > 0
-                          ? `${data.gpu[0].temperature.toFixed(0)}°C`
-                          : "—",
-                    },
-                    {
-                      icon: TrendingUp,
-                      iconClass: "text-green-300",
-                      text:
-                        data.gpu[0].clock_mhz > 0
-                          ? `${(data.gpu[0].clock_mhz / 1000).toFixed(1)} GHz`
-                          : "—",
-                    },
-                    {
-                      icon: Zap,
-                      iconClass: "text-yellow-400",
-                      text:
-                        data.gpu[0].power_w > 0
-                          ? `${data.gpu[0].power_w.toFixed(1)}W`
-                          : "—",
-                    },
-                  ]
-                : []
-            }
-            fallback={
-              data.gpu.length === 0 ? (
-                // 采集未就绪时区分「还在预热」与「确实没有 GPU」：
-                // PDH 首次采样前 GPU 列表必为空，此时断言「未检测到 GPU」
-                // 是错误结论，会让用户误以为硬件未被识别。
-                <p className="text-sm text-muted-foreground">
-                  {isPipelineWarmingUp(data, warmupDeadlinePassed) ? (
-                    <span className="flex items-center gap-1.5">
-                      <Loader2 className="size-3.5 animate-spin" />
-                      正在采集…
-                    </span>
-                  ) : (
-                    "未检测到 GPU"
-                  )}
-                </p>
-              ) : undefined
-            }
-          />
-
-          {/* 内存卡片 */}
-          <SummaryCard
-            className="animate-scale-in stagger-3"
-            icon={MemoryStick}
-            iconClass="bg-yellow-500/10"
-            iconColor="text-yellow-400"
-            label="内存"
-            meta={
-              data.memory.model_name && data.memory.model_name.trim().length > 0
-                ? data.memory.model_name
-                : undefined
-            }
-            value={data.memory.usage_percent.toFixed(0)}
-            progressValue={data.memory.usage_percent}
-            progressClass={cn(
-              data.memory.usage_percent > 90
-                ? "[&>div]:bg-red-500"
-                : data.memory.usage_percent > 70
-                  ? "[&>div]:bg-yellow-500"
-                  : "[&>div]:bg-blue-500",
-            )}
-            stats={[
-              { text: `${formatBytes(data.memory.used)} 已用` },
-              {
-                text: `${formatBytes(data.memory.total)} 总计`,
-                className: "ml-auto",
-              },
-            ]}
-          />
-        </div>
-      </div>
+      {/* ── 实时摘要（CPU / GPU / 内存 整合为单卡；卡内自编排入场动画） ── */}
+      <OverviewCard
+        className="animate-scale-in stagger-1"
+        data={data}
+        cpuSampleReady={cpuSampleReady}
+        warmingUp={isPipelineWarmingUp(data, warmupDeadlinePassed)}
+      />
 
       {/* ── 主板传感器卡（LHM SuperIO；无数据不渲染） ── */}
       {data.motherboard && data.motherboard.sensors.length > 0 && (

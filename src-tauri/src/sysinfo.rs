@@ -11,7 +11,6 @@
 ///
 /// 所有采集函数独立运行，单字段失败不影响其他字段。
 use serde::Serialize;
-use std::os::windows::process::CommandExt;
 
 // ============================================================================
 // 类型定义
@@ -257,77 +256,11 @@ fn parse_image_state_date(raw: &str) -> Option<String> {
 // 6. 激活状态
 // ============================================================================
 
-/// 通过 PowerShell Get-CimInstance 查询 Windows 激活状态（legacy 旧实现）
-///
-/// 查询 SoftwareLicensingProduct where ApplicationId=55c92734-... AND PartialProductKey IS NOT NULL
-/// 使用 PowerShell 替代 wmic（wmic 在 Win11 24H2+ 已被移除）
-/// LicenseStatus 映射:
-///   0 → Unlicensed (未激活)
-///   1 → Licensed (已激活)
-///   2 → OOBGrace (OOB 宽限期)
-///   3 → OOTGrace (OOT 宽限期)
-///   4 → NonGenuineGrace (非正版宽限期)
-///   5 → Notification (通知模式)
-///   6 → ExtendedGrace (延长宽限期)
-fn get_activation_legacy() -> ActivationInfo {
-    let script = r#"Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" | Select-Object -ExpandProperty LicenseStatus"#;
-
-    let output = run_powershell_silent(script);
-    let status_num: Option<u32> = output
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| l.trim().parse::<u32>().ok());
-
-    match status_num {
-        Some(0) => ActivationInfo {
-            status_raw: "Unlicensed".into(),
-            label: "未激活".into(),
-        },
-        Some(1) => ActivationInfo {
-            status_raw: "Licensed".into(),
-            label: "已激活".into(),
-        },
-        Some(2) => ActivationInfo {
-            status_raw: "OOBGrace".into(),
-            label: "OOB 宽限期".into(),
-        },
-        Some(3) => ActivationInfo {
-            status_raw: "OOTGrace".into(),
-            label: "OOT 宽限期".into(),
-        },
-        Some(4) => ActivationInfo {
-            status_raw: "NonGenuineGrace".into(),
-            label: "非正版宽限期".into(),
-        },
-        Some(5) => ActivationInfo {
-            status_raw: "Notification".into(),
-            label: "通知模式".into(),
-        },
-        Some(6) => ActivationInfo {
-            status_raw: "ExtendedGrace".into(),
-            label: "延长宽限期".into(),
-        },
-        Some(n) => ActivationInfo {
-            status_raw: format!("Unknown({})", n),
-            label: "未知".into(),
-        },
-        None => ActivationInfo {
-            status_raw: "Unknown".into(),
-            label: "无法获取".into(),
-        },
-    }
-}
-
 /// 采集 Windows 激活状态（P1）
 ///
-/// 过渡期（M5 前）由 `legacy-data-source` feature 控制回退旧 PowerShell 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::activation）。
+/// 走纯 Rust 驱动（secm-datasource::activation）。
 /// 失败/无数据时降级为 "Unknown"/"无法获取"（与现状文案一致），并打 R8 日志。
 fn get_activation() -> ActivationInfo {
-    if crate::ds_util::use_legacy() {
-        return get_activation_legacy();
-    }
-
     match crate::datasource::activation::get_activation() {
         Ok(Some(info)) => ActivationInfo {
             status_raw: info.status_raw,
@@ -352,67 +285,11 @@ fn get_activation() -> ActivationInfo {
 // 7. 最新补丁
 // ============================================================================
 
-/// 通过 PowerShell Get-CimInstance 查询已安装补丁列表，返回最新一条（legacy 旧实现）
-///
-/// 查询 Win32_QuickFixEngineering → HotFixID, InstalledOn, Description
-/// 按 InstalledOn 降序排序，取第一条
-/// 使用 PowerShell 替代 wmic（wmic 在 Win11 24H2+ 已被移除）
-fn get_latest_patch_legacy() -> PatchInfo {
-    let script = r#"Get-CimInstance -ClassName Win32_QuickFixEngineering | Sort-Object InstalledOn -Descending | Select-Object -First 1 | ForEach-Object { "$($_.HotFixID)|$($_.InstalledOn)|$($_.Description)" }"#;
-
-    let output = run_powershell_silent(script);
-
-    // 解析输出: KB1234567|2026/7/15 0:00:00|Security Update
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return PatchInfo {
-            kb: "无".into(),
-            date: "—".into(),
-            title_raw: "—".into(),
-            title_cn: "无补丁记录".into(),
-        };
-    }
-
-    let parts: Vec<&str> = trimmed.split('|').collect();
-    if parts.len() < 3 {
-        return PatchInfo {
-            kb: "无".into(),
-            date: "—".into(),
-            title_raw: "—".into(),
-            title_cn: "无补丁记录".into(),
-        };
-    }
-
-    let kb = parts[0].trim().to_string();
-    let date_raw = parts[1].trim().to_string();
-    let desc = parts[2].trim().to_string();
-
-    // PowerShell 返回的日期格式可能是 "7/15/2026 0:00:00" — 只取日期部分
-    let date_part = if let Some(space_idx) = date_raw.find(' ') {
-        &date_raw[..space_idx]
-    } else {
-        &date_raw
-    };
-    let formatted_date = normalize_date(date_part);
-
-    PatchInfo {
-        kb,
-        date: formatted_date,
-        title_raw: desc.clone(),
-        title_cn: translate_patch_title(&desc),
-    }
-}
-
 /// 采集最新安装的补丁（P2）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 PowerShell 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::registry，注册表 HotFix 枚举，与 WMI 同源）。
+/// 走纯 Rust 驱动（secm-datasource::registry，注册表 HotFix 枚举，与 WMI 同源）。
 /// 失败/无数据时降级为空占位（与现状文案一致），并打 R8 日志。
 fn get_latest_patch() -> PatchInfo {
-    if crate::ds_util::use_legacy() {
-        return get_latest_patch_legacy();
-    }
-
     match crate::datasource::registry::latest_patch() {
         Ok(Some(p)) => PatchInfo {
             kb: p.kb,
@@ -436,52 +313,6 @@ fn get_latest_patch() -> PatchInfo {
                 title_cn: "无补丁记录".into(),
             }
         }
-    }
-}
-
-/// 将 M/D/YYYY 格式归一化为 YYYY-MM-DD
-fn normalize_date(raw: &str) -> String {
-    let parts: Vec<&str> = raw.split('/').collect();
-    if parts.len() == 3 {
-        if let (Ok(m), Ok(d), Ok(y)) = (
-            parts[0].parse::<u32>(),
-            parts[1].parse::<u32>(),
-            parts[2].parse::<u32>(),
-        ) {
-            return format!("{:04}-{:02}-{:02}", y, m, d);
-        }
-    }
-    // 若已是 YYYY-MM-DD 格式则原样返回
-    if raw.len() == 10 && raw.chars().nth(4) == Some('-') {
-        return raw.to_string();
-    }
-    raw.to_string()
-}
-
-/// 补丁标题英文 → 中文翻译
-fn translate_patch_title(title: &str) -> String {
-    let lower = title.to_lowercase();
-    if lower.contains("security") && lower.contains("cumulative") {
-        "累积安全更新".into()
-    } else if lower.contains("security") && lower.contains("quality") {
-        "质量安全更新".into()
-    } else if lower.contains("security") || lower.contains("security update") {
-        "安全更新".into()
-    } else if lower.contains("cumulative update") {
-        "累积更新".into()
-    } else if lower.contains("update rollup") {
-        "更新汇总".into()
-    } else if lower.contains("service pack") {
-        "服务包".into()
-    } else if lower.contains("hotfix") {
-        "热修复".into()
-    } else if lower.contains("update") {
-        "更新".into()
-    } else if lower.contains("preview") {
-        "预览更新".into()
-    } else {
-        // 无法匹配则返回原标题
-        title.to_string()
     }
 }
 
@@ -559,23 +390,6 @@ fn read_reg_dword(hive: &str, key: &str, value: &str) -> Option<u32> {
         .open_subkey_with_flags(key, KEY_READ | KEY_WOW64_64KEY)
         .ok()?;
     subkey.get_value::<u32, _>(value).ok()
-}
-
-/// 静默执行 PowerShell 命令（隐藏控制台窗口），返回 stdout 字符串
-///
-/// 使用 PowerShell 替代已移除的 wmic.exe（Win11 24H2+）
-fn run_powershell_silent(script: &str) -> String {
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => String::new(),
-    }
 }
 
 #[cfg(test)]

@@ -519,18 +519,6 @@ pub fn set_service_start_type(name: &str, start_type: &str) -> Result<(), Collec
     Ok(())
 }
 
-// ============================================================================
-// 辅助
-// ============================================================================
-
-/// 判断服务是否正在运行（供 game_env 等场景，布尔语义）
-pub fn is_service_running(name: &str) -> Result<bool, CollectError> {
-    match query_service(name)? {
-        Some(info) => Ok(info.status == "Running"),
-        None => Ok(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

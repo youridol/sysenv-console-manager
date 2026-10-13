@@ -2,14 +2,14 @@
 //
 // 移植自 LiteMonitor（MIT）src/System/HardwareServices/PerformanceCounterManager.cs
 // 这是上游**唯一**的纯用户态数据源（CONTRACT-v3.md §1 关键事实），因此它是 SECM tier-1
-// 的 CPU 负载/频率来源，也是磁盘速率/活动的来源。
+// 的 CPU 负载/频率来源；磁盘速率/活动改由每卷实例提供（见文末契约 v3 说明）。
 //
 // 逐条保持：
 //   - 类别/计数器/实例名严格原样（上游 PerformanceCounterManager.cs:67-98）
 //     Processor Information / % Processor Utility / _Total（回退 % Processor Time、Processor）
 //     Processor Information / % Processor Performance / _Total（回退 Processor）
-//     Memory / Available MBytes；PhysicalDisk / Disk Read|Write Bytes/sec、% Disk Time / _Total
-//     System / System Up Time；SMB Client Shares / Read|Write Bytes/sec / _Total
+//     Memory / Available MBytes；
+//     SMB Client Shares / Read|Write Bytes/sec / _Total
 //     SMB Server Shares / Received|Sent Bytes/sec / _Total
 //   - 首次 NextValue() 恒为 0 → 初始化必须预热一次并丢弃（上游 :100-118）—— CONTRACT §5.3
 //   - % Processor Utility 睿频可能 >100 → 截断 100（上游 :187-188）—— CONTRACT §5.4
@@ -19,9 +19,10 @@
 //   - SMB 协议开销系数 1.2（上游 :238）
 //   - SafeRead 吞异常返回 null（上游 :273-285）
 //
-// 契约 v3 新增（CONTRACT-v3.md §3 disks[]）：每卷（per-volume 实例）读盘。上游只用
-// _Total 聚合实例（:84-86），本移植在保留 _Total 的同时增加按实例计数的同名计数器工厂
-// GetVolumeRead/Write/Active，类别/计数器名与上游一致，仅实例名改为卷标（"C:"）。
+// 与上游的差异（契约 v3，CONTRACT-v3.md §3 disks[]）：
+//   - 磁盘速率/活动只保留**每卷（per-volume 实例）**版本（GetVolumeRead/Write/Active，
+//     实例名 = 卷标如 "C:"）。上游的 PhysicalDisk `_Total` 聚合计数器与 System「System Up Time」
+//     在 SECM 内无读取方（消费方只用每卷实例），故不移植，避免"只创建不读取"的空转计数器。
 
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -37,10 +38,6 @@ public sealed class PerformanceCounterManager : IDisposable
     private Pc? _cpuLoadCounter;       // CPU 总使用率
     private Pc? _cpuFreqCounter;       // CPU 性能百分比（用于算频率）
     private Pc? _ramAvailableCounter;  // 可用内存 (MB)
-    private Pc? _diskReadCounter;      // 磁盘总读取
-    private Pc? _diskWriteCounter;     // 磁盘总写入
-    private Pc? _diskActiveCounter;    // 磁盘活动时间 (%)
-    private Pc? _uptimeCounter;        // 系统运行时间
 
     // --- SMB 计数器（用于忽略内网流量）上游 :29-32 ---
     private Pc? _smbClientReadCounter;
@@ -103,14 +100,6 @@ public sealed class PerformanceCounterManager : IDisposable
             // 内存：只读"可用内存"，用 (总内存 - 可用) 算占用，比直接读占用率更准
             _ramAvailableCounter = CreateCounter("Memory", "Available MBytes");
 
-            // 磁盘：物理磁盘总和 (_Total)
-            _diskReadCounter = CreateCounter("PhysicalDisk", "Disk Read Bytes/sec", "_Total");
-            _diskWriteCounter = CreateCounter("PhysicalDisk", "Disk Write Bytes/sec", "_Total");
-            _diskActiveCounter = CreateCounter("PhysicalDisk", "% Disk Time", "_Total");
-
-            // 系统：运行时间
-            _uptimeCounter = CreateCounter("System", "System Up Time");
-
             // SMB（内网流量）：SMB Client/Server Shares 类别
             _smbClientReadCounter = CreateCounter("SMB Client Shares", "Read Bytes/sec", "_Total");
             _smbClientWriteCounter = CreateCounter("SMB Client Shares", "Write Bytes/sec", "_Total");
@@ -123,10 +112,6 @@ public sealed class PerformanceCounterManager : IDisposable
             SafeRead(_cpuLoadCounter);
             SafeRead(_cpuFreqCounter);
             SafeRead(_ramAvailableCounter);
-            SafeRead(_diskReadCounter);
-            SafeRead(_diskWriteCounter);
-            SafeRead(_diskActiveCounter);
-            SafeRead(_uptimeCounter);
             SafeRead(_smbClientReadCounter);
             SafeRead(_smbClientWriteCounter);
             SafeRead(_smbServerReadCounter);
@@ -235,11 +220,6 @@ public sealed class PerformanceCounterManager : IDisposable
         }
         return (null, null);
     }
-
-    public float? GetDiskRead() => SafeRead(_diskReadCounter);      // 上游 :220
-    public float? GetDiskWrite() => SafeRead(_diskWriteCounter);    // 上游 :221
-    public float? GetDiskActive() => SafeRead(_diskActiveCounter);  // 上游 :222
-    public float? GetUptime() => SafeRead(_uptimeCounter);          // 上游 :223
 
     // ==========================================
     // 每卷计数器（契约 v3 §3 disks[]：per-volume 实例）
@@ -356,10 +336,6 @@ public sealed class PerformanceCounterManager : IDisposable
         _cpuLoadCounter?.Dispose();
         _cpuFreqCounter?.Dispose();
         _ramAvailableCounter?.Dispose();
-        _diskReadCounter?.Dispose();
-        _diskWriteCounter?.Dispose();
-        _diskActiveCounter?.Dispose();
-        _uptimeCounter?.Dispose();
 
         _smbClientReadCounter?.Dispose();
         _smbClientWriteCounter?.Dispose();

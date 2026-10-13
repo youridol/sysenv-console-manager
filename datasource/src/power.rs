@@ -13,8 +13,6 @@ use windows_sys::Win32::System::Registry::HKEY;
 pub const SUBGROUP_PROCESSOR: &str = "54533251-82be-4824-96c1-47b60b740d00";
 /// 异类线程调度策略设置 GUID
 pub const HETERO_THREAD_POLICY_GUID: &str = "93b8b6dc-0698-4d1c-9ee4-0644e900c85d";
-/// 异类短运行线程调度策略设置 GUID
-pub const HETERO_SHORT_THREAD_POLICY_GUID: &str = "465e1f50-b610-473a-ab58-00d1077dc418";
 
 /// GUID 解析辅助：字符串 → GUID
 fn guid_from_str(s: &str) -> Result<windows_sys::core::GUID, CollectError> {
@@ -153,6 +151,35 @@ pub fn delete_scheme(guid: &str) -> Result<(), CollectError> {
     Ok(())
 }
 
+/// 解析写入所需的三个 GUID：方案（None = 当前激活方案）、子组、设置项。
+///
+/// `write_ac_value` / `write_dc_value` 唯一差异是调用的 powrprof 导出函数，
+/// 参数准备完全同构，故集中在此处解析。
+fn resolve_write_guids(
+    scheme: Option<&str>,
+    subgroup: &str,
+    setting: &str,
+) -> Result<
+    (
+        Option<windows_sys::core::GUID>,
+        windows_sys::core::GUID,
+        windows_sys::core::GUID,
+    ),
+    CollectError,
+> {
+    let scheme_guid = match scheme {
+        Some(s) => Some(guid_from_str(s)?),
+        None => get_active_scheme()?
+            .map(|s| guid_from_str(&s))
+            .transpose()?,
+    };
+    Ok((
+        scheme_guid,
+        guid_from_str(subgroup)?,
+        guid_from_str(setting)?,
+    ))
+}
+
 /// 写入 AC 值索引（`powercfg /setacvalueindex SCHEME_CURRENT ...` 等价）
 ///
 /// `scheme`：传 None 表示使用当前激活方案（对应 SCHEME_CURRENT）
@@ -162,12 +189,8 @@ pub fn write_ac_value(
     setting: &str,
     value: u32,
 ) -> Result<(), CollectError> {
-    let scheme_guid = match scheme {
-        Some(s) => Some(guid_from_str(s)?),
-        None => get_active_scheme()?.map(|s| guid_from_str(&s)).transpose()?,
-    };
-    let subgroup_guid = guid_from_str(subgroup)?;
-    let setting_guid = guid_from_str(setting)?;
+    let (scheme_guid, subgroup_guid, setting_guid) =
+        resolve_write_guids(scheme, subgroup, setting)?;
 
     // SAFETY: 各 GUID 均为栈上有效引用；scheme 用当前激活方案
     let rc = unsafe {
@@ -196,12 +219,8 @@ pub fn write_dc_value(
     setting: &str,
     value: u32,
 ) -> Result<(), CollectError> {
-    let scheme_guid = match scheme {
-        Some(s) => Some(guid_from_str(s)?),
-        None => get_active_scheme()?.map(|s| guid_from_str(&s)).transpose()?,
-    };
-    let subgroup_guid = guid_from_str(subgroup)?;
-    let setting_guid = guid_from_str(setting)?;
+    let (scheme_guid, subgroup_guid, setting_guid) =
+        resolve_write_guids(scheme, subgroup, setting)?;
 
     // SAFETY: 各 GUID 均为栈上有效引用；scheme 用当前激活方案
     let rc = unsafe {

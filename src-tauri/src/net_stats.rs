@@ -271,48 +271,11 @@ extern "system" {
 // 链路协商速度 — PowerShell Get-NetAdapter（准静态数据，勿入 1s 轮询热路径）
 // ============================================================================
 
-/// 读取各网卡的链路协商速度（接口别名 → 速度字符串，如 "1 Gbps"）（legacy 旧实现）
-///
-/// 接口别名与 sysinfo 网卡名同源（GetIfTable2 的 Alias），前端按键名直接匹配。
-/// 中文别名（如"以太网"）依赖 proc_util::run_ps 的 UTF-8 强制输出避免乱码。
-/// 失败或无网卡时返回空表（前端据此隐藏速度显示，优雅降级）。
-fn get_link_speeds_legacy() -> HashMap<String, String> {
-    // @() 强制数组输出：单网卡时 ConvertTo-Json 默认返回对象而非数组
-    let out = crate::proc_util::run_ps(
-        "@(Get-NetAdapter -ErrorAction SilentlyContinue | Select-Object Name, LinkSpeed) | ConvertTo-Json -Compress",
-    );
-    // 防御性去除可能的 BOM（PS 5.1 某些输出路径会带 U+FEFF）
-    let text = out.trim_start_matches('\u{feff}');
-    let parsed: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
-    };
-    let mut map = HashMap::new();
-    if let Some(arr) = parsed.as_array() {
-        for item in arr {
-            let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or("");
-            let speed = item.get("LinkSpeed").and_then(|v| v.as_str()).unwrap_or("");
-            // 跳过未建立链路的网卡（Get-NetAdapter 返回 "0 bps" / "Unknown"）
-            let is_disconnected =
-                speed.is_empty() || speed == "0 bps" || speed.eq_ignore_ascii_case("unknown");
-            if !name.is_empty() && !is_disconnected {
-                map.insert(name.to_string(), speed.to_string());
-            }
-        }
-    }
-    map
-}
-
 /// 读取各网卡的链路协商速度（P3，接口别名 → 速度字符串，如 "1 Gbps"）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 PowerShell 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::netif，GetIfTable2，与 Get-NetAdapter 同源）。
+/// 走纯 Rust 驱动（secm-datasource::netif，GetIfTable2，与 Get-NetAdapter 同源）。
 /// 失败或无网卡时返回空表（前端据此隐藏速度显示，优雅降级），并打 R8 日志。
 pub fn get_link_speeds() -> HashMap<String, String> {
-    if crate::ds_util::use_legacy() {
-        return get_link_speeds_legacy();
-    }
-
     match crate::datasource::netif::link_speeds() {
         Ok(map) => map,
         Err(e) => {

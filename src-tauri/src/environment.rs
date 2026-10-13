@@ -225,26 +225,23 @@ fn detect_gpu_names() -> Vec<String> {
     names
 }
 
-fn check_d3d11_available() -> bool {
-    if let Ok(windir) = std::env::var("WINDIR") {
-        std::path::PathBuf::from(&windir)
+/// 检查 `%WINDIR%\System32\<dll>` 是否存在（D3D 运行库可用性判据）。
+fn system32_dll_exists(dll: &str) -> bool {
+    match std::env::var("WINDIR") {
+        Ok(windir) => std::path::PathBuf::from(&windir)
             .join("System32")
-            .join("d3d11.dll")
-            .exists()
-    } else {
-        false
+            .join(dll)
+            .exists(),
+        Err(_) => false,
     }
 }
 
+fn check_d3d11_available() -> bool {
+    system32_dll_exists("d3d11.dll")
+}
+
 fn check_d3d12_available() -> bool {
-    if let Ok(windir) = std::env::var("WINDIR") {
-        std::path::PathBuf::from(&windir)
-            .join("System32")
-            .join("d3d12.dll")
-            .exists()
-    } else {
-        false
-    }
+    system32_dll_exists("d3d12.dll")
 }
 
 fn check_wddm_2() -> bool {

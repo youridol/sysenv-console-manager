@@ -352,41 +352,11 @@ fn read_virtual_memory() -> String {
     "未知".into()
 }
 
-/// 检查服务运行状态（legacy 旧实现：sc query）
-fn check_service_legacy(name: &str) -> String {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW：防止 GUI 应用 spawn sc.exe 时弹出黑色控制台窗口
-    let output = std::process::Command::new("sc")
-        .args(["query", name])
-        .creation_flags(0x08000000)
-        .output()
-        .ok();
-    match output {
-        Some(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if text.contains("RUNNING") {
-                "运行中".into()
-            } else if text.contains("STOPPED") {
-                "已停止".into()
-            } else {
-                "未安装".into()
-            }
-        }
-        None => "未安装".into(),
-    }
-}
-
 /// 检查服务运行状态（P12，advapi32 QueryServiceStatusEx）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::is_service_running）。
-/// 服务不存在/查询失败 → "未安装"（与现状 sc query 无输出一致）。
+/// 走纯 Rust 驱动（secm-datasource::service::query_service）。
+/// 服务不存在/查询失败 → "未安装"。
 fn check_service(name: &str) -> String {
-    if crate::ds_util::use_legacy() {
-        return check_service_legacy(name);
-    }
-
     match crate::datasource::service::query_service(name) {
         Ok(Some(info)) if info.status == "Running" => "运行中".into(),
         Ok(Some(_)) => "已停止".into(),

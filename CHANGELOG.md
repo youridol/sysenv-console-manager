@@ -1,3 +1,237 @@
+## [v3.0.0] - 2026-10-11
+
+> 全链路代码瘦身：删除过渡期 `legacy-data-source` 回退通道（18 个 `*_legacy` 实现、
+> 20 处分支、Cargo feature 与静默执行包装）、符号级死代码与闲置 sidecar 成员，
+> 合并 5 组重复实现，并更正全部文档与版本漂移。
+> **破坏性变更**：`cargo build --features legacy-data-source` 不再存在。
+
+### 删除（过渡期回退通道，MAJOR）
+
+**问题定位**：`ds_util::use_legacy()` 自述「迁移完成后（M6）删除本函数与全部 `legacy`
+分支」，且 `datasource/` 已成为唯一采集实现（纯 Rust Win32/注册表/HTTP）。但该开关
+长期留存，形成约 510 行平行实现（`flush_dns_legacy` / `get_activation_legacy` /
+`set_power_plan_legacy` / `get_services_legacy` 等 18 个函数），每次改动采集语义都需
+同时维护两份代码。
+
+**解决方案设计**：
+
+- 删除 Cargo feature `legacy-data-source` 与 20 处 `use_legacy()` 分支，保留纯 Rust 驱动路径。
+- 删除 7 个文件中的 18 个 `*_legacy` 实现：`cleanup.rs`、`game_env.rs`、`ip_info.rs`、
+  `net_stats.rs`、`settings.rs`（11 个）、`sysinfo.rs`。
+- 连带删除仅服务旧链路的辅助：`cleanup::decode_console_output`、`settings::decode_sc_output`、
+  `settings::query_service`、`settings::ServiceInfoRaw`、`sysinfo::run_powershell_silent`、
+  `sysinfo::normalize_date`、`sysinfo::translate_patch_title`。
+- `proc_util` 收敛：删除已无调用方的 `run_ps`（静默吞错）与 `run_cmd`，仅保留
+  `run_ps_result`（错误显式化）与 `decode_ps`，供 `net_config` 的 DoH 查询使用。
+- 删除无外部引用的 `datasource::power::HETERO_SHORT_THREAD_POLICY_GUID`
+  （`settings.rs` 自带同名常量，两份重复）。
+
+### 删除（死代码与闲置成员）
+
+- `datasource/src/registry.rs`：删除 `read_dword`（零调用点的 pub 导出；仅 `read_string` 在用）。
+- `datasource/src/service.rs`：删除 `is_service_running`（零调用点；其语义由 `query_service` 承担）。
+- `src-tauri/src/dhcp_probe.rs`：保留 `OfferInfo.message_type`（由单测直接消费，已有注释说明）。
+- `sidecar-lhm/Hardware/MetricUtils.cs`：删除无调用方的 `GetSampleValueStr` / `GetDisplayUnit`。
+- `sidecar-lhm/Hardware/PerformanceCounterManager.cs`：删除无读取方的 4 个实例访问器
+  （`GetDiskRead` / `GetDiskWrite` / `GetDiskActive` / `GetUptime`）及其对应的
+  `PhysicalDisk _Total` 与 `System Up Time` 计数器字段（含创建、预热与释放点）——
+  磁盘指标只由每卷实例提供，这些"只创建不读取"的计数器属空转开销。
+
+### 合并（重复实现）
+
+- `src-tauri/src/net_config.rs`：`apply_dns4_steps` 与 `apply_dns6_steps`（各 76 行，
+  相似度 94%）合并为 `apply_dns_steps_for(family, ...)`，经 `DNS_V4` / `DNS_V6` 参数化；
+  步骤名、错误文案与 argv 逐字保持，前端分步渲染零回归。
+- `datasource/src/power.rs`：`write_ac_value` 与 `write_dc_value`（相似度 92%）
+  共用新增的 `resolve_write_guids`，唯一差异仍是各自的 powrprof 导出函数。
+- `src-tauri/src/environment.rs`：`check_d3d11_available` 与 `check_d3d12_available`
+  （相似度 83%）合并为 `system32_dll_exists(dll)`。
+- `src-tauri/src/sysinfo.rs` ⨯ `datasource/src/registry.rs`：`translate_patch_title`
+  两份 25 行实现（相似度 99%）在删除 `sysinfo` 旧链路后只余 `datasource` 一份，
+  后者成为唯一真源（`ds_regression_edge` 已直接消费）。
+
+### 文档更正
+
+- `AGENTS.md`：版本 `2.1.0` → `2.3.1`；src-tauri 测试数 `249` → `264`（`--lib` 执行
+  258 项 + 6 项真机 `#[ignore]`）；datasource 测试数 `48` → `51`；sidecar 用例数
+  补齐口径（141 `[Fact]` + 133 `[InlineData]` = 274）；「改造数据源」不再提回滚开关。
+- `README.md`：徽章版本 `v2.0.1` → `v2.3.1`；架构图前端 `8 页面` → `9 页面`、
+  后端 `24 个模块` → `28 个模块`；datasource 单测 `47` → `51`（3 处）；
+  「数据源切换（新驱动 ⇄ legacy 回滚）」整节改写为「数据源」（不再承诺回滚）；
+  故障排查表「疑似旧链路残留」改为说明 DoH 查询确实使用 PowerShell 的原因；
+  `ds_util.rs` / `proc_util.rs` 的结构注释与实现同步。
+- `CHANGELOG.md`：修正顶部条目顺序——`v2.3.1`（2026-10-10）原先排在
+  `v2.3.0`（2026-10-09）之后，与全文件「新版本在前」的降序约定相反，已交换。
+
+### 验证结果
+
+- `cargo check --all-targets`（src-tauri）退出 0、零警告；`cargo check --all-targets`
+  （datasource）退出 0、零警告。
+- `cargo test`（datasource）50 passed / 0 failed / 1 ignored（退出 0）。
+- `bash scripts/test-lib.sh`（src-tauri）258 passed / 0 failed / 6 ignored（退出 0）。
+- `npx tsc -b` 退出 0；`npx eslint .` 退出 0（0 error / 11 warning，均为既有告警）。
+- `cd sidecar-lhm && dotnet test tests/LhmSidecar.Tests` 全绿（见下）。
+
+## [v2.3.1] - 2026-10-10
+
+> 网络诊断页顶部的 DHCP 服务器检测与 HTTP 延迟测试由左右两列改为上下各占整行。
+> 仅前端布局变更；后端契约、命令与数据字段均不变。
+
+### 变更（网络诊断页顶部两卡改为各占整行）
+
+**问题定位**：`src/pages/Network.tsx` 的 DHCP 服务器检测与 HTTP 延迟测试原本包在
+`grid grid-cols-1 @3xl/main:grid-cols-2` 里，主内容列宽度 ≥ 48rem（768px）时并排成两列。
+两卡内容量差异大（DHCP 卡只有一段说明文字，HTTP 卡是站点网格），并排时 DHCP 卡下半幅
+留白、HTTP 卡的站点网格被压到每行 2–3 个，横向空间利用不均。
+
+**解决方案设计**：外层容器由两列网格改为 `flex flex-col gap-4`，两卡上下排列、
+各占整行；卡内布局不动，站点网格继续按既有 `@container/main` 容器查询自适应列数
+（主列 ≥ 56rem 时 3 列，≥ 72rem 时 4 列）。
+
+**验证结果**：
+
+- `npm run build`（tsc -b + vite build）退出 0；`npx eslint src/pages/Network.tsx` 退出 0（0 error）。
+- 真实浏览器 1400×800 渲染核对（`npm run dev` + Chrome）：日志面板展开（主列 792px）与
+  收起（主列 1104px）两种状态下，两卡宽度均为整行且彼此相等（744px / 1056px）；
+  站点网格在收起态回到 3 列，确认列数变化源自容器查询宽度、非本次改动引起。
+
+## [v2.3.0] - 2026-10-09
+
+> 修复 IPv4 静态配置因接口名参数拼接错误而整体失败的问题（报
+> `Invalid source parameter (vEthemet)` / `Invalid address parameter (vEthemet)`）。
+> 同时修正 IPv6 自动获取、以及 netsh「退出码 0 但命令未执行」的静默假成功。
+> 新增：默认网关独立成列表，额外 IPv4 地址不要求网关，网关可留空、可配置多个。
+
+### 修复（接口名参数导致网络配置失败）
+
+**问题定位**：`src-tauri/src/net_config.rs` 的 `netsh_quoted()` 拼出
+`name="<接口名>"` 作为**单个** argv 元素传给 netsh。Windows 参数层在把 argv 还原成
+命令行时，会对元素内部的双引号做转义，netsh 实际收到的是 `name=\"vEthernet
+(External network)\"`——值里带字面引号，且在第一个空格处被截断为 `vEthernet`。
+于是接口名参数解析失败并沿用到后续所有子命令：
+
+- `interface ip set address` → `Invalid source parameter (vEthernet).`
+- `interface ip add address` → `Invalid address parameter (vEthernet). It should be a
+  valid IPv4 address.`
+
+修掉接口名参数后，同一接口会被 netsh 正确识别（含空格的 `vEthernet (External
+network)` 由 Windows 参数层负责加引号，参数值内部不含引号）。
+
+**关键日志证据**：`build/runtime/logs/2026-10-09.log` 第 19996 行：
+
+```
+[2026-10-09 19:11:41.334] [Error] [net-config] apply_network_config:
+ifname=vEthernet (External network) ok=4/6 fail=2 293ms
+```
+
+即 6 个步骤中 2 个失败（主地址与附加地址），而 `ok=4` 里还混有下面第二类静默失效。
+受控探针确认：`netsh interface ipv4 set address name="Ghost Adapter X" ...` 报的
+正是 `Invalid source parameter (Ghost Adapter X 的截断值)`，与日志口径一致。
+
+**解决方案设计**（`src-tauri/src/net_config.rs`）：
+
+- `netsh_quoted()` → `netsh_name()`：产出 `name=<接口名>`（引号交给系统参数层，
+  值内只剔除可能逃逸解析的内嵌引号）。
+- 新增 `netsh_interface()`：产出 `interface=<接口名>`。`interface ipv6` 的
+  `set/add address`、`add/delete route`、`set interface` 只认 `interface=`，
+  实测传 `name=` 会返回退出码 0 并报 `'name' is not a valid argument`。
+- IPv4 地址改为标签参数：主地址 `set address ... source=static address= mask=
+  [gateway=]`，附加地址 `add address ... address= mask= [gateway=]`。
+- IPv6 自动获取原为 `interface ipv6 set address ... source=dhcp`，但该子命令没有
+  `source` 参数（实测退出码 0 + `'source' is not a valid argument`），改为
+  `interface ipv6 set interface ... routerdiscovery=enabled managedaddress=enabled
+  otherstateful=enabled`。
+- IPv4/IPv6 DNS 改用显式标签：`set dnsservers ... source=static address=<dns>`、
+  `add dnsservers ... address=<dns> index=<n>`。
+- **退出码 0 假成功**：netsh 对部分语法错误返回退出码 0，把错误文本写在 stdout。
+  `run_netsh()` 原先只判 `status.success()`，因此把失败当成功上报（截图里 DNS 与
+  IPv6 显示绿色对勾却未生效）。现增加 `NETSH_FAILURE_MARKERS` 输出扫描，命中
+  `is not a valid argument` / `syntax supplied for this command is not valid` /
+  `The filename, directory name, or volume label syntax is incorrect` 等标记即返回
+  `Err`。注意 `The configured DNS server is incorrect or does not exist.` **不**列入
+  失败标记：该提示出现时 DNS 已实际写入。
+
+**验证结果**：
+
+- `bash scripts/test-lib.sh` 退出 0，258 项通过、0 失败（含新增 7 项参数向量回归）。
+- `npm run build`（tsc -b + vite build）退出 0；`npm run lint` 退出 0（0 error）。
+- 真机以新代码的 argv 形态对 `vEthernet (External network)` 实测：接口名含空格时
+  `set address` / `add address` / `set dnsservers` 均 exit=0 且配置生效。
+- 全部 10 条改动过的命令形态以「非法取值」方式逐个校验语法（netsh 在取值校验阶段
+  即报错退出，不落盘），前/后只读快照完全一致，确认语法合法且无副作用。
+
+### 新增（默认网关独立列表：可留空、可多个）
+
+**问题定位**：网关原先挂在每个 IPv4 地址条目上（`Ipv4Entry.gateway`），前端按网段
+分组时只能保留每组第一个网关，既无法表达「额外地址不配网关」，也配不出多个网关。
+
+**解决方案设计**：
+
+- 契约变更：`Ipv4Entry` 去掉 `gateway`；`NetworkConfigRequest` 新增
+  `#[serde(default)] ipv4_gateways: Vec<String>`（第 1 个为主网关，其余为附加网关）。
+- `plan_ipv4_static()`（新增纯函数，只产出「步骤名 + 完整 netsh argv」，不做 IO）：
+  地址/掩码逐条校验；网关去空去重；主地址带首个网关；第 i 个网关优先随第 i 个地址
+  下发；网关数超过地址数时，剩余网关以 `gateway= gwmetric=9000` 追加。
+- 为什么必须带 `gwmetric`：实测 `add address name=X gateway=IP`（不带 `gwmetric`）
+  是**语法错误**（`The syntax supplied for this command is not valid`）；带
+  `gwmetric` 才被接受。额外网关取大度量 9000，避免与主网关争抢默认路由。
+- 前端 `NetworkConfigEditor.tsx`：网关从网段行内移出，改为独立列表（可增删、可全空），
+  与应用前确认摘要同步。
+
+**验证结果**：
+
+- 新增 7 项纯函数回归，直接断言发给 netsh 的 argv（含「参数不得内嵌字面双引号」的
+  全局约束），不启动 netsh，提权跑测试也不会改写真实网卡。
+- 真机追加测试地址 `192.168.1.238`/`10.77.0.5` 后回读：原 `192.168.3.238`、
+  网关 `192.168.3.254`（metric 256）与 DNS 均未变，`ping 223.5.5.5` 0% 丢包；
+  测试地址已删除，最终状态与改动前基线一致。
+
+## [v2.2.0] - 2026-09-25
+
+> 硬件信息页「实时摘要」的 CPU / GPU / 内存 三张独立卡片整合为单张概览卡，
+> 同一台硬件的占用率与读数收在同一列内。
+> 仅前端样式与结构变更；后端契约、命令与数据字段均不变。
+
+### 新增（实时摘要整合为单张概览卡）
+
+**问题定位**：CPU、GPU、内存原本各占一张卡，由外层三列网格并排。三卡等高只是
+布局的偶然结果——各卡内容行数随数据可用性变化（GPU 缺失时整卡改为占位文案、
+CPU 首采样未就绪时多出「正在采样…」行），任一张卡高度变化都会让其余两卡的进度条
+与数值基线错位；同时三卡各自承担标题栏，在默认 1400px 窗口下横向空间被三份
+图标与标题占去。
+
+**解决方案设计**（`src/pages/Dashboard.tsx`，`SummaryCard` → `OverviewCard`）：
+
+- **一台硬件一列**：CPU / GPU / 内存 各占一列，列内自上而下为列头
+  （`OverviewColumnHead`：图标 + 名称 + 静态元数据 → 3xl 大号占用率 →
+  1px 进度条 → 口径说明）与该硬件自己的读数行（`OverviewReadingRow`）。
+  同一台硬件的全部数据不再拆成「上行占用率、下行读数」两条互不对齐的带。
+- **列内读数行**：名称在左、数值在右（`ml-auto` + `tabular-nums`），每列宽度
+  独立，窄容器下不会互相挤压；无图标的读数（内存容量三项）保留等宽占位，
+  使三列标签左边缘对齐。
+- **竖分割线**：保留原三卡之间的视觉分隔，仅用 `border-l`（不用 `divide`，
+  否则宽度不足时被隐藏的 GPU 列也会被画线）。
+- **数字排版**：数值用 `tabular-nums` 等宽数字 + `leading-none` 压缩行高，
+  避免每秒刷新时的宽度跳动。
+
+**同批修正**：
+
+- **多显卡数据一致性**：主数值（占用率）与读数（温度/频率/功耗）原先分别取
+  `data.gpu[0]`，且主数值另有 `reduce` 取最大占用率；两处口径不同，多显卡机器上
+  会同时展示两张卡的数据。现统一取占用率最高的一张（`gpuMain`，与趋势图 maxGpu
+  口径一致）。
+- **口径标识去角标**：「估算」/「标称」原用 `Badge`，与表示异常状态的角标语义冲突，
+  改为「文字 + 语义色」。
+- **无效值弱化**：温度、频率、功耗、容量的缺失值由普通前景色改为
+  `text-muted-foreground`，避免「—」被读成正常读数。
+- **骨架屏同构**：加载态由三张 `h-[148px]` 卡改为单张 `h-[248px]` 卡，
+  与内容态尺寸一致，切换时不产生跳动。
+
+**验证结果**：`npx prettier --write`、`npx tsc -b`、`npx eslint src/pages/Dashboard.tsx`、
+`npm run lint`、`npm run build` 全部退出 0。另以 Tauri IPC 替身在真实浏览器渲染
+三种场景校验（1400×800 正常态、1400×800 tier-2 未授权且无 GPU 的降级态、
+1000×700 窄窗口态），均无控制台报错。
+
 ## [v2.1.0] - 2026-09-25
 
 > 硬件信息页加载提速 + 提权改为「零 UAC 自动优先，非管理员才申请一次授权」。

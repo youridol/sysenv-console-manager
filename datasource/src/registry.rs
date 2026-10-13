@@ -48,19 +48,6 @@ pub fn read_string(hive: RegHive, path: &str, value: &str) -> Result<Option<Stri
     }
 }
 
-/// 读取 REG_DWORD 值
-pub fn read_dword(hive: RegHive, path: &str, value: &str) -> Result<Option<u32>, CollectError> {
-    let key = open_key(hive, path)?;
-    match key.get_value::<u32, _>(value) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(CollectError::registry(
-            format!("{:?}\\{}", hive, path),
-            format!("读取值 '{}' 失败: {}", value, e),
-        )),
-    }
-}
-
 /// 枚举子键名列表（按返回顺序）
 pub fn enum_subkeys(hive: RegHive, path: &str) -> Result<Vec<String>, CollectError> {
     let key = open_key(hive, path)?;

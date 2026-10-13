@@ -11,63 +11,16 @@
 ///
 /// All HKLM operations require administrator privileges.
 use serde::Serialize;
-use std::os::windows::process::CommandExt;
-use std::process::Command;
 
 // ============================================================================
 // Registry Helpers
 // ============================================================================
 
-/// Detect GPU vendor using WMI (fast, no console window flash).（legacy 旧实现）
-fn detect_gpu_via_wmi_legacy() -> (String, String) {
-    if let Ok(output) = Command::new("wmic")
-        .args([
-            "path",
-            "Win32_VideoController",
-            "get",
-            "Name",
-            "/format:csv",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if text.contains("nvidia") || text.contains("nv") {
-            return ("nvidia".into(), "NVIDIA GPU 已检测".into());
-        }
-        if text.contains("amd")
-            || text.contains("radeon")
-            || text.contains("advanced micro devices")
-        {
-            return ("amd".into(), "AMD GPU 已检测".into());
-        }
-        if text.contains("intel")
-            || text.contains("uhd")
-            || text.contains("iris")
-            || text.contains("arc")
-        {
-            return ("intel".into(), "Intel GPU 已检测".into());
-        }
-        if text.len() > 20 {
-            return (
-                "other".into(),
-                format!("GPU 已检测: {}", text.lines().last().unwrap_or("").trim()),
-            );
-        }
-    }
-    ("unknown".into(), "未检测到 GPU".into())
-}
-
 /// Detect GPU vendor（P6）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 wmic 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::registry，注册表 Class 键枚举，与 Win32_VideoController 同源）。
+/// 走纯 Rust 驱动（secm-datasource::registry，注册表 Class 键枚举，与 Win32_VideoController 同源）。
 /// 失败/无数据时返回 "unknown"/"未检测到 GPU"（与现状一致），并打 R8 日志。
 fn detect_gpu_via_wmi() -> (String, String) {
-    if crate::ds_util::use_legacy() {
-        return detect_gpu_via_wmi_legacy();
-    }
-
     match crate::datasource::registry::detect_gpu() {
         Ok(Some(g)) => (g.vendor, g.message),
         Ok(None) => ("unknown".into(), "未检测到 GPU".into()),
@@ -674,31 +627,10 @@ pub fn get_power_plans() -> Result<Vec<PowerPlan>, String> {
     Ok(plans)
 }
 
-/// Set active power plan via powercfg (write-only, user-triggered).（legacy 旧实现）
-fn set_power_plan_legacy(guid: &str) -> Result<(), String> {
-    let output = Command::new("powercfg")
-        .args(["/setactive", guid])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("powercfg /setactive failed: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "set_power_plan failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(())
-}
-
 /// 切换激活电源计划（P7）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 powercfg 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::power，PowerSetActiveScheme，与 powercfg /setactive 等价）。
+/// 走纯 Rust 驱动（secm-datasource::power，PowerSetActiveScheme，与 powercfg /setactive 等价）。
 pub fn set_power_plan(guid: &str) -> Result<(), String> {
-    if crate::ds_util::use_legacy() {
-        return set_power_plan_legacy(guid);
-    }
-
     crate::datasource::power::set_active_scheme(guid)
         .map_err(|e| crate::ds_util::log_err("settings", "切换电源计划", &e))
 }
@@ -817,61 +749,13 @@ pub fn get_hetero_policies() -> Result<HeteroPolicies, String> {
     })
 }
 
-/// 设置异类调度策略（AC/DC 同步写入 + 激活当前方案）（legacy 旧实现：powercfg）
-///
-/// `kind`: "thread" = 异类线程调度策略, "short" = 异类短运行线程调度策略
-fn set_hetero_policy_legacy(kind: &str, value: u32) -> Result<(), String> {
-    let setting = match kind {
-        "short" => HETERO_SHORT_THREAD_POLICY_GUID,
-        _ => HETERO_THREAD_POLICY_GUID,
-    };
-
-    let run = |args: &[&str]| -> Result<(), String> {
-        let out = Command::new("powercfg")
-            .args(args)
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| format!("powercfg 启动失败: {}", e))?;
-        if !out.status.success() {
-            return Err(format!(
-                "powercfg {} 失败: {}",
-                args[0],
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
-    };
-
-    run(&[
-        "/setacvalueindex",
-        "SCHEME_CURRENT",
-        SUBGROUP_PROCESSOR,
-        setting,
-        &value.to_string(),
-    ])?;
-    run(&[
-        "/setdcvalueindex",
-        "SCHEME_CURRENT",
-        SUBGROUP_PROCESSOR,
-        setting,
-        &value.to_string(),
-    ])?;
-    run(&["/s", "SCHEME_CURRENT"])?;
-    Ok(())
-}
-
 /// 设置异类调度策略（P8，AC/DC 同步写入 + 重新激活当前方案使更改生效）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 powercfg 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::power：PowerWriteACValueIndex /
+/// 走纯 Rust 驱动（secm-datasource::power：PowerWriteACValueIndex /
 /// PowerWriteDCValueIndex / PowerSetActiveScheme，与 powercfg /setacvalueindex 等等价）。
 ///
 /// `kind`: "thread" = 异类线程调度策略, "short" = 异类短运行线程调度策略
 pub fn set_hetero_policy(kind: &str, value: u32) -> Result<(), String> {
-    if crate::ds_util::use_legacy() {
-        return set_hetero_policy_legacy(kind, value);
-    }
-
     let setting = match kind {
         "short" => HETERO_SHORT_THREAD_POLICY_GUID,
         _ => HETERO_THREAD_POLICY_GUID,
@@ -901,46 +785,13 @@ pub fn set_hetero_policy(kind: &str, value: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Create Ultimate Performance plan via powercfg (write-only, user-triggered).（legacy 旧实现）
-fn enable_ultimate_performance_legacy() -> Result<String, String> {
-    // Check if already exists via registry
-    let existing = get_power_plans().unwrap_or_default();
-    for plan in &existing {
-        if plan.guid.contains("e9a42b02-d5df-448d-aa00-03f14749eb61") {
-            return Ok(format!("卓越性能电源计划已存在: {}", plan.guid));
-        }
-    }
-    let output = Command::new("powercfg")
-        .args(["/duplicatescheme", "e9a42b02-d5df-448d-aa00-03f14749eb61"])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("powercfg /duplicatescheme failed: {}", e))?;
-    if !output.status.success() {
-        Err(format!(
-            "导入卓越性能失败: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    } else {
-        Ok(format!(
-            "卓越性能已导入: {}",
-            String::from_utf8_lossy(&output.stdout).trim()
-        ))
-    }
-}
-
 /// 导入卓越性能电源计划（P9）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 powercfg 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::power::duplicate_scheme，
+/// 走纯 Rust 驱动（secm-datasource::power::duplicate_scheme，
 /// 即 PowerDuplicateScheme，与 powercfg /duplicatescheme 等价）。
 /// 新实现直接取 API 返回的新 GUID（旧实现解析 powercfg stdout，更脆弱）。
 pub fn enable_ultimate_performance() -> Result<String, String> {
-    if crate::ds_util::use_legacy() {
-        return enable_ultimate_performance_legacy();
-    }
-
-    // 先查是否已存在（注册表读路径，与旧实现一致）
+    // 先查是否已存在（注册表读路径）
     let existing = get_power_plans().unwrap_or_default();
     for plan in &existing {
         if plan.guid.contains("e9a42b02-d5df-448d-aa00-03f14749eb61") {
@@ -984,37 +835,12 @@ pub struct ServiceInfo {
     pub start_type: String,
 }
 
-struct ServiceInfoRaw {
-    status: String,
-    start_type: String,
-}
-
-/// 查询 16 个预设服务（legacy 旧实现：sc query / sc qc）
-fn get_services_legacy() -> Vec<ServiceInfo> {
-    let mut services = Vec::new();
-    for (svc_name, display_name) in SERVICE_LIST {
-        let status = query_service(svc_name);
-        services.push(ServiceInfo {
-            name: svc_name.to_string(),
-            display_name: display_name.to_string(),
-            status: status.status,
-            start_type: status.start_type,
-        });
-    }
-    services
-}
-
 /// 查询 16 个预设服务（P11）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::query_service，
+/// 走纯 Rust 驱动（secm-datasource::service::query_service，
 /// 即 QueryServiceStatusEx + QueryServiceConfigW，与 sc query/qc 等价）。
-/// 单服务失败不阻塞整体：降级为该服务 "Unknown"/"未知"（与现状 sc 无输出一致）。
+/// 单服务失败不阻塞整体：降级为该服务 "Unknown"/"未知"。
 pub fn get_services() -> Vec<ServiceInfo> {
-    if crate::ds_util::use_legacy() {
-        return get_services_legacy();
-    }
-
     let mut services = Vec::new();
     for (svc_name, display_name) in SERVICE_LIST {
         match crate::datasource::service::query_service(svc_name) {
@@ -1048,95 +874,13 @@ pub fn get_services() -> Vec<ServiceInfo> {
     services
 }
 
-/// 解码 sc 命令输出：复用 `proc_util::decode_ps`（ADR-0001 D14）。
-///
-/// 原实现为 `String::from_utf8(bytes.to_vec())` 再回退 GBK，语义与 decode_ps 一致，
-/// 但多一次堆分配；合并后行为不变且只维护一份编码回退策略。
-fn decode_sc_output(bytes: &[u8]) -> String {
-    crate::proc_util::decode_ps(bytes)
-}
-
-/// 枚举系统所有服务（legacy 旧实现：sc query type= service state= all + 8 线程并行 sc qc）
-fn list_all_services_legacy() -> Vec<ServiceInfo> {
-    // 1. 一次枚举：名称 / 显示名 / 状态
-    let output = Command::new("sc")
-        .args(["query", "type=", "service", "state=", "all"])
-        .creation_flags(0x08000000)
-        .output();
-    let Ok(out) = output else {
-        return Vec::new();
-    };
-    // GBK 解码（中文系统 sc 输出非 UTF-8，直接 from_utf8_lossy 会乱码）
-    let text = decode_sc_output(&out.stdout) + &decode_sc_output(&out.stderr);
-
-    // 解析多服务块：SERVICE_NAME / DISPLAY_NAME / STATE
-    let mut entries: Vec<(String, String, String)> = Vec::new(); // (name, display, status)
-    let mut cur: Option<(String, String, String)> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("SERVICE_NAME:") {
-            if let Some(e) = cur.take() {
-                entries.push(e);
-            }
-            cur = Some((
-                rest.trim().to_string(),
-                String::new(),
-                "Unknown".to_string(),
-            ));
-        } else if let Some(rest) = trimmed.strip_prefix("DISPLAY_NAME:") {
-            if let Some(e) = cur.as_mut() {
-                e.1 = rest.trim().to_string();
-            }
-        } else if trimmed.contains("STATE") {
-            if let Some(e) = cur.as_mut() {
-                e.2 = if trimmed.contains("RUNNING") {
-                    "Running".into()
-                } else if trimmed.contains("STOPPED") {
-                    "Stopped".into()
-                } else if trimmed.contains("STOP_PENDING") {
-                    "Stopping".into()
-                } else if trimmed.contains("START_PENDING") {
-                    "Starting".into()
-                } else if trimmed.contains("PAUSED") {
-                    "Paused".into()
-                } else {
-                    "Unknown".into()
-                };
-            }
-        }
-    }
-    if let Some(e) = cur.take() {
-        entries.push(e);
-    }
-
-    // 2. 并行查询启动类型
-    let names: Vec<String> = entries.iter().map(|e| e.0.clone()).collect();
-    let start_types = query_start_types_parallel(&names);
-
-    entries
-        .into_iter()
-        .zip(start_types)
-        .map(|((name, display, status), start_type)| ServiceInfo {
-            name,
-            display_name: display,
-            status,
-            start_type,
-        })
-        .collect()
-}
-
 /// 枚举系统所有服务（P10）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::enum_services，
+/// 走纯 Rust 驱动（secm-datasource::service::enum_services，
 /// 即 EnumServicesStatusExW 一次返回全部名称/显示名/状态），
-/// 启动类型仍保留 8 线程并行补全（但为内存内 API 调用，比 spawn `sc qc` 快 2-3 个数量级）。
+/// 启动类型并行补全（内存内 API 调用）。
 /// 失败时返回空表（与现状 sc 无输出一致），并打 R8 日志。
 pub fn list_all_services() -> Vec<ServiceInfo> {
-    if crate::ds_util::use_legacy() {
-        return list_all_services_legacy();
-    }
-
     let entries = match crate::datasource::service::enum_services() {
         Ok(list) => list,
         Err(e) => {
@@ -1162,7 +906,7 @@ pub fn list_all_services() -> Vec<ServiceInfo> {
         .collect()
 }
 
-/// 并行查询启动类型（sc qc），8 线程分摊数百次子进程调用
+/// 并行查询服务启动类型（内存内 QueryServiceConfigW 调用），多线程分摊数百次查询
 fn query_start_types_parallel(names: &[String]) -> Vec<String> {
     let n = names.len();
     if n == 0 {
@@ -1200,110 +944,19 @@ fn query_start_types_parallel(names: &[String]) -> Vec<String> {
     result
 }
 
-/// 查询单个服务启动类型（legacy 旧实现：sc qc —— sc query 不输出 START_TYPE）
-fn query_start_type_legacy(name: &str) -> String {
-    let output = Command::new("sc")
-        .args(["qc", name])
-        .creation_flags(0x08000000)
-        .output();
-    let Ok(out) = output else {
-        return "未知".to_string();
-    };
-    let text = decode_sc_output(&out.stdout) + &decode_sc_output(&out.stderr);
-    if text.contains("AUTO_START") {
-        "自动".into()
-    } else if text.contains("DEMAND_START") {
-        "手动".into()
-    } else if text.contains("DISABLED") {
-        "已禁用".into()
-    } else {
-        "未知".into()
-    }
-}
-
 /// 查询单个服务启动类型（P10/P11 辅助，内存内 QueryServiceConfigW 调用）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc qc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::start_type_of）。
-/// 失败/服务不存在时降级 "未知"（与现状 sc qc 无输出一致）。
+/// 走纯 Rust 驱动（secm-datasource::service::start_type_of）。
+/// 失败/服务不存在时降级 "未知"。
 fn query_start_type(name: &str) -> String {
-    if crate::ds_util::use_legacy() {
-        return query_start_type_legacy(name);
-    }
     crate::datasource::service::start_type_of(name)
-}
-
-fn query_service(name: &str) -> ServiceInfoRaw {
-    // 注意：sc query 输出不包含 START_TYPE（仅 STATE），启动类型需用 sc qc 查询配置
-    let run = |args: &[&str]| -> String {
-        Command::new("sc")
-            .args(args)
-            .creation_flags(0x08000000)
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
-            })
-            .unwrap_or_default()
-    };
-    let q_text = run(&["query", name]);
-    let qc_text = run(&["qc", name]);
-    let status = if q_text.contains("RUNNING") {
-        "Running".into()
-    } else if q_text.contains("STOPPED") {
-        "Stopped".into()
-    } else if q_text.contains("STOP_PENDING") {
-        "Stopping".into()
-    } else if q_text.contains("START_PENDING") {
-        "Starting".into()
-    } else if q_text.contains("PAUSED") {
-        "Paused".into()
-    } else {
-        "Unknown".into()
-    };
-    let start_type = if qc_text.contains("AUTO_START") {
-        "自动".into()
-    } else if qc_text.contains("DEMAND_START") {
-        "手动".into()
-    } else if qc_text.contains("DISABLED") {
-        "已禁用".into()
-    } else {
-        "未知".into()
-    };
-    ServiceInfoRaw { status, start_type }
-}
-
-/// 启动服务（legacy 旧实现：sc start）
-fn start_service_legacy(name: &str) -> Result<String, String> {
-    if !super::cleanup::is_admin() {
-        return Err("需要管理员权限".to_string());
-    }
-    let output = Command::new("sc")
-        .args(["start", name])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("sc start failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
-        Ok(format!("{} started: {}", name, stdout.trim()))
-    } else {
-        Err(format!(
-            "start {} failed: {} {}",
-            name,
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
 }
 
 /// 启动服务（P11，advapi32 StartServiceW）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::start_service）。
+/// 走纯 Rust 驱动（secm-datasource::service::start_service）。
 /// 需管理员权限（现状 is_admin 前置检查保留；API 层对 ACCESS_DENIED 再兜底一次）。
 pub fn start_service(name: &str) -> Result<String, String> {
-    if crate::ds_util::use_legacy() {
-        return start_service_legacy(name);
-    }
     if !super::cleanup::is_admin() {
         return Err("需要管理员权限".to_string());
     }
@@ -1312,38 +965,11 @@ pub fn start_service(name: &str) -> Result<String, String> {
         .map_err(|e| crate::ds_util::log_err("settings", "启动服务", &e))
 }
 
-/// 停止服务（legacy 旧实现：sc stop）
-fn stop_service_legacy(name: &str) -> Result<String, String> {
-    if !super::cleanup::is_admin() {
-        return Err("需要管理员权限".to_string());
-    }
-    let output = Command::new("sc")
-        .args(["stop", name])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("sc stop failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
-        Ok(format!("{} stopped: {}", name, stdout.trim()))
-    } else {
-        Err(format!(
-            "stop {} failed: {} {}",
-            name,
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
 /// 停止服务（P11，advapi32 ControlService）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::stop_service）。
+/// 走纯 Rust 驱动（secm-datasource::service::stop_service）。
 /// 需管理员权限；服务已停止时幂等成功（与 sc stop 行为一致）。
 pub fn stop_service(name: &str) -> Result<String, String> {
-    if crate::ds_util::use_legacy() {
-        return stop_service_legacy(name);
-    }
     if !super::cleanup::is_admin() {
         return Err("需要管理员权限".to_string());
     }
@@ -1352,53 +978,12 @@ pub fn stop_service(name: &str) -> Result<String, String> {
         .map_err(|e| crate::ds_util::log_err("settings", "停止服务", &e))
 }
 
-/// 设置服务启动类型（legacy 旧实现：sc config start= X）
-///
-/// 设置为手动/禁用后，服务不会随系统启动自动拉起；配合停止操作可防止服务自动重启。
-/// 注意：sc config 的 `start=` 参数后必须有空格（sc 命令特性）。
-fn set_service_start_type_legacy(name: &str, start_type: &str) -> Result<String, String> {
-    if !super::cleanup::is_admin() {
-        return Err("需要管理员权限".to_string());
-    }
-    let sc_type = match start_type {
-        "auto" => "auto",
-        "manual" => "demand",
-        "disabled" => "disabled",
-        _ => return Err(format!("无效的启动类型: {}", start_type)),
-    };
-    let label = match start_type {
-        "auto" => "自动",
-        "manual" => "手动",
-        _ => "禁用",
-    };
-    let output = Command::new("sc")
-        .args(["config", name, "start=", sc_type])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("sc config failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
-        Ok(format!("{} 启动类型已设置为 {}", name, label))
-    } else {
-        Err(format!(
-            "设置 {} 启动类型失败: {} {}",
-            name,
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
 /// 设置服务启动类型（P11，advapi32 ChangeServiceConfigW）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 sc 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::service::set_service_start_type）。
+/// 走纯 Rust 驱动（secm-datasource::service::set_service_start_type）。
 /// 参数（与前端契约一致）："auto" 自动 / "manual" 手动 / "disabled" 禁用。
 /// 需管理员权限（现状 is_admin 前置检查保留；API 层对 ACCESS_DENIED 再兜底一次）。
 pub fn set_service_start_type(name: &str, start_type: &str) -> Result<String, String> {
-    if crate::ds_util::use_legacy() {
-        return set_service_start_type_legacy(name, start_type);
-    }
     if !super::cleanup::is_admin() {
         return Err("需要管理员权限".to_string());
     }

@@ -8,9 +8,6 @@ tmp/
 
 # GPUI 重构工作区（独立 git 仓库，见 SysEnv-Console-Manager/）
 SysEnv-Console-Manager/
-# 临时 spike 验证目录（不入库）
-gpui-spike/
-tray-spike/
 
 # Rust / Tauri 构建产物
 src-tauri/target/

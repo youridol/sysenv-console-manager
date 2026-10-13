@@ -1,5 +1,4 @@
 /// IP 信息采集模块
-use crate::proc_util::run_ps;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,24 +72,11 @@ pub fn get_ip_info() -> IpInfo {
     }
 }
 
-fn get_local_ips_legacy() -> (String, String) {
-    let v4 = "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' -and $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1 -ExpandProperty IPAddress";
-    let v6 = "Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.IPAddress -notlike 'fe80:*' } | Select-Object -First 1 -ExpandProperty IPAddress";
-    let ipv4 = run_ps(v4);
-    let ipv6 = run_ps(v6).split('%').next().unwrap_or("").to_string();
-    (ipv4, ipv6)
-}
-
 /// 获取本地 IPv4/IPv6 地址（P4）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 PowerShell 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::netif，GetAdaptersAddresses，与 Get-NetIPAddress 同源）。
+/// 走纯 Rust 驱动（secm-datasource::netif，GetAdaptersAddresses，与 Get-NetIPAddress 同源）。
 /// 失败/无数据时返回空串（上层映射为 "—" 占位，与现状一致），并打 R8 日志。
 fn get_local_ips() -> (String, String) {
-    if crate::ds_util::use_legacy() {
-        return get_local_ips_legacy();
-    }
-
     match crate::datasource::netif::local_ips() {
         Ok(ips) => (ips.ipv4.unwrap_or_default(), ips.ipv6.unwrap_or_default()),
         Err(e) => {
@@ -123,11 +109,6 @@ fn fetch_ipv6() -> String {
 /// 强制 IPv4 连接（ureq 自定义 resolver），确保拿到的是 IPv4 地址，
 /// 避免系统 IPv6 优先策略下 myip.ipip.net 返回 IPv6。
 fn fetch_domestic_v4() -> (String, String) {
-    if crate::ds_util::use_legacy() {
-        // legacy：PowerShell 无法强制地址族，维持原行为（自动地址族）
-        return parse_domestic(&http_get("https://myip.ipip.net"), extract_ipv4);
-    }
-
     match crate::datasource::http::http_get_family(
         "https://myip.ipip.net",
         crate::datasource::http::IpFamily::V4,
@@ -144,12 +125,7 @@ fn fetch_domestic_v4() -> (String, String) {
 /// 获取国内出口 IP（IPv6）+ 归属地
 ///
 /// 强制 IPv6 连接；无 IPv6 连通性/解析不到 AAAA 时返回空（上层映射占位）。
-/// legacy 模式下 PowerShell 无法强制 IPv6 连接，直接返回空。
 fn fetch_domestic_v6() -> (String, String) {
-    if crate::ds_util::use_legacy() {
-        return (String::new(), String::new());
-    }
-
     match crate::datasource::http::http_get_family(
         "https://myip.ipip.net",
         crate::datasource::http::IpFamily::V6,
@@ -295,28 +271,12 @@ fn is_valid_ipv6(candidate: &str) -> bool {
 // 工具函数
 // ============================================================================
 
-// run_ps / run_cmd 已提取至 crate::proc_util（共享实现，此处仅保留本模块特有函数）
-
-/// 发起 HTTP GET 请求（legacy 旧实现：PowerShell Invoke-RestMethod）
-fn http_get_legacy(url: &str) -> String {
-    let script = format!(
-        "try {{ $r=Invoke-RestMethod -Uri '{}' -TimeoutSec 5 -ErrorAction Stop; if ($r -is [string]) {{ $r }} else {{ ConvertTo-Json -Compress $r }} }} catch {{ '' }}",
-        url
-    );
-    run_ps(&script)
-}
-
 /// 发起 HTTP GET 请求，返回响应体文本（P5）
 ///
-/// 过渡期由 `legacy-data-source` feature 控制回退旧 PowerShell 实现；
-/// 默认走纯 Rust 驱动（secm-datasource::http，ureq + URL 白名单，超时 5s 与现状一致）。
+/// 走纯 Rust 驱动（secm-datasource::http，ureq + URL 白名单，超时 5s 与现状一致）。
 /// 失败/无数据时返回空串（上层映射为 "—" 占位，与现状一致），并打 R8 日志。
 /// 注意：URL 必须命中 datasource 白名单（R4 安全），否则直接返回空串。
 fn http_get(url: &str) -> String {
-    if crate::ds_util::use_legacy() {
-        return http_get_legacy(url);
-    }
-
     match crate::datasource::http::http_get(url) {
         Ok(body) => body,
         Err(e) => {
